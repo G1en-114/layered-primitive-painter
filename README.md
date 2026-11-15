@@ -27,7 +27,8 @@
 - [x] 分层分解器（图片 + 分割 → 分层图元序列）：量化感知拟合、amodal 补全、图层越界约束
 - [x] 协议支持文本前缀与 `REDRAW_k` / `REFINE_k`
 - [x] Triton tile 光栅化算子（前向 + 反向，确定性梯度）：分解器单步快 64×，端到端 19.8 s → 0.8 s/图，见 [bench/REPORT_raster.md](bench/REPORT_raster.md)
-- [ ] CUDA C++ / CPU SIMD 光栅化（部署用）
+- [x] 原生 CUDA/HIP C++ tile 光栅化（前向/反向）：同一源码适配 NVIDIA 与海光 DCU，DCU 算子基准快 9–38×，见 [移植学习记录](docs/hip_port_log.md)
+- [ ] CPU SIMD 光栅化（部署用）
 - [x] CelebAMask-HQ 数据处理：18 类合并为 6 个按深度排序的图层，3 万张 256px 分片
 - [x] 语法状态机、full / redraw / refine 序列、批量分解流水线（3 万张，本机 5070 约 4 小时）
 - [x] 两级模型（tiny 1.7M / small 22M / base 123M）、带 KV cache 的参考采样器、训练循环
@@ -36,6 +37,9 @@
 - [ ] small / base 在全量数据上训练，规模对比
 - [ ] ONNX 导出、C++ 运行时、量化工具、基准测试
 - [ ] 二次元风格后训练（见下）
+
+二次元数据已完成首批 1000 张头像裁剪、原图关联与角色/背景伪标签，953 张通过自动检查；
+8 张已做图元分解试验，尚未启动风格训练。见 [数据处理记录](docs/anime_data_log.md)。
 
 ## 计划：二次元风格后训练
 
@@ -62,7 +66,9 @@ python/lpp/
   codebook.py codec.py k-means 码本；连续参数 <-> token
   render/reference.py  稠密参考光栅化器（正确性基准）
   render/triton_raster.py  tile 光栅化：前向/反向 Triton kernel
-  render/dispatch.py   后端选择（CUDA 用 Triton，否则用参考实现；LPP_RASTER 可强制）
+  render/native_raster.py  原生 CUDA/HIP 包装器（首次调用即时编译）
+  render/tiles.py      Triton 与 CUDA/HIP 共用的参数打包、tile 分箱
+  render/dispatch.py   后端选择（GPU float32 优先 Triton，再尝试 CUDA/HIP；LPP_RASTER 可强制）
   decompose/           分层分解器：图片 + 图层标签 -> 有序、量化后的图元
   synthetic.py         已知真值的合成分层场景（测试与 demo 用）
 assets/codebooks/      先验码本（数据驱动码本会覆盖它们）

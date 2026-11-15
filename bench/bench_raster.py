@@ -17,13 +17,51 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-sys.path.insert(0, os.path.expanduser("~/.claude/skills/kernel-opt"))
+sys.path.insert(0, os.path.expanduser("~/.claude/skills/kernel-opt"))  # optional
 
-from kopt import bench, table  # noqa: E402
 from lpp.render import Primitives  # noqa: E402
+from lpp.render.dispatch import triton_available  # noqa: E402
 from lpp.render.reference import render_group as torch_group  # noqa: E402
-from lpp.render.triton_raster import TILE, bin_tiles, render_group_triton  # noqa: E402
+from lpp.render.tiles import TILE, bin_tiles  # noqa: E402
 from lpp.shape import conic  # noqa: E402
+
+try:                                    # kernel-opt helpers (L2 flush, percentiles, roofline)
+    from kopt import bench, table  # noqa: E402
+except ImportError:                     # e.g. on the DCU box: plain CUDA-event timing
+    import statistics
+    from types import SimpleNamespace
+
+    def bench(fn, name, **_):
+        fn()
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(30):
+            s0, s1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s0.record()
+            fn()
+            s1.record()
+            torch.cuda.synchronize()
+            times.append(s0.elapsed_time(s1))
+        times.sort()
+        return SimpleNamespace(name=name, median_ms=statistics.median(times), p10=times[3], p90=times[-4])
+
+    def table(rows):
+        base = rows[0].median_ms if rows else 1.0
+        out = ["| impl | median | p10-p90 | speedup |", "|---|---|---|---|"]
+        out += [f"| {r.name} | {r.median_ms:.3f} ms | {r.p10:.3f}-{r.p90:.3f} ms | "
+                f"{base / r.median_ms:.2f}x |" for r in rows]
+        return "\n".join(out)
+
+
+def fast_backends():
+    out = []
+    if triton_available():
+        from lpp.render.triton_raster import render_group_triton
+        out.append(("triton tiles", render_group_triton))
+    from lpp.render import native_raster
+    if native_raster.available():
+        out.append(("native CUDA/HIP v1", native_raster.render_group_native))
+    return out
 
 
 def scene(B, N, sigma_lo, sigma_hi, seed=0, dev="cuda") -> Primitives:
@@ -93,7 +131,7 @@ def main() -> None:
               f"(tile kernel evaluates {tile_pairs / dense_pairs:.1%} of the dense pixel-primitive pairs)")
         target = torch.rand(B, 3, size, size, device="cuda")
         rows = []
-        for name, fn in (("torch dense reference", torch_group), ("triton tiles v1", render_group_triton)):
+        for name, fn in [("torch dense reference", torch_group)] + fast_backends():
             run = step_fn(fn, p, target, size) if kind == "step" else fwd_fn(fn, p, size)
             r = try_bench(run, name)
             if r is not None:
