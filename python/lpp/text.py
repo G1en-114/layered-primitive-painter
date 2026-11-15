@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -35,6 +36,34 @@ _ATTR_ZH = [
     ("Wearing_Hat", "戴帽子"), ("Wearing_Earrings", "戴耳环"), ("Wearing_Necklace", "戴项链"),
     ("Wearing_Necktie", "打领带"),
 ]
+
+
+def mirror_caption(caption: str | None) -> str | None:
+    """Swap explicit left/right directions for a horizontally mirrored image.
+
+    Keep paired expressions such as 左右/左、右 unchanged. This is a deterministic
+    transform of directional words, not an attempt to rewrite the scene description.
+    """
+    if caption is None:
+        return None
+    pairs = []
+
+    def protect(match):
+        pairs.append(match.group())
+        return f"\ue000{len(pairs) - 1}\ue001"
+
+    text = re.sub(r"左右|右左|左[、和及与/]右|右[、和及与/]左", protect, caption)
+    text = re.sub(r"[左右](?=侧|边|眼|耳|脸|肩|手|上|下|转|倾)|(?<=[向朝往偏])[左右]",
+                  lambda m: "右" if m.group() == "左" else "左", text)
+
+    def english(match):
+        word = "right" if match.group().lower() == "left" else "left"
+        return word.upper() if match.group().isupper() else word.capitalize() if match.group()[0].isupper() else word
+
+    text = re.sub(r"\b(?:left|right)\b", english, text, flags=re.IGNORECASE)
+    for index, pair in enumerate(pairs):
+        text = text.replace(f"\ue000{index}\ue001", pair)
+    return text
 
 
 def template_caption(attrs: dict[str, bool], rng: random.Random | None = None) -> str:
@@ -84,14 +113,19 @@ class CaptionStore:
 class TextEncoder(torch.nn.Module):
     """Frozen Chinese-CLIP text tower -> per-token features [B, L<=max_positions, 768]."""
 
-    def __init__(self, model_dir: str | Path, max_positions: int = 32, max_tokens: int = 96):
+    def __init__(self, model_dir: str | Path, max_positions: int = 32, max_tokens: int | None = None):
         super().__init__()
         from transformers import BertTokenizer, ChineseCLIPModel
         self.tok = BertTokenizer.from_pretrained(str(model_dir))
         full = ChineseCLIPModel.from_pretrained(str(model_dir))
         self.model = full.text_model.eval().requires_grad_(False)
         self.dim = self.model.config.hidden_size
-        self.max_positions, self.max_tokens = max_positions, max_tokens
+        capacity = self.model.config.max_position_embeddings
+        self.max_positions = max_positions
+        self.max_tokens = capacity if max_tokens is None else max_tokens
+        if max_positions < 1 or not 1 <= self.max_tokens <= capacity:
+            raise ValueError(f"invalid text limits: max_positions={max_positions}, "
+                             f"max_tokens={self.max_tokens}, encoder capacity={capacity}")
 
     @torch.no_grad()
     def forward(self, captions: list[str | None]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -102,8 +136,11 @@ class TextEncoder(torch.nn.Module):
         idx = [i for i, c in enumerate(captions) if c]
         if not idx:
             return feats[:, :0], valid[:, :0]
-        enc = self.tok([captions[i] for i in idx], padding=True, truncation=True, max_length=self.max_tokens,
-                       return_tensors="pt").to(dev)
+        enc = self.tok([captions[i] for i in idx], padding=True, truncation=False, return_tensors="pt")
+        if enc["input_ids"].shape[1] > self.max_tokens:
+            raise ValueError(f"caption needs {enc['input_ids'].shape[1]} tokens, text encoder limit is "
+                             f"{self.max_tokens}; shorten explicitly or increase max_tokens within capacity")
+        enc = enc.to(dev)
         h = self.model(**enc).last_hidden_state.float()            # [b, T, dim]
         lengths = enc["attention_mask"].sum(1).tolist()
         for row, (i, n) in enumerate(zip(idx, lengths)):

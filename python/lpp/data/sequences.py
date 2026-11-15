@@ -1,6 +1,7 @@
 """Training examples from decomposition shards (tools/decompose_dataset.py output)."""
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset
 
 from ..protocol import Protocol, load_protocol
 from ..sequence import DrawSeq, build, perturb, sample_mode
+from ..text import mirror_caption
 
 
 @dataclass
@@ -19,11 +21,17 @@ class Example:
     layer: torch.Tensor    # [N]
     round: torch.Tensor    # [N]
     image_id: int
+    flip: bool = False
 
 
 def load_shards(paths: list[Path]) -> list[Example]:
     out = []
+    configs = {}
     for p in paths:
+        if p.parent not in configs:
+            config = p.parent / "config.json"
+            configs[p.parent] = json.loads(config.read_text()) if config.exists() else {}
+        flipped = bool(configs[p.parent].get("flip", False))
         # read each array once: every z["key"] access decompresses the whole array again,
         # which made loading quadratic in shard size
         with np.load(p) as z:
@@ -33,7 +41,7 @@ def load_shards(paths: list[Path]) -> list[Example]:
             rounds = torch.from_numpy(z["round"].astype(np.int64))
         for i, image_id in enumerate(ids):
             a, b = int(off[i]), int(off[i + 1])
-            out.append(Example(tokens[a:b], layer[a:b], rounds[a:b], int(image_id)))
+            out.append(Example(tokens[a:b], layer[a:b], rounds[a:b], int(image_id), flipped))
     return out
 
 
@@ -62,6 +70,8 @@ class SequenceDataset(Dataset):
             seq = perturb(seq, self.rng, self.proto)
         if self.captions is not None:
             text = self.captions.pick(ex.image_id, self.rng, self.p_text_drop)
+            if ex.flip:
+                text = mirror_caption(text)
         else:
             text = self.text_fn(ex.image_id) if self.text_fn else None
         return seq, text
