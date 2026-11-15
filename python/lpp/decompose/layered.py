@@ -45,6 +45,13 @@ class DecomposeConfig:
     size: int | None = None                       # working resolution; None = canvas size
     round_sigmas: tuple[float, ...] = (48.0, 24.0, 12.0, 6.0, 3.0, 1.5)   # init sigma, canvas px
     round_fracs: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25, 0.25)  # share of layer budget
+    # global-to-local (as in POP 2): grid size per round; 0 = whole layer. In a gridded round the
+    # canvas is cut into g x g blocks visited in a random order; the round's primitives are
+    # allocated to blocks by error mass, start inside their block, and their centers may not leave
+    # it (plus `block_slack` of a block). Late, fine primitives then follow a learnable spatial
+    # pattern instead of landing wherever the error happens to be largest.
+    round_grids: tuple[int, ...] = (0, 0, 0, 0, 0, 0)   # e.g. (0, 0, 4, 4, 8, 8); off: see docs/data_lessons.md
+    block_slack: float = 0.25
     steps_per_round: int = 120
     snap_frac: float = 0.3            # last fraction of each round fitted through snap()
     quantize: bool = True             # False: never snap, stack layers continuously (for fitting
@@ -87,8 +94,11 @@ class LayeredDecomposer:
     def _to_prims(self, p: dict[str, torch.Tensor], active: torch.Tensor) -> Primitives:
         proto = self.proto
         log_sigma = p["log_sigma"].clamp(math.log(proto.sigma_min), math.log(proto.sigma_max))
+        xy = p["xy"]
+        if "box" in p:      # [B, N, 4] = x0, y0, x1, y1: a block-local primitive's center stays in it
+            xy = torch.maximum(torch.minimum(xy, p["box"][..., 2:]), p["box"][..., :2])
         return Primitives(
-            xy=p["xy"],
+            xy=xy,
             sigma=log_sigma.exp(),
             theta=p["theta"],
             beta=2.0 ** p["log2_beta"].clamp(0.0, math.log2(max(proto.beta_levels))),
@@ -195,6 +205,7 @@ class LayeredDecomposer:
 
         p = {n: torch.zeros(B, 0, *shape, device=dev) for n, shape in
              (("xy", (2,)), ("log_sigma", (2,)), ("theta", ()), ("log2_beta", ()), ("rgb", (3,)), ("alpha", ()))}
+        box = torch.zeros(B, 0, 4, device=dev)
         active = torch.zeros(B, 0, device=dev)
         rounds = torch.zeros(B, 0, dtype=torch.long, device=dev)
         done = budget == 0
@@ -221,15 +232,15 @@ class LayeredDecomposer:
 
             # --- place new primitives where the current error is largest
             with torch.no_grad():
-                comp, _ = composite(self._to_prims(p, active))
+                comp, _ = composite(self._to_prims(p | {"box": box}, active))
                 err = ((comp - img) ** 2).sum(1, keepdim=True) * region + \
                       cfg.w_front_near * ((comp - pseudo) ** 2).sum(1, keepdim=True) * near
                 ks = max(1, int(sigma0 * px_per_canvas)) | 1
                 err = F.avg_pool2d(err, ks, stride=1, padding=ks // 2, count_include_pad=False)
                 w = err.flatten(1) * allowed + 1e-12 * allowed
                 w = torch.where(allowed.sum(1, keepdim=True) > 0, w, torch.ones_like(w))
-                replace = bool((allowed.sum(1) < n_max).any())
-                idx = torch.multinomial(w, n_max, replacement=replace, generator=gen)
+                grid = cfg.round_grids[r] if r < len(cfg.round_grids) else 0
+                idx, block_rank, new_box = self._place(w, n_new, n_max, grid, S, gen)
                 iy, ix = idx // S, idx % S
                 jit = torch.rand(B, n_max, 2, device=dev, generator=gen)
                 xy = (torch.stack([ix, iy], -1).float() + jit) / px_per_canvas
@@ -237,13 +248,13 @@ class LayeredDecomposer:
 
                 slot = torch.arange(n_max, device=dev).expand(B, n_max)
                 new_active = (slot < n_new.unsqueeze(1)).float()
-                # Morton order inside the round; padding slots sort last
+                # order: block visiting order (random), then Morton inside a block; padding last
                 q = (xy.clamp(0, proto.canvas_size - 1e-3)).long()
-                key = torch.where(new_active.bool(), morton_code(q[..., 0], q[..., 1]),
-                                  torch.full_like(q[..., 0], 1 << 40))
+                key = block_rank.long() * (1 << 17) + morton_code(q[..., 0], q[..., 1])
+                key = torch.where(new_active.bool(), key, torch.full_like(key, 1 << 40))
                 order = key.argsort(dim=1)
                 g2 = lambda t: t.gather(1, order.view(B, n_max, *([1] * (t.dim() - 2))).expand_as(t))  # noqa: E731
-                xy, col, new_active = g2(xy), g2(col), g2(new_active)
+                xy, col, new_active, new_box = g2(xy), g2(col), g2(new_active), g2(new_box)
 
                 new = {
                     "xy": xy,
@@ -255,11 +266,13 @@ class LayeredDecomposer:
                     "alpha": torch.full((B, n_max), math.log(0.7 / (proto.max_alpha - 0.7)), device=dev),
                 }
                 p = {n: torch.cat([p[n], new[n]], 1) for n in PARAM_NAMES}
+                box = torch.cat([box, new_box], 1)
                 active = torch.cat([active, new_active], 1)
                 rounds = torch.cat([rounds, torch.full((B, n_max), r, dtype=torch.long, device=dev)], 1)
 
             # --- fit every primitive of this layer
             leaves = {n: t.detach().requires_grad_(True) for n, t in p.items()}
+            leaves["box"] = box
             opt = torch.optim.Adam([{"params": [leaves[n]], "lr": cfg.lr[n]} for n in PARAM_NAMES])
             snap_from = int(cfg.steps_per_round * (1 - cfg.snap_frac))
             for step in range(cfg.steps_per_round):
@@ -278,12 +291,63 @@ class LayeredDecomposer:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
-            p = {n: t.detach() for n, t in leaves.items()}
+            p = {n: leaves[n].detach() for n in PARAM_NAMES}
 
             with torch.no_grad():
-                cur = self._to_prims(p, active)
+                cur = self._to_prims(p | {"box": box}, active)
                 comp, _ = composite(self._snapped(cur, active, straight_through=False) if cfg.quantize else cur)
                 mse = (((comp - img) ** 2).mean(1, keepdim=True) * region).sum((1, 2, 3)) / region_n
                 done = done | (mse < cfg.stop_mse)
 
-        return p, active, rounds
+        return p | {"box": box}, active, rounds
+
+    def _place(self, w, n_new, n_max, grid: int, S: int, gen):
+        """Sample n_max pixel indices from error weights w [B, S*S].
+
+        grid == 0: anywhere in the allowed region. grid > 0: the round's count n_new[b] is split
+        over g x g blocks by error mass (largest remainder), each block samples its share from
+        its own pixels, and blocks get a random visiting rank. Returns pixel indices [B, n_max],
+        block rank [B, n_max] (0 for global rounds) and center bounds [B, n_max, 4] in canvas units.
+        """
+        B, dev = w.shape[0], w.device
+        C, slack = self.proto.canvas_size, self.cfg.block_slack
+        if grid <= 0:
+            replace = bool(((w > 0).sum(1) < n_max).any())
+            idx = torch.multinomial(w, n_max, replacement=replace, generator=gen)
+            box = torch.tensor([0.0, 0.0, float(C), float(C)], device=dev).expand(B, n_max, 4).clone()
+            return idx, torch.zeros(B, n_max, device=dev), box
+        bs = S // grid                                             # block size, working pixels
+        yy, xx = torch.meshgrid(torch.arange(S, device=dev), torch.arange(S, device=dev), indexing="ij")
+        block_of = ((yy // bs).clamp(max=grid - 1) * grid + (xx // bs).clamp(max=grid - 1)).flatten()
+        nb = grid * grid
+        mass = torch.zeros(B, nb, device=dev).index_add_(1, block_of, w)
+        share = mass / mass.sum(1, keepdim=True).clamp(min=1e-30) * n_new[:, None].float()
+        count = share.floor().long()
+        rem = (n_new - count.sum(1))                               # largest-remainder rounding
+        frac_order = (share - count).argsort(1, descending=True)
+        bonus = (torch.arange(nb, device=dev)[None] < rem[:, None]).long()
+        count.scatter_add_(1, frac_order, bonus)
+        rank_of_block = torch.rand(B, nb, device=dev, generator=gen).argsort(1).argsort(1)  # random order
+        idx = torch.zeros(B, n_max, dtype=torch.long, device=dev)
+        rank = torch.zeros(B, n_max, device=dev)
+        box = torch.zeros(B, n_max, 4, device=dev)
+        canvas_per_px = C / S
+        for b in range(B):
+            pos = 0
+            for k in torch.nonzero(count[b]).flatten().tolist():
+                n = int(count[b, k])
+                wk = w[b] * (block_of == k)
+                if wk.sum() <= 0:
+                    wk = (block_of == k).float()
+                idx[b, pos:pos + n] = torch.multinomial(wk, n, replacement=bool((wk > 0).sum() < n), generator=gen)
+                rank[b, pos:pos + n] = rank_of_block[b, k]
+                by, bx = divmod(k, grid)
+                lo_x, lo_y = bx * bs * canvas_per_px, by * bs * canvas_per_px
+                size = bs * canvas_per_px
+                box[b, pos:pos + n] = torch.tensor([lo_x - slack * size, lo_y - slack * size,
+                                                    lo_x + (1 + slack) * size, lo_y + (1 + slack) * size],
+                                                   device=dev)
+                pos += n
+            if pos < n_max:                                        # padding slots: anywhere, inactive
+                box[b, pos:] = torch.tensor([0.0, 0.0, float(C), float(C)], device=dev)
+        return idx, rank, box

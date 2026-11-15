@@ -88,3 +88,28 @@ def test_continuous_mode_never_snaps(proto):
     assert abs(psnr - d.psnr) < 0.05
     snapped = codec.snap(Primitives(**c), straight_through=False)
     assert not torch.allclose(snapped.xy, c["xy"])
+
+
+def test_block_local_rounds(proto):
+    """Gridded rounds: every primitive's center lies in (or within the slack of) its block, and
+    inside one round primitives come block by block (not interleaved across blocks)."""
+    try:
+        codec = Codec.load(device=DEV)
+    except FileNotFoundError:
+        pytest.skip("codebooks missing")
+    from lpp.decompose.layered import DecomposeConfig as DC
+    img, label, _, _ = synthetic_scene(2, 64, seed=5, device=DEV)
+    cfg = DC(size=64, round_sigmas=(48.0, 6.0), round_fracs=(0.3, 0.7), round_grids=(0, 4),
+             steps_per_round=20, budget_scale=0.8, block_slack=0.0)   # strict blocks for the check
+    dec = LayeredDecomposer(codec, cfg)
+    for d in dec(img, label):
+        x = codec.decode({k: v.unsqueeze(0).to(DEV) for k, v in d.tokens.items()}).xy[0].cpu()
+        for k in d.layer.unique().tolist():
+            fine = (d.layer == k) & (d.round == 1)
+            if fine.sum() < 2:
+                continue
+            blk = (x[fine, 1] // 64).clamp(0, 3) * 4 + (x[fine, 0] // 64).clamp(0, 3)
+            # visited block by block: one run per block, plus a few centers that position
+            # quantization puts just across a block edge
+            changes = (blk[1:] != blk[:-1]).sum().item()
+            assert changes <= len(blk.unique()) - 1 + 4, (changes, blk.tolist())
