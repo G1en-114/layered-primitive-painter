@@ -124,6 +124,8 @@ def main() -> None:
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto",
+                    help="math avoids unavailable FlashAttention libraries on some DTK builds")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--captions", type=Path, default=None, help="captions.jsonl from tools/caption_vlm.py")
@@ -139,6 +141,10 @@ def main() -> None:
                     help="start a NEW run from these weights (fresh optimizer and step; missing modules such "
                          "as canvas layers start at their init). Not the same as --resume.")
     args = ap.parse_args()
+    if args.sdpa_backend == "math":
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     args.out.mkdir(parents=True, exist_ok=True)
     if args.workers is None:
         args.workers = default_workers()

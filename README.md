@@ -36,7 +36,7 @@
 - [x] 3万张中文标注完成并校验，17条异常描述另存修复；Chinese-CLIP 文本条件与 CFG 已接入，正式条件模型待训练
 - [x] 协议 v2 独立形状分档与版本化颜色码本，图元教师约26→30dB，见 [实验记录](docs/protocol_v2.md)
 - [x] 可选画布反馈与前缀扰动，已通过测试及冒烟训练，见 [设计](docs/canvas_feedback_design.md)
-- [ ] v2 四轨迹数据正在分解；本机与DCU分别处理奇偶分片，完成后再汇集清理
+- [ ] v2 四轨迹数据正在分解；t0已完成3万张并通过校验，清理完成后由启动队列开始首阶段训练
 - [ ] small / base 在全量数据上训练，规模对比
 - [ ] ONNX 导出、C++ 运行时、量化工具、基准测试
 - [ ] 二次元风格后训练（见下）
@@ -92,6 +92,12 @@ python tools/decompose_demo.py --out out/decompose   # 合成场景分解报告
 ```
 
 需要 PyTorch（CUDA 可选）、numpy、pillow、pytest。
+
+部分DTK构建会尝试加载未提供的FlashAttention库；训练可显式使用
+`--sdpa-backend math` 选择PyTorch内置注意力，默认仍为自动选择。
+单条完整轨迹的清理、覆盖检查、远程SHA校验和训练启动可用
+`python tools/start_ready_training.py --plan <launch-plan.json>` 串接；
+具体路径与本轮配置见[续接记录](docs/continuation_2026-11-15.md#8-t0-完成提前清理并排入正式训练1707之后)。
 
 ## 许可
 
