@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
+from lpp.canvas import build_training_canvases  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E402
 from lpp.data.splits import load_split_manifest  # noqa: E402
@@ -44,12 +45,16 @@ def lr_at(step, args):
     return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
 
 
-def to_gpu(batch: dict, encoder) -> dict:
-    """Tensors to the GPU; caption strings through the frozen text encoder."""
+def to_gpu(batch: dict, encoder, codec=None, model_cfg=None) -> dict:
+    """Tensors to the GPU; caption strings through the frozen text encoder; checkpoint
+    canvases rendered for canvas-feedback models."""
     captions = batch.pop("captions", None)
     batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
     if captions is not None and encoder is not None:
         batch["text"], batch["text_valid"] = encoder(captions)
+    if model_cfg is not None and model_cfg.canvas:
+        batch["canvas"], batch["seg"] = build_training_canvases(batch, codec, model_cfg.canvas_k,
+                                                                model_cfg.canvas_size)
     return batch
 
 
@@ -84,7 +89,7 @@ def render_samples(model, codec, n, path, seed, encoder=None, cfg_scale=2.0):
     if encoder is not None:
         text, text_valid = encoder(SAMPLE_PROMPTS[:n])
         sc.cfg_scale = cfg_scale
-    seqs = generate(model, batch=n, cfg=sc, text=text, text_valid=text_valid, generator=g)
+    seqs = generate(model, batch=n, cfg=sc, text=text, text_valid=text_valid, generator=g, codec=codec)
     tiles, orphan = [], []
     for s in seqs:
         attrs, lay = paint_order(s)
@@ -126,6 +131,13 @@ def main() -> None:
     ap.add_argument("--text-encoder", type=Path, default=None, help="Chinese-CLIP model directory")
     ap.add_argument("--text-drop", type=float, default=0.1, help="caption dropout (for CFG)")
     ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for text-conditioned samples")
+    ap.add_argument("--canvas", action="store_true", help="canvas feedback (docs/canvas_feedback_design.md)")
+    ap.add_argument("--canvas-k", type=int, default=32)
+    ap.add_argument("--canvas-size", type=int, default=64)
+    ap.add_argument("--perturb", type=float, default=0.0, help="share of training sequences with a corrupted history")
+    ap.add_argument("--init-weights", type=Path, default=None,
+                    help="start a NEW run from these weights (fresh optimizer and step; missing modules such "
+                         "as canvas layers start at their init). Not the same as --resume.")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.workers is None:
@@ -160,12 +172,14 @@ def main() -> None:
         print(f"text conditioning: {len(store.vlm)} VLM-captioned, {len(store.attrs)} with attributes, "
               f"caption dropout {args.text_drop}")
     train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed, captions=store,
-                               p_text_drop=args.text_drop)
+                               p_text_drop=args.text_drop, p_perturb=args.perturb)
     val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0,
                              captions=store, p_text_drop=0.0)
     print(f"{len(files)} shards, {len(train_ds)} train / {len(val_ds)} val sequences")
 
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
+    if args.canvas:
+        cfg.canvas, cfg.canvas_k, cfg.canvas_size = True, args.canvas_k, args.canvas_size
     if encoder is not None and cfg.text_dim != encoder.dim:
         raise SystemExit(f"model text_dim {cfg.text_dim} != text encoder width {encoder.dim}")
     model = Painter(cfg, proto, codec).cuda()
@@ -174,6 +188,13 @@ def main() -> None:
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd},
                              {"params": no_decay, "weight_decay": 0.0}],
                             lr=args.lr, betas=(0.9, 0.95), fused=True)
+    if args.init_weights and not (args.resume and (args.out / "last.pt").exists()):
+        src = torch.load(args.init_weights, map_location="cuda", weights_only=False)
+        missing, unexpected = model.load_state_dict(src["model"], strict=False)
+        if unexpected:
+            raise SystemExit(f"--init-weights has parameters this model lacks: {unexpected[:5]}")
+        print(f"initialised from {args.init_weights} (step {src.get('step')}); "
+              f"{len(missing)} new tensors start fresh: {sorted({k.split('.')[0] for k in missing})}")
     step = 0
     ckpt = args.out / "last.pt"
     if args.resume and ckpt.exists():
@@ -194,7 +215,7 @@ def main() -> None:
             g["lr"] = lr_at(step, args)
         totals = {}
         for _ in range(args.accum):
-            batch = to_gpu(next(train_it), encoder)
+            batch = to_gpu(next(train_it), encoder, codec, cfg)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 losses = fwd(batch)
             (losses["loss"] / args.accum).backward()
@@ -208,7 +229,9 @@ def main() -> None:
 
         if step % 50 == 0:
             dt = time.perf_counter() - t0
-            rec = {"step": step, "lr": lr_at(step, args), "gnorm": round(gnorm, 3),
+            gates = ([round(float(torch.tanh(c.gate.detach())), 4) for c in model.cross.values()]
+                     if model.cfg.canvas else None)
+            rec = {"step": step, "lr": lr_at(step, args), "gnorm": round(gnorm, 3), "canvas_gates": gates,
                    "records_per_s": round(seen / dt), **{k: round(v, 4) for k, v in totals.items()}}
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
@@ -220,7 +243,7 @@ def main() -> None:
             vals = {}
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for _ in range(10):
-                    batch = to_gpu(next(val_it), encoder)
+                    batch = to_gpu(next(val_it), encoder, codec, cfg)
                     for k, v in model(batch).items():
                         vals[k] = vals.get(k, 0.0) + v.item() / 10
             lens = render_samples(model, codec, 6, args.out / f"samples_{step:06d}.png", seed=step,

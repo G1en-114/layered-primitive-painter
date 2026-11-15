@@ -57,7 +57,7 @@ def main() -> None:
         orphan, lengths, early, tiles = [], [], 0, []
         for b0 in range(0, args.n, args.batch):
             g = torch.Generator(device="cuda").manual_seed(1000 + b0)
-            for s in generate(model, batch=min(args.batch, args.n - b0), cfg=sc, generator=g):
+            for s in generate(model, batch=min(args.batch, args.n - b0), cfg=sc, generator=g, codec=codec):
                 attrs, lay = paint_order(s)
                 lengths.append(len(s))
                 early += int(2 not in lay.tolist())

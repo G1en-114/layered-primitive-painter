@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from .model import Painter
+from .canvas import CanvasTracker
 from .sequence import KIND_BOS, KIND_CONTROL, KIND_PRIMITIVE, NO_ATTR, DrawSeq, Grammar
 
 
@@ -56,10 +57,13 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
 
 @torch.no_grad()
 def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, text=None, text_valid=None,
-             generator: torch.Generator | None = None, uniforms=None) -> list[DrawSeq]:
+             generator: torch.Generator | None = None, uniforms=None, codec=None,
+             canvas_history: list | None = None) -> list[DrawSeq]:
     """Generate `batch` drawing sequences from BOS (optionally text-conditioned).
 
     uniforms: optional callable (step, field) -> [B] tensor in [0, 1) replacing the RNG.
+    codec: required for models with canvas feedback (decodes primitives to render the canvas).
+    canvas_history: if a list is given, it receives each sample's canvases at every checkpoint.
     """
     cfg = cfg or SampleConfig()
     model.eval()
@@ -98,7 +102,17 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     if Lt:
         x = torch.cat([model.embed_text(text), x], 1)
         valid = torch.cat([text_valid, valid], 1)
-    h = model.backbone(x, valid, cache)[:, -1]
+    tracker = None
+    if model.cfg.canvas:
+        if codec is None:
+            raise ValueError("a canvas-feedback model needs `codec` to render its canvas")
+        tracker = CanvasTracker(model, codec, B, dev, record=canvas_history is not None)
+        draw = torch.zeros(R, valid.shape[1], dtype=torch.bool, device=dev)
+        draw[:, -1] = True                                  # the BOS sees the blank canvas; text does not
+        ctx = ("current", rows(tracker.tokens), draw)
+    else:
+        ctx = None
+    h = model.backbone(x, valid, cache, canvas_ctx=ctx)[:, -1]
 
     out = {k: [v[:, 0]] for k, v in (("kind", rec_kind), ("event", rec_event), ("layer", rec_layer),
                                       ("attrs", rec_attrs))}
@@ -141,8 +155,13 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
             break
         x = model.embed_records(rows(kind)[:, None], rows(event)[:, None], rows(layer)[:, None],
                                 rows(attrs)[:, None])
-        h = model.backbone(x, rows(live)[:, None], cache)[:, -1]
+        if tracker is not None:
+            tracker.update(kind, attrs, layer, live)
+            ctx = ("current", rows(tracker.tokens), torch.ones(R, 1, dtype=torch.bool, device=dev))
+        h = model.backbone(x, rows(live)[:, None], cache, canvas_ctx=ctx)[:, -1]
 
+    if tracker is not None and canvas_history is not None:
+        canvas_history.extend(tracker.history)
     kinds = torch.stack(out["kind"], 1)
     events = torch.stack(out["event"], 1)
     layers = torch.stack(out["layer"], 1)

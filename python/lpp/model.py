@@ -43,6 +43,13 @@ class ModelConfig:
     max_positions: int = 1024
     rope_base: float = 10000.0
     fourier_freqs: int = 8
+    # canvas feedback (docs/canvas_feedback_design.md): a small CNN encodes the canvas rendered at
+    # checkpoints; gated cross-attention after every `canvas_every` backbone blocks reads it
+    canvas: bool = False
+    canvas_k: int = 32          # a checkpoint every k primitives (and at every control record)
+    canvas_size: int = 64
+    canvas_every: int = 4
+    canvas_width: int = 64
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -133,6 +140,78 @@ class Block(nn.Module):
         return x + self.ff(self.n2(x))
 
 
+class CanvasEncoder(nn.Module):
+    """[N, C, S, S] canvas -> [N, (S/8)^2, d] tokens with a learned 2D position embedding."""
+
+    def __init__(self, in_ch: int, d: int, size: int, width: int):
+        super().__init__()
+        w = width
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, w, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(w, 2 * w, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(2 * w, 4 * w, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(4 * w, d, 1),
+        )
+        self.n_tokens = (size // 8) ** 2
+        self.pos = nn.Parameter(torch.zeros(self.n_tokens, d))
+        nn.init.normal_(self.pos, std=0.02)
+
+    def forward(self, canvas):
+        return self.net(canvas).flatten(2).transpose(1, 2) + self.pos
+
+
+class CanvasCross(nn.Module):
+    """Gated cross-attention from sequence positions to the canvas tokens of their checkpoint.
+
+    The gate starts at 0, so a model with canvas feedback starts out exactly equal to one
+    without it (and can be initialised from such a checkpoint)."""
+
+    def __init__(self, d: int, n_heads: int):
+        super().__init__()
+        self.h, self.hd = n_heads, d // n_heads
+        self.norm_q, self.norm_kv = nn.RMSNorm(d), nn.RMSNorm(d)
+        self.q = nn.Linear(d, d, bias=False)
+        self.kv = nn.Linear(d, 2 * d, bias=False)
+        self.o = nn.Linear(d, d, bias=False)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def attend(self, q_in, tokens):
+        """q_in [N, Lq, d], tokens [N, Lk, d] -> [N, Lq, d]."""
+        N, Lq, d = q_in.shape
+        q = self.q(self.norm_q(q_in)).view(N, Lq, self.h, self.hd).transpose(1, 2)
+        k, v = self.kv(self.norm_kv(tokens)).view(N, -1, 2, self.h, self.hd).permute(2, 0, 3, 1, 4)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return self.o(out.transpose(1, 2).reshape(N, Lq, d))
+
+    def forward(self, x, ctx):
+        """ctx = ("segments", tokens [B, S, n, d], seg [B, T]) for teacher-forced training, or
+        ("current", tokens [B, n, d], draw [B, T]) for decoding (every drawing position of this
+        call sees its row's current canvas)."""
+        mode = ctx[0]
+        if mode == "current":
+            _, tokens, draw = ctx
+            out = self.attend(x, tokens) * draw.unsqueeze(-1)
+            return x + torch.tanh(self.gate) * out
+        _, tokens, seg = ctx
+        B, T, d = x.shape
+        S = tokens.shape[1]
+        has = seg >= 0
+        # group positions by the checkpoint they see: [B*S, Lmax, d]
+        # running max keeps the index non-decreasing (searchsorted needs that): leading text
+        # positions stay 0, trailing padding repeats the last checkpoint; both are masked out
+        segc = torch.cummax(seg.clamp(min=0), dim=1).values
+        first = torch.stack([torch.searchsorted(segc[b].contiguous(), segc[b].contiguous()) for b in range(B)])
+        off = torch.arange(T, device=x.device)[None] - first
+        Lmax = int(off[has].max()) + 1 if bool(has.any()) else 1
+        flat = (torch.arange(B, device=x.device)[:, None] * S + segc) * Lmax + off
+        grouped = x.new_zeros(B * S * Lmax, d)
+        grouped[flat[has]] = x[has]
+        out = self.attend(grouped.view(B * S, Lmax, d), tokens.reshape(B * S, -1, d)).view(-1, d)
+        delta = out.new_zeros(B, T, d)          # attention output dtype (bf16 under autocast)
+        delta[has] = out[flat[has]]
+        return x + torch.tanh(self.gate) * delta
+
+
 class Fourier(nn.Module):
     """Ordinal token -> sin/cos features of its normalized value -> Linear.
 
@@ -215,6 +294,10 @@ class Painter(nn.Module):
         self.blocks = nn.ModuleList(Block(d, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, rope)
                                     for _ in range(cfg.n_layers))
         self.norm = nn.RMSNorm(d)
+        if cfg.canvas:
+            self.canvas_enc = CanvasEncoder(3 + proto.num_layers, d, cfg.canvas_size, cfg.canvas_width)
+            self.cross = nn.ModuleDict({str(li): CanvasCross(d, cfg.n_heads) for li in range(cfg.n_layers)
+                                        if (li + 1) % cfg.canvas_every == 0})
 
         # attribute decoder
         self.dec_in = nn.Linear(d, dd)
@@ -250,8 +333,9 @@ class Painter(nn.Module):
     def embed_text(self, text):
         return self.text_proj(text) + self.kind_emb.weight[0]
 
-    def backbone(self, x, valid, cache: KVCache | None = None):
-        """x [B, T, d], valid [B, T] -> hidden [B, T, d]. With a cache, x continues it."""
+    def backbone(self, x, valid, cache: KVCache | None = None, canvas_ctx=None):
+        """x [B, T, d], valid [B, T] -> hidden [B, T, d]. With a cache, x continues it.
+        canvas_ctx: see CanvasCross.forward (None: no canvas feedback)."""
         B, T, _ = x.shape
         if cache is None:
             pos = (valid.long().cumsum(1) - 1).clamp(min=0)
@@ -268,6 +352,8 @@ class Painter(nn.Module):
         mask = mask.unsqueeze(1)
         for li, blk in enumerate(self.blocks):
             x = blk(x, pos, mask, cache, li)
+            if canvas_ctx is not None and str(li) in getattr(self, "cross", {}):
+                x = self.cross[str(li)](x, canvas_ctx)
         if cache is not None:
             cache.length += T
             cache.next_pos += valid.long().sum(1)
@@ -304,7 +390,15 @@ class Painter(nn.Module):
             Lt = batch["text"].shape[1]
             x = torch.cat([self.embed_text(batch["text"]), x], 1)
             valid = torch.cat([batch["text_valid"], valid], 1)
-        h = self.backbone(x, valid)[:, Lt:]
+        canvas_ctx = None
+        if self.cfg.canvas and batch.get("canvas") is not None:
+            B, S = batch["canvas"].shape[:2]
+            tokens = self.canvas_enc(batch["canvas"].flatten(0, 1)).view(B, S, -1, self.cfg.d_model)
+            seg = batch["seg"]
+            if Lt:
+                seg = torch.cat([torch.full((B, Lt), -1, dtype=seg.dtype, device=seg.device), seg], 1)
+            canvas_ctx = ("segments", tokens, seg)
+        h = self.backbone(x, valid, canvas_ctx=canvas_ctx)[:, Lt:]
 
         tgt_event, tgt_attrs = batch["tgt_event"], batch["tgt_attrs"]
         sel = tgt_event >= 0

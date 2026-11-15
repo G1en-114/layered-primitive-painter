@@ -40,6 +40,7 @@ class DrawSeq:
     event: torch.Tensor    # [T] long, event id (PRIMITIVE for primitives, -1 for BOS)
     attrs: torch.Tensor    # [T, A] long, attribute tokens, NO_ATTR on non-primitive records
     layer: torch.Tensor    # [T] long, layer the record belongs to / opens (-1 for BOS, EOS)
+    no_target: torch.Tensor | None = None   # [T] bool: perturbed records, never used as targets
 
     def __len__(self) -> int:
         return self.kind.numel()
@@ -220,3 +221,82 @@ def paint_order(seq: DrawSeq) -> tuple[torch.Tensor, torch.Tensor]:
     attrs, lay = seq.attrs[is_prim], seq.layer[is_prim]
     order = torch.sort(lay, stable=True).indices
     return attrs[order], lay[order]
+
+
+def perturb(seq: DrawSeq, rng: random.Random, proto: Protocol | None = None, frac: float = 0.05,
+            max_ops: int = 40) -> DrawSeq:
+    """Corrupt a few primitives so the model sees mistakes in its history (and its canvas)
+    and learns to continue well after them (exposure bias, cf. Self Forcing).
+
+    About `frac` of the primitives get one operation each:
+        jitter  move / resize / recolour / change opacity a little
+        delete  only primitives with primitives on both sides (grammar stays valid)
+        insert  a small random primitive in the same layer (if the layer cap allows)
+    Jittered and inserted records are marked `no_target`: the model must not learn to
+    produce them, only to continue after them. Deleted ones simply vanish.
+    """
+    proto = proto or load_protocol()
+    vocab = proto.attr_vocab_sizes
+    names = proto.attr_names
+    n = len(seq)
+    prim = [i for i in range(n) if int(seq.kind[i]) == KIND_PRIMITIVE]
+    if not prim:
+        return seq
+    k = min(max_ops, max(1, round(frac * len(prim))))
+    chosen = set(rng.sample(prim, k))
+    counts: dict[int, int] = {}
+    for i in prim:
+        counts[int(seq.layer[i])] = counts.get(int(seq.layer[i]), 0) + 1
+
+    def jitter(a: torch.Tensor) -> torch.Tensor:
+        a = a.clone()
+        for j, nm in enumerate(names):
+            v = vocab[nm]
+            step = max(1, v // 32)                                  # ~3% of the range
+            if nm in ("x", "y"):
+                a[j] = min(v - 1, max(0, int(a[j]) + rng.randint(-step, step)))
+            elif nm == "theta":                                      # periodic: wrap around
+                a[j] = (int(a[j]) + rng.randint(-v // 16, v // 16)) % v
+            elif nm == "color":
+                if rng.random() < 0.3:
+                    a[j] = rng.randrange(v)
+            elif rng.random() < 0.5:   # sigma_x, sigma_y, beta, alpha (and v1 shape): small step
+                a[j] = min(v - 1, max(0, int(a[j]) + rng.randint(-step, step)))
+        return a
+
+    def speck(layer_id: int) -> torch.Tensor:
+        a = torch.zeros(len(names), dtype=torch.long)
+        for j, nm in enumerate(names):
+            v = vocab[nm]
+            if nm in ("sigma_x", "sigma_y"):
+                a[j] = rng.randrange(0, max(1, v // 4))           # small
+            else:
+                a[j] = rng.randrange(v)
+        return a
+
+    kind, event, attrs, layer, bad = [], [], [], [], []
+    for i in range(n):
+        rec = (seq.kind[i], seq.event[i], seq.attrs[i], seq.layer[i])
+        if i in chosen:
+            op = rng.random()
+            lay = int(seq.layer[i])
+            if op < 0.25 and 0 < i < n - 1 and int(seq.kind[i - 1]) == KIND_PRIMITIVE \
+                    and int(seq.kind[i + 1]) == KIND_PRIMITIVE:
+                counts[lay] -= 1
+                continue                                           # delete
+            if op < 0.5 and counts[lay] < proto.layers[lay].max_primitives:
+                kind += [rec[0], rec[0]]                           # keep, then insert a speck after it
+                event += [rec[1], rec[1]]
+                attrs += [rec[2], speck(lay)]
+                layer += [rec[3], rec[3]]
+                bad += [False, True]
+                counts[lay] += 1
+                continue
+            rec = (rec[0], rec[1], jitter(rec[2]), rec[3])         # jitter
+            kind.append(rec[0]), event.append(rec[1]), attrs.append(rec[2]), layer.append(rec[3])
+            bad.append(True)
+            continue
+        kind.append(rec[0]), event.append(rec[1]), attrs.append(rec[2]), layer.append(rec[3])
+        bad.append(False)
+    return DrawSeq(torch.stack(kind), torch.stack(event), torch.stack(attrs), torch.stack(layer),
+                   torch.tensor(bad))

@@ -106,3 +106,27 @@ def test_fresh_generation_has_no_special_markers(proto):
     g.bos()
     names = {proto.events[e] for e in g.allowed_events()}
     assert not any(n.startswith(("REDRAW", "REFINE")) for n in names)
+
+
+def test_perturbed_sequences_stay_grammatical(proto):
+    from lpp.sequence import perturb
+    rng = random.Random(0)
+    tokens, layer, rounds = fake_decomposition(6)
+    for _ in range(30):
+        seq = build(tokens, layer, rounds, **sample_mode(layer, rounds, rng))
+        p = perturb(seq, rng, proto, frac=0.3)
+        validate(p)
+        assert p.no_target is not None and len(p.no_target) == len(p)
+        assert not bool(p.no_target[p.kind != 3].any())          # only primitives are ever marked
+
+
+def test_perturbed_records_are_not_targets(proto):
+    from lpp.data.sequences import collate
+    from lpp.sequence import perturb
+    tokens, layer, rounds = fake_decomposition(7)
+    p = perturb(build(tokens, layer, rounds), random.Random(1), proto, frac=0.5)
+    b = collate([(p, None)])
+    bad_next = p.no_target[1:]
+    assert bool(bad_next.any())
+    assert (b["tgt_event"][0, : len(p) - 1][bad_next] == -1).all()
+    assert (b["tgt_event"][0, : len(p) - 1][~bad_next] >= 0).all()
