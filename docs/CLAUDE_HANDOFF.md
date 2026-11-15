@@ -1,262 +1,188 @@
-# Claude 接续计划：Layered Primitive Painter
+# Claude 最新交接：v2 已正式开训，继续数据生成与训练验证
 
-> 历史交接快照：本文记录的是12:46状态，之后已经实现v2、中文条件、画布反馈等。
-> 当前接续请先阅读 [最新续接记录](continuation_2026-11-15.md)，不要照旧状态重复启动任务。
+状态核查：2026-11-15 **纽约时间17:27左右**（UTC22:27），工作目录 `/home/martis/picture_train`。
+接续 Claude 会话 `4612f68c-db51-4649-9c22-cc88ed5b4fc5`。
 
-交接时间：2026-11-15，纽约时间约 12:46。工作目录：`/home/martis/picture_train`。
-这是一份执行计划；状态数字是交接快照，接手后先查日志更新，不要当作实时进度。
+**先查实际进程和日志，保持已运行的训练与数据任务继续执行。当前已经正式开训，不要重新启动另一份。**
+本文数字及PID都是核查快照；不要把静态数字当实时状态。
 
-## 直接给 Claude 的任务
+## 1. 接手后立即做什么
 
-请先阅读本文件、用户提供的 AGENTS.md 规则和现有 git diff，然后按 P0 → P1 的顺序执行。
-先把现有数据任务收好，并用固定样本改善图元教师质量，产出对照图和实验表；不要再次停留在方案讨论。
-后续按 P2–P5 推进，依据实验结果决定是否改变表示和协议。过程中持续记录原因、命令、结果和下一步。
+1. 阅读用户的AGENTS规则、本文与 `git status`。代码截至 `00af76f` 已push到origin/main；
+   本交接会另行提交，实际HEAD以git log为准。详细过程见 `docs/continuation_2026-11-15.md`。
+2. 核实远程训练仍在推进，优先关注第500步检查点与第1000步验证/样图。
+3. 保持本地轨迹队列、远程三项分解和跨机器同步继续运行，检查错误和产物完整性。
+4. 四轨迹完成后检查清理结果，为下一阶段多轨迹训练准备数据；与当前t0阶段分开记录。
 
-用户目标：约一个月内做成求职项目，面向 AI 部署工具、高性能算子岗位。
-用户已将产品范围扩展为真人、风景、动物、物体的通用可编辑分层绘画；动漫作为风格后训练方向。
-现阶段优先完成扎实基线，不同时重写所有模块。
+用户之前询问本地GPU服务，只要求查看，**没有要求停掉本地任务**。
 
-## 一、真实状态
+## 2. 正式训练已经运行
 
-### 正在运行的任务
+- 启动时间：2026-11-15纽约时间 **17:24:23**。
+- 远程训练PID快照：**29620**，已核实存活且实际输出训练指标。
+- 运行目录：`/root/private_data/runs/small_v2_t0_text_canvas/`。
+- 最新已核实：**step200 / 8000，loss36.2179，gnorm4.27**。
+- step50/100/150的loss分别39.8792 / 38.2527 / 37.0078，梯度有限。
+- 当前约26080 records/s；这是图元序列记录吞吐，不是图片/秒。
+- 第500步才首次保存 `last.pt`；本次step200检查时尚无检查点，属于预期。
+- 第1000步才进行首轮验证、采样并生成 `samples_001000.png`。目前不能评价生成质量或收敛。
 
-| 任务 | 交接快照 | 路径/说明 |
+实际配置：
+
+| 项目 | 配置 |
+|---|---|
+| 模型 | v2 small，约20.41M参数，从头初始化；未加载v1权重 |
+| 数据 | t0完整30000张清理序列，29400 train / 600 val |
+| 序列协议 | v2，9步：事件+8项属性 |
+| 条件 | 冻结Chinese-CLIP；中文长/短描述、随机属性模板；text dropout0.1 |
+| 画布与扰动 | canvas K32、64px；历史扰动概率0.3 |
+| 训练 | batch32，8000步，seed0，workers2，OMP/MKL各4 |
+| 优化 | AdamW，lr3e-4、min_lr3e-5、warmup500、wd0.1、梯度裁剪1.0 |
+| 采样/保存 | CFG2.0；每500步保存，每1000步验证与采样 |
+| 后端 | LPP_RASTER=native，LPP_EXT_BUILD=/root/private_data/ext_build_v2，SDPA math |
+
+重要文件：
+
+- 真实训练指标：`/root/private_data/runs/small_v2_t0_text_canvas/log.jsonl`。
+- stdout和错误：同目录 `train.stdout.log`。
+- 启动时间、真实argv、PID、清理统计：同目录 `launch.json`。
+- 本机启动计划：`/home/martis/picture_train/data/launch_small_v2_t0.json`。
+- 本机启动结果：同名 `.state.json`，当前阶段 `training_launched`；同名 `.log`记录全过程。
+- 启动器已经完成并退出，不需要重启它。它对重复启动和已有训练目录有保护。
+
+远程读取命令（已有SSH主连接；x是占位名，不能假定DNS可解析）：
+
+```sh
+ssh -F /dev/null -S /run/user/1000/scnet.sock -o BatchMode=yes -o ConnectTimeout=12 -o LogLevel=ERROR x \
+  'tail -n 4 /root/private_data/runs/small_v2_t0_text_canvas/log.jsonl; tail -n 8 /root/private_data/runs/small_v2_t0_text_canvas/train.stdout.log; ps -p 29620 -o pid,etime,stat,args'
+```
+
+连接失效时先确认socket/主连接，不要从旧聊天复制凭据到文件，也不要凭空重建未知端点。
+
+## 3. 本地GPU现在在做什么
+
+17:27核查：RTX5070 Laptop 8GB，GPU利用率100%，总显存1902MiB。
+
+| 本机进程快照 | 工作 | GPU占用 |
 |---|---|---|
-| 本机 CelebAMask-HQ 分解 | 19096/30000；19 个完整分片 | `data/decompose_v0.log`；`data/seq/v0/` |
-| 远程中文标注 | 12544/30000，约 3 张/秒，日志 unparsed=0 | `/root/private_data/caption_full.log`、`captions.jsonl` |
-| 远程 small 试训 | 已结束 3000 步；val loss=20.0401 | `/root/private_data/runs/small_v0a/` |
-| 新模型训练 | 没有运行 | 不要把数据处理或逐图优化说成训练了新模型 |
+| 444466 | t1偶数分片分解，seed1，batch32，steps80，part0/2 | 约1840MiB |
+| 444424 | 本机有限轨迹队列，等待t1后运行t2、t3 | 未列入GPU计算进程 |
+| 457459 | 远程分片汇集、SHA校验及后续清理控制器 | 当前未列入GPU计算进程 |
+| kwin_wayland，PID1484 | 桌面合成器 | 约7MiB |
 
-本机正在运行的配置：`data/seq/v0/config.json`，**steps=80、seed=0、flip=false**。
-脚本默认 steps=120；恢复旧任务必须显式保持 80，否则新增的配置保护会拒绝混写。
-重启会跳过完整分片，当前未完成分片会重新计算。先确认任务是否仍在运行，避免启动第二份。
-
-远程现有标注进程 PID 在交接时为 12317；不应依赖 PID 永久不变，也不要启动第二个同输出进程。
-使用个人数据目录保留产物，未获新指示不要关闭正在运行的 notebook。
-
-### SSH 与环境
-
-已有 SSH ControlMaster socket：`/run/user/1000/scnet.sock`。只读核对已确认目标是用户 SCNet 个人数据目录。
+没有发现额外的本地模型推理服务或本地正式训练进程。
+先前t0清理PID464967、启动器PID467334已经完成，不应把它们当作仍运行的GPU任务。
 
 ```sh
-# 避开本环境 /etc/ssh 配置权限问题，复用已有连接
-ssh -F /dev/null -S /run/user/1000/scnet.sock -o BatchMode=yes -o ConnectTimeout=12 x \
-  'tail -2 /root/private_data/caption_full.log; wc -l /root/private_data/captions.jsonl'
+nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader
+cat /home/martis/picture_train/data/trajectory_plan_local_v2.state.json
+tail -n 3 /home/martis/picture_train/data/decompose_v2_t1_local.log
 ```
 
-`x` 在这里是已有主连接的占位主机名；socket 失效后不要假定它能直接解析或凭空重建连接。
-文档不含密码；不要从旧聊天里复制密码进代码、日志或计划。
+## 4. 四轨迹进度与控制器
 
-- 本机唯一 ML 环境：`/home/martis/AI infra/.venv/bin/python`，uv 管理，torch 2.15.0+cu132，RTX5070 Laptop 8GB。
-- 不新建 CUDA 环境，不重复安装 torch/CUDA 包；本轮未增删包。
-- 本机临时原生扩展缓存：`/tmp/lpp-native-verify`；原先持久缓存也在 `~/.cache/lpp/ext`。
-- 远程是海光 BW 64GB、DTK26.04、torch2.9/HIP；无 Triton，使用原生 HIP。
-- 远程持久扩展缓存：`LPP_EXT_BUILD=/root/private_data/ext_build`。
-- 远程代码：`/root/private_data/lpp`。此前仅同步了 HIP 接入、选择测试与文档；**本轮新加的动漫工具和数据尚未同步**。
-- 远程容器 CPU 配额约 15 核，不能按宿主机 128 核开线程；使用已有 runtime_env 配额逻辑。
-- 有 50 小时卡时是用户最初提供的额度，不代表现在还剩 50 小时；不要据此承诺剩余预算。
+同一批30000张原图的四种轨迹，共120000条序列，**不是120000张独立图片**。
+每条本机负责15000张偶数分片，远程负责15000张奇数分片。
+以下图片数包含未落盘分片中的已完成批次：
 
-## 二、已有实现与未实现边界
+| 轨迹 | seed / flip | 本机 | 远程 | 原始目录后缀 |
+|---|---|---:|---:|---|
+| t0 | 0 / false | 15000，完成 | 15000，完成 | seq/v2 |
+| t1 | 1 / false | 12256 | 9032 | seq/v2_t1 |
+| t2 | 2 / true | 等待 | 3032 | seq/v2_t2 |
+| t3 | 3 / true | 等待 | 2352 | seq/v2_t3 |
 
-已经有：协议、码本/量化、PyTorch 参考与 Triton/CUDA/HIP 光栅化、分层分解、两级 Transformer、
-训练循环、BOS 开始的参考采样器、REDRAW/REFINE 协议与训练样本、数据预处理。
+远程t1/t2/t3实际并行运行，PID快照22694 / 25039 / 25954。
+远程t0的18481已正常结束。控制器25955依次加入既有进程等待和验证，不再派生相同输出任务。
+不要看到控制器只写“waiting t1”就误认为t2/t3没运行。
 
-尚未完整接通：
+本机文件：
 
-- **中文条件训练**：模型支持文本特征接口，数据集有 text_fn，但 train.py 仍未传入真实文字特征。
-  caption 生成完成不等于文本训练已实现；当前 small 是无条件模型。
-- **交互局部编辑**：generate() 从 BOS 开始；尚无完整的已有图元前缀编辑/恢复推理入口。
-- **连续修正预测头**：没有训练；probe 只是拿着原图逐张优化。
-- 通用实例图层、全局粗绘+局部续画、原图图像损失、LoRA、正式动漫后训练均未完成。
-- ONNX 导出、C++ 推理、量化工具链仍属项目后半程。
+- 计划 `/home/martis/picture_train/data/trajectory_plan_local_v2.json`。
+- 状态同名 `.state.json`、队列日志同名 `.log`。
+- 各轨迹日志：`/home/martis/picture_train/data/decompose_v2_local.log`及`decompose_v2_t1_local.log`、
+  `decompose_v2_t2_local.log`、`decompose_v2_t3_local.log`。
+- 同步状态 `/home/martis/picture_train/data/trajectory_plan_local_v2.sync.json`，日志同名 `.sync.log`。
 
-## 三、git 与测试状态
+远程文件：
 
-HEAD：`88d507e`。工作树有跨 Claude/Codex 会话的 **已暂存、未暂存、新文件混合修改，尚未提交**。
-不要 reset、clean 或覆盖这些改动，也不要把它们误认为无关用户修改。
-提交仅使用用户当前 git identity，不设 author、不改身份、不加 AI co-author/Generated with 文案。
-本轮只写交接文档，不代替用户启动新的 Claude 会话。
+- 计划 `/root/private_data/trajectory_plan_dcu_v2.json`，状态同名 `.state.json`，日志同名 `.log`。
+- 分解日志 `/root/private_data/decompose_v2_dcu.log`及`t1/t2/t3`对应的`decompose_v2_tN_dcu.log`。
+- 新代码目录 `/root/private_data/lpp_next`，后续任务使用该目录。
+- 老t0记录的协议位于 `/root/private_data/lpp/protocol.json`；与lpp_next协议内容哈希相同。
 
-主要修改组：
+本机同步器每60秒收集已原子落盘的远程分片并核对SHA。
+当前阶段collecting，无报错；t0已验证30000张，其他原始完整分片在持续汇集。
+四条原始轨迹全部完成后自动调用清理，输出 `/home/martis/picture_train/data/seq/v2_clean/t0..t3/`。
+已有t0清理结果会核对源SHA后跳过，不重复生成。
 
-1. HIP/CUDA：`csrc/raster/raster_ext.cu`、`python/lpp/render/{native_raster,tiles,dispatch,triton_raster}.py`，
-   fast-raster/dispatch 测试与 benchmark；旧 test_triton_raster.py 已重命名为 test_fast_raster.py。
-2. caption_vlm.py：HIP 强制 math SDPA，改成两行中文输出与单行回退，batch128、max-new-tokens110。
-3. 动漫：`python/lpp/data/anime.py`、`splits.py`，`tools/prepare_anime.py`、`segment_anime.py`。
-4. `tools/decompose_dataset.py` 新增 --protocol、--ids-file、输出配置一致性保护。
-5. `tools/train.py` 新增 --protocol、--split-manifest，保存 protocol 元数据；**尚无 --init-weights**。
-6. `tools/probe_raw_supervision.py`：有界逐图参数优化、量化对照、连续参数保存；不是训练器。
+**自动流程的边界：** 其余清理轨迹不会自动发布到远程，也不会热加入正在运行的t0训练。
+当前DataLoader在启动时固定；后续多轨迹阶段需要明确同步、检查并另外启动。
 
-已做验证：
+## 5. 已就绪的数据与关键修复
 
-- HIP 接入时完整测试：本机 84 passed，远程 69 passed；这些数字早于动漫新增代码。
-- 动漫/显式划分/原有协议测试：17 passed。
-- 8 条动漫序列 grammar 验证，tiny 模型用两层 profile 做过一次前向/反向。
-- 全部 1000 张动漫原始字节 SHA256、RGB/label/alpha 对齐及划分互斥检查通过。
-- 改动文件的基础 Ruff E4/E7/E9/F 检查、git diff HEAD --check 通过。
-- 没有宣称全部新增代码已重新通过本机和远程完整套件；正式提交前补适当检查。
+- 训练清理目录：本机 `/home/martis/picture_train/data/seq/v2_clean/t0/`；
+  远程 `/root/private_data/seq/v2_clean/t0/`，30片均已同步并逐文件SHA校验。
+- 图元数21536248→20653078，删除约4.10%；平均PSNR损失0.0307468dB，最大0.0999928dB。
+- 清理按真实RGB重新渲染计分；下降超过0.1dB保留原序列；原始元数据和源SHA保留。
+- 远程训练配置中保留了本机原始来源路径作为溯源，训练使用显式--data/--protocol路径。
+  不要为消除源路径外观差异重写已做SHA校验的文件。
+- 清理版描述：本机 `/home/martis/picture_train/data/captions/captions_clean_v1.jsonl`；
+  远程 `/root/private_data/captions_clean_v1.jsonl`，30000条、无缺失/重复/空描述。
+- 描述SHA：`4caa472301e3f3ab89df66d540f4d7bb50cd25706e143d80e98dc74071c45265`。
+- 17条截断/重复描述已单独重写，原始版本保留。未逐图人工审核全部描述。
+- 属性：本机 `/home/martis/picture_train/data/celebamask256/attributes.json`；远程同结构数据目录。
+- 固定划分：本机 `/home/martis/picture_train/data/celebamask256_split_v1.jsonl`；
+  远程 `/root/private_data/celebamask256_split_v1.jsonl`，29400 train / 600 val。
+  同一图片四条轨迹必须保持相同划分；四轨迹对应117600 train / 2400 val序列。
+- 文字编码器已修复96token隐式截断：先完整编码（容量512），再池化到32个特征位置。
+- 水平翻转序列自动交换描述里的显式左右方向，保留“左右”等成对表述。
+- 训练前31项运行时代码、协议和v2码本已核对本机/远程一致。
+- 当前协议SHA256：`bb54b53748557229f1135f26ad5ed9a750ff7410170930c396e47e5787a9d58c`。
 
-## 四、数据与结果在哪里
+## 6. 海光注意力兼容问题已解决
 
-### 真人
+实际开训检查发现无mask画布注意力尝试加载缺失的 `flash_attn_2_cuda*.so`。
+已给train.py增加显式 `--sdpa-backend math`，本次正式运行已带该参数。
+默认auto不变；没有安装FlashAttention、改系统环境或移除画布模块。
 
-- 原始：`data/raw/CelebAMask-HQ/`。
-- 256px 图片与六层标签：`data/celebamask256/`。
-- 正在生成的量化图元：`data/seq/v0/`。
-- 本机 JPEG 标注输入：`data/caption_images/`；VLM：`data/models/Qwen2.5-VL-7B-Instruct/`。
-- 远程 VLM、图片、描述：`/root/private_data/models/`、`caption_images/`、`captions.jsonl`。
-- 远程试训用约 6000 张旧子集，不是全量 30000；权重/日志/样图位于 `/root/private_data/runs/small_v0a/`。
-- 本机已取回样图：`data/remote_samples/small_v0a_step3000.png`。
+当前stdout可能仍显示“not compiled with memory efficient attention”的一次性警告。
+正式step200已实际运行成功，不要因这条警告擅自重装torch或安装CUDA包。
+恢复本次训练时保留math选项。单独做推理/评估时也需确保SDPA后端与该环境兼容。
 
-### 动漫：首批已完成清洗与伪标签
+真实batch32、完整中文/画布/扰动的两步检查已通过，峰值分配显存15.93GiB。
+本机结果 `/home/martis/picture_train/out/smoke_small_v2_t0_text_canvas.json`，远程同名JSON在个人数据根目录。
 
-- 来源 `huanngzh/anime_face_control_60k`；只下载 11 个 Parquet 中的第 1 个，5455 条。
-- 固定 revision：`04e4f951a987a668cd90e43c5db1bcbf74b986c2`。
-- 原始：`data/raw/anime_face_control_60k/`。**target 才是插画；source 是黑底关键点图。**
-- 处理后：`data/anime_portraits256_v1/`。
-- 扫描1139条，接受1000；排除124条标签项、13条非单人、2条关键点越界；这批检测到重复0条。
-- 生成1000张角色/背景掩码；953张自动检查通过：**902 train / 51 val**。
-- 47张隔离待复核，多数因为角色几乎占满画面，不等于47张都标错。
-- `manifest.jsonl`、`originals/`、images/labels/alpha_XXX.npy、eligible/train/val/review_ids.json 均已生成。
-- 原图是数据集提供的通常512px插画原字节，保留校验值；不是未经上游加工的更高分辨率原作。
-- 当前中文描述是头像标签模板，原有全身 prompt/BLIP 描述只作为元数据保存。
-- 原始ID映射为 `200000000 + source_id`，避免和真人 ID 冲突；后续来源也需独立命名空间。
-- pHash + RGB 校验含镜像近重复检查，不能声称已穷尽所有重复；扩充时需要跨分片统一去重。
-- 分割模型：`data/models/anime-seg/isnetis.onnx`，固定 revision
-  `493cb60893f47441b26ec4fb9a306bce9e342982`，输入1024px，CUDA工作区上限2.5GiB；全批约78秒。
-- `decomposition_protocol.json` 是独立的**两层实验 profile**，不是人工六层、不含真实 amodal 标注。
-  它与现有六层 checkpoint 的事件/embedding 尺寸不兼容，不能直接混合或 strict-load。
-- `data/seq/anime_pilot_v1/` 只有8张分解试验，平均21.78dB；其余945张尚未批量图元化。
+## 7. 后续执行顺序
 
-### 诊断实验：不能当成生成模型的结果
+1. **先确认训练持续推进。** 到500步检查last.pt及其step；1000步取回验证指标与六提示词样图，
+   检查文字条件、轮廓、图层、孤儿率、是否早停。早期训练loss下降只证明优化在运行。
+2. 继续收好t1/t2/t3。若控制器失败，核对实际argv、输出目录、锁、协议哈希、seed和flip后恢复；
+   不按旧PID盲目杀任务或启动重复生产者。
+3. 多轨迹清理完成后，验证每条覆盖30000张、源SHA、真实PSNR、固定划分及翻转描述一致性，
+   同步到远程并校验，再计划第二阶段。
+4. 第二阶段单独命名run，记录数据变化、优化器和学习率策略。
+   可以用--init-weights从本轮兼容权重开启新优化器；若用--resume延长总步数，注意余弦LR计划会改变。
+   不覆盖首阶段目录，不加载不兼容的v1形状词表。
+5. 当前用户已同意真人优先；动漫并行准备用于后训练，不把旧两层动漫序列混入六层v2。
+   风景/动物/物体仍是通用化后续方向，本轮尚未加入正式训练。
 
-| 样本 | 初始目标 | 80步量化感知修正 | 80步有界连续修正 |
-|---|---:|---:|---:|
-| 真人8张 | 26.18dB | 27.73dB | 31.48dB |
-| 动漫4张 | 21.55dB | 22.66dB | 27.37dB |
+v1对照模型已完成8000步，权重 `/home/martis/picture_train/out/baselines/small_v1data_step8000.pt`，
+采样评估在 `/home/martis/picture_train/out/sample_eval_v1data_final/`。
+v1与v2属性头/词表不同，不直接比较原始token loss；图像指标和采样条件需对齐。
 
-两分支从相同初始参数独立开始；保持图元数、图层、顺序和 beta 不变。连续分支拿到了目标原图。
-修正范围：xy±2像素、log_sigma±0.25、theta±0.25rad、RGB/alpha±0.10。
-这些结果提示拟合/量化值得改善，样本太小，不能说全数据或自由生成将获得同样增益。
+## 8. 环境、验证和提交规则
 
-- 真人：`out/raw_supervision_probe/metrics.json`、`comparison_compact.png`。
-- 动漫：`out/anime_raw_probe_000/metrics.json`、`continuous_parameters.npz`、`comparison.png`。
-- 8张动漫原图/标签/重建：`data/anime_portraits256_v1/decomposition_contact_sheet.jpg`。
+- 本机唯一CUDA/ML环境：`/home/martis/AI infra/.venv/bin/python`，uv管理；不要新装重复CUDA栈。
+- 远程使用已有python/torch2.9 HIP与DTK，海光BW 64GB；项目代码在lpp_next。
+- 最新完整回归 **148 passed in 29.98s**；Ruff E4/E7/E9/F及diff检查通过。
+- 远程文字/清理相关15项测试通过；正式前向反向和正式step200均已实测。
+- 不声称ONNX、C++推理、量化部署或动漫后训练已经完成。
+- 提交使用用户现有git身份，不改身份、不加AI co-author或Generated with标记。
+- 包/系统配置改动遵守用户系统变更日志、备份、Timeshift规则；本轮未做系统配置或包变更。
+- 本交接之前最近三次提交：00af76f（正式开训记录）、8ae0fc2（启动门槛与SDPA修复）、
+  ef76238（数据/文字/清理流水线），均已push。
 
-## 五、执行计划与验收
-
-### P0：先收好正在跑的基线
-
-1. 更新日志进度，确认进程状态；不重复跑、不无故终止。
-2. 分解结束后核对30个完整分片、30000个唯一ID、offset/token/layer/round一致性和数值有限性。
-3. 标注结束后核对30000个唯一ID、缺失/重复/空描述、输出截断和单行回退的比例。
-   日志 unparsed=0 只代表解析成功，不代表内容完整或正确；抽查不同构图与长描述。
-4. 回收远程 captions 至本机，保留原件与校验值。传输中断使用临时文件续传/原子完成，不覆盖唯一副本。
-5. 保留small_v0a权重、日志和固定样图。准备全量无条件small基线；文本条件另接真实文字特征，
-   不用随机特征假装已经接通。数据与配置版本必须写进产物。
-
-验收：一份清楚的数据审计表、可恢复路径、完整基线产物；不重新下载/重做已有正确数据。
-
-### P1：立即做固定样本的图元教师改进（当前最优先开发）
-
-先从合格动漫样本中按既有split固定64张train/16张val，另从真人固定32张对照。
-保存ID清单，不按好看的结果挑图；参数在train上选，val作独立判断。
-
-按一次只改一个因素的顺序比较：
-
-1. 当前80步基线及增加优化步数的控制组，避免把更多计算误认为新算法收益。
-2. 分层拟合结束后，全图联合的**量化感知**微调，约束越界与图层外观。
-3. 固定几何/alpha时的颜色拟合，再与几何优化交替；先推导适用于有序高斯合成的公式，
-   不能照搬POP2固定alpha的颜色求解。比较RGB误差与Oklab码本选择标准。
-4. 边缘/关键区域损失与预算分配：动漫细线、眼睛、轮廓优先；增加图元数时单独记为预算对照。
-5. 连续小残差与低比特残差实验，评估能保留多少连续优化收益，以及额外字节数和延迟。
-
-输出每图指标与同图对照：PSNR、结构/边缘指标、图层越界、图元数、时间、峰值显存、记录大小。
-不要求为了一个数字牺牲层的可编辑性。建议先以独立val平均至少约+1dB、没有明显视觉/越界退化为
-纯离散方案的采用起点；这是实验选择门槛，不是已保证的结果。未达标时说明失败原因并换路线。
-
-验收：实验脚本、固定ID、配置、完整指标、代表性及失败样图、采用/不采用的明确结论。
-先完成这些，再决定是否批量图元化剩余动漫样本，避免大量生产低质量教师。
-
-### P2：若残差方案胜出，接入原图监督的小修正头
-
-1. 离散事件和属性仍做交叉熵；新头从模型隐状态和当前图元属性预测有界连续修正。
-2. 使用配对原图的teacher-forced重建/局部块监督，先验证冻结主干只训修正头，再逐步解冻。
-3. 图像损失可回传到修正头及共享表示；argmax/采样仍不直接可微。
-   不以“可微渲染器已经有了”代替完整梯度路径验证。
-4. 推理只给文字时，修正头不能依赖训练时才有的目标图特征。
-5. 原图重建任务与自由生成任务分开评估；不要拿任意生成图与任意原图计算逐像素监督。
-6. 形状残差优先研究唯一的log协方差表示，检查近圆形处梯度；不默认把多峰token分布取均值。
-7. 若输出格式变化，做新协议版本，明确旧权重/数据兼容与迁移，不覆盖旧码本或重解释旧token。
-
-验收：未见图重建、固定种子自由生成、延迟/大小对照，确认真实学习收益而非逐图优化收益。
-
-### P3：通用图像与局部编辑的最小闭环
-
-1. 层槽位/实例ID、语义类别、合成顺序分开表示；先背景+少量实例，不一次加入复杂嵌套层级。
-2. 真人六层和动漫两层先独立保存，制定统一映射及checkpoint迁移后才混合训练。
-3. 风景/动物/物体各约500张工程样本：优先有现成分割的COCO Panoptic/ADE20K；
-   保留来源、许可、去重分组、固定划分。此批尚未下载，不要报告已在训练。
-4. 先实现“指定图层/区域的图元前缀续画”：加载已存在前缀、恢复grammar、重建KV缓存，输出合法序列。
-5. 区域限制作用于图元中心时，图元边缘仍可越界；训练和推理要使用一致规则并检测区域外变化。
-6. 扰动少量图元/移除细节后训练修复，配合REDRAW/REFINE；固定样例检查保留区域是否稳定。
-7. 引入全局粗绘+局部细化前，先验证短段续画。完整历史外部保存，缓存仅复用完全相同的有序前缀。
-
-验收：照片、简单风景、动物、物体各有可编辑样例；能改一个区域，并说明区域外变化和未知遮挡部分。
-单图无法提供被遮挡内容的真实监督；先做可见层编辑，补全内容需明确是推测。
-
-### P4：规模训练与动漫风格后训练
-
-1. 在稳定数据/协议上完成small全量基线，接入中文条件；再与base约123M比较，不直接跳1B。
-2. 训练数据质量通过后，逐批扩充动漫与其他类别，不先把数量堆到最大。
-3. 同图先试2–4条轨迹、少量描述版本；所有轨迹/翻转/裁剪保持同一split。
-4. 正式后训练从基础权重初始化，**新建优化器和学习率调度**。补 --init-weights 或等效入口，
-   不把 --resume 当风格微调：现有 --resume 会恢复旧优化器及step。
-5. small先比较全参微调，多个可切换风格包再做LoRA；需要动漫数据，不能指望只换提示词就学会。
-6. 若保留通用能力，加入原数据回放和风格条件，分别评估风格、内容、坏图比例、多样性和遗忘。
-
-### P5：回到求职目标的部署与算子交付
-
-正式模型接口稳定后，推进ONNX子图、ORT/C++推理、量化与精度回归、性能表。
-保留PyTorch oracle与跨后端一致性，分别报告CUDA/HIP算子、端到端延迟、显存、质量和硬件条件。
-避免项目全部时间耗在扩大训练，最后没有部署工具与C++成果。
-
-## 六、常用验证与参考
-
-```sh
-cd /home/martis/picture_train
-tail -3 data/decompose_v0.log
-
-# 小检查；完整测试在适当GPU资源下运行，不要与大任务挤到显存溢出
-OMP_NUM_THREADS=4 "/home/martis/AI infra/.venv/bin/python" -m pytest tests/test_anime_data.py tests/test_protocol.py
-git diff HEAD --check
-
-# 原图监督诊断：会逐图优化，不是训练生成模型
-OMP_NUM_THREADS=4 LPP_EXT_BUILD=/tmp/lpp-native-verify \
-  "/home/martis/AI infra/.venv/bin/python" tools/probe_raw_supervision.py \
-  --prepared data/anime_portraits256_v1 --sequences data/seq/anime_pilot_v1 \
-  --protocol data/anime_portraits256_v1/decomposition_protocol.json \
-  --shard 0 --count 4 --steps 80 --quantized-control --out out/anime_raw_probe_recheck
-```
-
-已有学习记录：
-
-- `docs/hip_port_log.md`：原生光栅化接入与性能。
-- `docs/anime_data_log.md`：本轮数据来源、清洗、掩码、验证与限制。
-- `docs/general_painter_design.md`：原图监督、残差、通用图层设计。
-- `docs/data_expansion_plan.md`：候选来源与分阶段扩充。
-- `docs/pop2_comparison.md`：参考POP2，重点是多轨迹、空间组织、编辑前缀与颜色拟合。
-
-参考仓库：https://github.com/wonderfulearth/primitive-operation-painter 。
-POP2模型看 `model/`，数据工具看 `data_tools/image_to_sequence/`，原生编辑看 `app/src/`；
-根目录部分Python文件为旧版保留，别把POP1当POP2。此仓库并非本项目的直接基础分支。
-
-## 七、工作纪律
-
-- 继续遵守用户AGENTS.md：复用uv环境；系统配置/包服务变更需按用户规则备份、记系统日志和快照。
-  纯项目代码、数据产物不是系统配置改动，不因此引入多余的系统操作。
-- `data/`、`out/` 已被忽略；不要把原始图片、大权重或凭据推到公开仓库。
-- 不把自动检查通过写成人工标注；不把逐图优化写成生成效果；不把候选计划写成已运行任务。
-- 每个阶段提交可审阅的结果并更新实验记录。仅有新的数据/代码变化、失败或明确疑点时扩展测试，
-  不反复跑已通过且未受影响的重测试。
-- 首先自主执行P0/P1，普通可逆实现选择无需反复询问用户；碰到真正缺少的信息或不可替代的权限再说明。
+中午旧交接已归档到 `docs/archive/CLAUDE_HANDOFF_2026-11-15_1246.md`，只作历史参考。
+不要按旧交接重启v0分解、VLM标注或另一份训练。
