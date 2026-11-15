@@ -4,6 +4,7 @@ Set LPP_RASTER=torch to force the reference (debugging, or comparing results).
 """
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -13,9 +14,19 @@ from .reference import Primitives
 from .reference import render_group as render_group_torch
 
 
+@functools.cache
+def triton_available() -> bool:
+    """Triton importable here? (Hygon DCU / ROCm builds of PyTorch may ship without it.)"""
+    try:
+        import triton  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def render_group(prims: Primitives, size: int, proto: Protocol | None = None, backend: str | None = None):
     backend = backend or os.environ.get("LPP_RASTER") or (
-        "triton" if prims.xy.is_cuda and prims.xy.dtype == torch.float32 else "torch")
+        "triton" if prims.xy.is_cuda and prims.xy.dtype == torch.float32 and triton_available() else "torch")
     if backend == "torch":
         return render_group_torch(prims, size, proto)
     if backend == "triton":

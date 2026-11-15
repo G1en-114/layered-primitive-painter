@@ -7,7 +7,10 @@ from conftest import random_prims
 from lpp.render import Primitives
 from lpp.render.reference import render_group as ref_group
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+from lpp.render.dispatch import triton_available
+
+pytestmark = pytest.mark.skipif(not (torch.cuda.is_available() and triton_available()),
+                                reason="needs a GPU with Triton")
 
 FIELDS = ("xy", "sigma", "theta", "beta", "rgb", "alpha")
 
