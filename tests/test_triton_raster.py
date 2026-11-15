@@ -1,5 +1,4 @@
 """Triton tile rasterizer vs the dense reference: forward values and every gradient."""
-import math
 
 import pytest
 import torch

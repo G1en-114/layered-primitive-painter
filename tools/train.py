@@ -28,7 +28,7 @@ from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E4
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
-from lpp.render.reference import flatten_on_base, over  # noqa: E402
+from lpp.render.reference import flatten_on_base  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
 from lpp.sequence import paint_order  # noqa: E402
 
