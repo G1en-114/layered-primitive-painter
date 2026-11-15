@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -74,6 +75,9 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=200)
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+    from lpp.runtime_env import configure_threads
+    print(f"torch threads: {configure_threads()}", flush=True)
 
     ids = sorted(int(p.stem) for p in args.images.glob("*.jpg"))[: args.limit]
     done = set()

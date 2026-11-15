@@ -65,8 +65,9 @@ def main() -> None:
 
     @attempt("system")
     def _():
+        from lpp.runtime_env import available_cpus
         return {"python": sys.version.split()[0], "platform": platform.platform(),
-                "cpus": os.cpu_count(), "hostname": platform.node(),
+                "cpus_host": os.cpu_count(), "cpus_quota": available_cpus(), "hostname": platform.node(),
                 "hy_smi": sh("hy-smi 2>/dev/null | head -30"), "rocm_smi": sh("rocm-smi 2>/dev/null | head -30"),
                 "nvidia_smi": sh("nvidia-smi --query-gpu=name,memory.total --format=csv 2>/dev/null"),
                 "dtk": sh("ls -d /opt/dtk* 2>/dev/null; cat /opt/dtk/.info/version 2>/dev/null"),

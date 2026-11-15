@@ -27,6 +27,7 @@ from lpp.codec import ATTR_ORDER, Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
+from lpp.runtime_env import available_cpus, configure_threads, default_workers  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
 from lpp.render.reference import flatten_on_base  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
@@ -84,12 +85,16 @@ def main() -> None:
     ap.add_argument("--val-frac", type=float, default=0.02)
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--save-every", type=int, default=1000)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    if args.workers is None:
+        args.workers = default_workers()
+    threads = configure_threads(reserve_for_workers=args.workers)
+    print(f"CPU budget {available_cpus()} -> {threads} torch threads, {args.workers} data workers")
     torch.manual_seed(args.seed)
 
     proto, codec = load_protocol(), Codec.load(device="cuda")
