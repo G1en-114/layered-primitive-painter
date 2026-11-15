@@ -28,9 +28,29 @@
 - [x] 协议支持文本前缀与 `REDRAW_k` / `REFINE_k`
 - [x] Triton tile 光栅化算子（前向 + 反向，确定性梯度）：分解器单步快 64×，端到端 19.8 s → 0.8 s/图，见 [bench/REPORT_raster.md](bench/REPORT_raster.md)
 - [ ] CUDA C++ / CPU SIMD 光栅化（部署用）
-- [ ] CelebAMask-HQ 数据处理与中文标注
-- [ ] 模型与训练
+- [x] CelebAMask-HQ 数据处理：18 类合并为 6 个按深度排序的图层，3 万张 256px 分片
+- [x] 语法状态机、full / redraw / refine 序列、批量分解流水线（3 万张，本机 5070 约 4 小时）
+- [x] 两级模型（tiny 1.7M / small 22M / base 123M）、带 KV cache 的参考采样器、训练循环
+- [x] 海光 DCU（BW，DTK 26.04）上训练：测试 46 通过（无 Triton 的 14 个跳过），small 模型 3.6 分钟/轮
+- [ ] 中文标注（Qwen2.5-VL-7B，离线在 DCU 上运行）与文本条件
+- [ ] small / base 在全量数据上训练，规模对比
 - [ ] ONNX 导出、C++ 运行时、量化工具、基准测试
+- [ ] 二次元风格后训练（见下）
+
+## 计划：二次元风格后训练
+
+主模型在 CelebAMask-HQ（真人、精确分层标注）上预训练，再用动漫人脸微调出二次元风格，
+对比同一模型微调前后的变化。
+
+- 图像与描述：[huanngzh/anime_face_control_60k](https://huggingface.co/datasets/huanngzh/anime_face_control_60k)
+  （6 万张动漫人脸，含文字描述与面部关键点，5.4 GB）；分辨率与关键点质量待确认。
+- 分层伪标签（无现成的动漫人脸逐像素分层标注）：角色 / 背景用
+  [skytnt/anime-segmentation](https://github.com/SkyTNT/anime-segmentation) 的分割模型；
+  脸部轮廓关键点 → 皮肤层，眼睛 / 嘴巴关键点 → 五官层，角色其余部分按位置分为头发与身体。
+- 精确的角色 / 背景两层数据：[skytnt/anime-segmentation 数据集](https://huggingface.co/datasets/skytnt/anime-segmentation)
+  的透明背景角色 PNG 合成到背景图上（被遮挡的背景也是真实的）。
+- 版权：上述图片多抓取自 getchu / danbooru，仅作非商业研究用途；仓库不分发图片，
+  发布权重时注明数据来源与限制。
 
 ## 目录
 
