@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from lpp.codec import ATTR_ORDER, Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E402
+from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
 from lpp.runtime_env import available_cpus, configure_threads, default_workers  # noqa: E402
@@ -83,6 +84,9 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--split-manifest", type=Path, default=None,
+                    help="JSONL id/split records; overrides --val-frac")
+    ap.add_argument("--protocol", type=Path, default=None, help="explicit versioned protocol/profile")
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
@@ -97,12 +101,19 @@ def main() -> None:
     print(f"CPU budget {available_cpus()} -> {threads} torch threads, {args.workers} data workers")
     torch.manual_seed(args.seed)
 
-    proto, codec = load_protocol(), Codec.load(device="cuda")
+    proto = load_protocol(args.protocol) if args.protocol else load_protocol()
+    codec = Codec.load(proto=proto, device="cuda")
     files = sorted(Path(p) for p in glob.glob(args.data))
     if not files:
         raise SystemExit(f"no shards match {args.data}")
     examples = load_shards(files)
     is_val = lambda e: (e.image_id * 2654435761 % 2**32) / 2**32 < args.val_frac  # noqa: E731  same split for flips
+    if args.split_manifest:
+        splits = load_split_manifest(args.split_manifest)
+        missing = {e.image_id for e in examples} - splits.keys()
+        if missing:
+            raise ValueError(f"{len(missing)} image IDs missing from the split manifest")
+        is_val = lambda e: splits[e.image_id] == "val"  # noqa: E731
     train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed)
     val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0)
     print(f"{len(files)} shards, {len(train_ds)} train / {len(val_ds)} val sequences")
@@ -172,7 +183,8 @@ def main() -> None:
         if step % args.save_every == 0 or step == args.steps:
             tmp = ckpt.with_suffix(".tmp")
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                        "config": cfg.to_dict(), "args": vars(args) | {"out": str(args.out)}}, tmp)
+                        "config": cfg.to_dict(), "protocol": proto.raw,
+                        "args": vars(args) | {"out": str(args.out)}}, tmp)
             tmp.replace(ckpt)
 
 
