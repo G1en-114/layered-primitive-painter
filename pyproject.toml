@@ -1,0 +1,13 @@
+[project]
+name = "lpp"
+version = "0.1.0"
+description = "Layered Primitive Painter: autoregressive layered 2D-Gaussian painting, with a deployment and kernel toolchain"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110

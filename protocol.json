@@ -1,0 +1,63 @@
+{
+  "name": "layered-primitive-painter",
+  "version": 1,
+
+  "canvas": {
+    "size": 256,
+    "base_color_srgb": [1.0, 1.0, 1.0],
+    "compositing": "srgb_over"
+  },
+
+  "context": {
+    "max_positions": 1024
+  },
+
+  "primitive": {
+    "kind": "generalized_gaussian",
+    "formula": "alpha_px = min(alpha * (g(min(d2, c2)) - g(c2)) / (1 - g(c2)), max_alpha); g(t) = exp(-0.5 * t**beta); d2 = squared Mahalanobis distance; c2 = cutoff_sigma**2",
+    "cutoff_sigma": 3.0,
+    "max_alpha": 0.99,
+    "sigma_px": { "min": 0.5, "max": 128.0 },
+    "beta_levels": [1.0, 2.0, 4.0, 8.0]
+  },
+
+  "attributes": [
+    { "name": "x",     "type": "uniform",  "bins": 256, "min": 0.5,  "max": 255.5 },
+    { "name": "y",     "type": "uniform",  "bins": 256, "min": 0.5,  "max": 255.5 },
+    { "name": "shape", "type": "codebook", "size": 4096,
+      "layout": "beta_index * 1024 + logcov_code",
+      "codes_per_beta": 1024,
+      "file": "assets/codebooks/shape_logcov.npy" },
+    { "name": "color", "type": "codebook", "size": 4096,
+      "space": "oklab",
+      "file": "assets/codebooks/color_oklab.npy" },
+    { "name": "alpha", "type": "uniform",  "bins": 16,  "min": 0.06, "max": 0.99 }
+  ],
+
+  "events": ["PRIMITIVE",
+             "LAYER_0", "LAYER_1", "LAYER_2", "LAYER_3", "LAYER_4", "LAYER_5",
+             "REDRAW_0", "REDRAW_1", "REDRAW_2", "REDRAW_3", "REDRAW_4", "REDRAW_5",
+             "EOS"],
+
+  "position_kinds": ["COND", "BOS", "CONTROL", "PRIMITIVE"],
+
+  "layers": [
+    { "id": 0, "name": "background",  "max_primitives": 96,
+      "celebamask": ["background"] },
+    { "id": 1, "name": "body",        "max_primitives": 128,
+      "celebamask": ["neck", "cloth"] },
+    { "id": 2, "name": "skin",        "max_primitives": 192,
+      "celebamask": ["skin", "l_ear", "r_ear"] },
+    { "id": 3, "name": "features",    "max_primitives": 224,
+      "celebamask": ["nose", "l_eye", "r_eye", "l_brow", "r_brow", "mouth", "u_lip", "l_lip"] },
+    { "id": 4, "name": "hair",        "max_primitives": 256,
+      "celebamask": ["hair"] },
+    { "id": 5, "name": "accessories", "max_primitives": 64,
+      "celebamask": ["hat", "eye_g", "ear_r", "neck_l"] }
+  ],
+
+  "condition": {
+    "source": "celeba_hq_40_attributes",
+    "dropout_for_cfg": 0.1
+  }
+}
