@@ -19,18 +19,36 @@ class SampleConfig:
     temperature: float = 1.0
     top_p: float = 0.95
     cfg_scale: float = 1.0             # >1: classifier-free guidance (needs text)
+    attr_temperature: dict | None = None   # per-attribute temperature overrides, e.g. {"x": 0.7}
+    renyi_alpha: float | None = None   # adaptive support (POP2-style) instead of top-p, see _sample
+    require_before_eos: tuple = ()     # layer ids that must be drawn before EOS
     max_records: int | None = None     # drawing records incl. BOS; default: context minus text
 
 
-def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor) -> torch.Tensor:
-    """Top-p sampling by inverse CDF with given uniforms u [B] (deterministic given u)."""
-    if cfg.temperature <= 0:
+def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str = "") -> torch.Tensor:
+    """Sample one token per row by inverse CDF with given uniforms u [B] (deterministic given u).
+
+    Default: temperature + top-p. With renyi_alpha: the support size is the exponential of the
+    Renyi entropy H_a = log(sum p^a) / (1 - a) of the (temperature-scaled) distribution, i.e. an
+    "effective number of candidates"; the top k are kept and sampled uniformly (as in POP 2).
+    A peaked distribution keeps 1-2 candidates, a flat one many.
+    """
+    temp = (cfg.attr_temperature or {}).get(name, cfg.temperature)
+    if temp <= 0:
         return logits.argmax(-1)
-    probs = torch.softmax(logits.float() / cfg.temperature, -1)
+    probs = torch.softmax(logits.float() / temp, -1)
     sp, si = probs.sort(-1, descending=True)
-    cum = sp.cumsum(-1)
-    keep = (cum - sp) < cfg.top_p                     # always keeps the top token
-    sp = sp * keep
+    if cfg.renyi_alpha is not None:
+        a = cfg.renyi_alpha
+        h = torch.log((sp.clamp(min=1e-30) ** a).sum(-1)) / (1 - a)
+        legal = (sp > 0).sum(-1)
+        k = torch.minimum(torch.exp(h).round().clamp(min=1), legal.float()).long()
+        keep = torch.arange(sp.shape[-1], device=sp.device)[None] < k[:, None]
+        sp = keep.float()                              # uniform inside the support
+    else:
+        cum = sp.cumsum(-1)
+        keep = (cum - sp) < cfg.top_p                  # always keeps the top token
+        sp = sp * keep
     cdf = sp.cumsum(-1) / sp.sum(-1, keepdim=True)
     j = torch.searchsorted(cdf, u.unsqueeze(-1).clamp(max=1 - 1e-7)).clamp(max=cdf.shape[-1] - 1)
     return si.gather(-1, j).squeeze(-1)
@@ -67,7 +85,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     rand = uniforms or (lambda step, field: torch.rand(B, device=dev, generator=generator))
     prim_ev = proto.event_id("PRIMITIVE")
 
-    grammars = [Grammar(proto) for _ in range(B)]
+    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=False)
+                for _ in range(B)]
     for g in grammars:
         g.bos()
     rec_kind = torch.full((B, 1), KIND_BOS, device=dev)
@@ -93,16 +112,16 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
                                torch.nn.functional.one_hot(torch.tensor(proto.event_id("EOS")),
                                                            len(proto.events)).bool().to(dev)
                                for g in grammars])
-        if step == max_records - 1:      # out of room: force the end
-            allowed = allowed & (torch.arange(len(proto.events), device=dev) == proto.event_id("EOS"))
-        event = _sample(logits.masked_fill(~allowed, float("-inf")), cfg, rand(step, "event"))
+        if step == max_records - 1:      # out of room: force the end (even if constraints are unmet)
+            allowed = (torch.arange(len(proto.events), device=dev) == proto.event_id("EOS")).expand_as(allowed)
+        event = _sample(logits.masked_fill(~allowed, float("-inf")), cfg, rand(step, "event"), "event")
 
         attrs = torch.full((B, A), NO_ATTR, dtype=torch.long, device=dev)
         is_prim = event == prim_ev
         if is_prim.any():
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
-                attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name))
+                attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name), name)
             attrs[~is_prim] = NO_ATTR
 
         layer = torch.empty(B, dtype=torch.long, device=dev)

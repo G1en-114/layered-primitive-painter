@@ -182,3 +182,17 @@ def to_straight_rgba(group) -> torch.Tensor:
     A = 1 - T
     rgb = torch.where(A > 1e-6, P / A.clamp(min=1e-6), torch.zeros_like(P))
     return torch.cat([rgb.clamp(0, 1), A], dim=1)
+
+
+def visible_mass(prims: Primitives, size: int | None = None, proto: Protocol | None = None) -> torch.Tensor:
+    """How much each primitive shows in the final image: sum over pixels of its opacity times
+    the transmittance of everything painted after it. [B, N], in output-pixel units.
+
+    Used to find primitives that are (nearly) invisible: tiny, transparent, or fully covered.
+    """
+    proto = proto or load_protocol()
+    size = size or proto.canvas_size
+    a = pixel_alpha(prims, size, proto)
+    log_t = torch.log1p(-a)
+    after = log_t.sum(1, keepdim=True) - torch.cumsum(log_t, dim=1)
+    return (a * torch.exp(after)).sum((2, 3))

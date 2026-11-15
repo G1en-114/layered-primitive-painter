@@ -126,3 +126,26 @@ def test_caption_strings_collate(proto):
     picks = [store.pick(1, rng, p_drop=0.25) for _ in range(2000)]
     assert 0.2 < sum(p is None for p in picks) / 2000 < 0.3
     assert "金发" in next(p for p in picks if p) and "女性" in next(p for p in picks if p)
+
+
+def test_sampling_options(proto, codec):
+    """EOS constraint, per-attribute temperature and Renyi support all yield valid sequences;
+    with the constraint, every sample contains the required layers."""
+    m = tiny(proto, codec)
+    g = torch.Generator(device=DEV).manual_seed(3)
+    sc = SampleConfig(max_records=150, attr_temperature={"x": 0.5, "y": 0.5}, renyi_alpha=4.0,
+                      require_before_eos=(0, 2))
+    for s in generate(m, batch=4, cfg=sc, generator=g):
+        validate(s)
+        if len(s) < 150:   # finished on its own -> constraint must hold
+            assert {0, 2} <= set(s.layer.tolist())
+
+
+def test_renyi_support_size():
+    from lpp.sample import _sample
+    peaked = torch.tensor([[10.0, 0.0, 0.0, 0.0]])
+    flat = torch.zeros(1, 4)
+    sc = SampleConfig(renyi_alpha=4.0)
+    picks_peaked = {_sample(peaked, sc, torch.tensor([u])).item() for u in torch.linspace(0, 0.99, 50)}
+    picks_flat = {_sample(flat, sc, torch.tensor([u])).item() for u in torch.linspace(0, 0.99, 50)}
+    assert picks_peaked == {0} and picks_flat == {0, 1, 2, 3}

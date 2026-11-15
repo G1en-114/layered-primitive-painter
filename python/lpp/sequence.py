@@ -56,6 +56,10 @@ class Grammar:
     count: int = 0                 # primitives since the last marker
     special: str | None = None     # "redraw" / "refine" once the special marker was used
     seen: dict[int, int] = field(default_factory=dict)   # layer -> primitives painted in it
+    # decoding-time constraint (not part of the data grammar): EOS only once these layers
+    # have primitives, so a sample cannot stop after the background alone
+    require_before_eos: frozenset = frozenset()
+    allow_special: bool = True     # False: no REDRAW/REFINE (they edit a given prefix; pointless from BOS)
 
     # ---- what may come next ---------------------------------------------
     def _cap_left(self) -> int:
@@ -75,13 +79,20 @@ class Grammar:
             return out                         # a marker must be followed by a primitive
         if self.special is None:
             for k in range(p.num_layers):
-                if k > self.current and k not in self.seen:
+                # a required layer cannot be skipped: layers only go up, so jumping past it
+                # would make the EOS requirement impossible to meet
+                skips_required = any(r < k and self.seen.get(r, 0) == 0 for r in self.require_before_eos)
+                if k > self.current and k not in self.seen and not skips_required:
                     out.append(p.layer_event(k))
+                if not self.allow_special:
+                    continue
                 if k not in self.seen:
                     out.append(p.redraw_event(k))
                 elif k <= self.current and p.layers[k].max_primitives - self.seen[k] > 0:
                     out.append(p.refine_event(k))
-        if self.current >= 0:
+        if self.current >= 0 and all(self.seen.get(k, 0) > 0 for k in self.require_before_eos):
+            out.append(p.event_id("EOS"))
+        if not out:   # decoding constraints can paint into a corner: ending must stay possible
             out.append(p.event_id("EOS"))
         return sorted(out)
 

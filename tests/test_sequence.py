@@ -88,3 +88,21 @@ def test_allowed_mask_matches_list(proto):
     g.bos()
     m = g.allowed_mask()
     assert m.sum() == len(g.allowed_events()) and not m[proto.event_id("PRIMITIVE")]
+
+
+def test_constraints_never_deadlock(proto):
+    """A required layer that can no longer be reached must not leave zero legal events."""
+    P = proto.event_id("PRIMITIVE")
+    g = Grammar(proto, require_before_eos=frozenset({0, 2}))
+    g.bos()
+    g.step(proto.redraw_event(5))
+    for _ in range(proto.layers[5].max_primitives):
+        g.step(P)
+    assert g.allowed_events() == [proto.event_id("EOS")]
+
+
+def test_fresh_generation_has_no_special_markers(proto):
+    g = Grammar(proto, allow_special=False)
+    g.bos()
+    names = {proto.events[e] for e in g.allowed_events()}
+    assert not any(n.startswith(("REDRAW", "REFINE")) for n in names)

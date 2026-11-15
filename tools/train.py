@@ -27,6 +27,7 @@ from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E402
 from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
+from lpp.metrics import orphan_stats  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
 from lpp.text import CaptionStore, TextEncoder  # noqa: E402
 from lpp.runtime_env import available_cpus, configure_threads, default_workers  # noqa: E402
@@ -84,7 +85,7 @@ def render_samples(model, codec, n, path, seed, encoder=None, cfg_scale=2.0):
         text, text_valid = encoder(SAMPLE_PROMPTS[:n])
         sc.cfg_scale = cfg_scale
     seqs = generate(model, batch=n, cfg=sc, text=text, text_valid=text_valid, generator=g)
-    tiles = []
+    tiles, orphan = [], []
     for s in seqs:
         attrs, lay = paint_order(s)
         if attrs.shape[0] == 0:
@@ -93,8 +94,9 @@ def render_samples(model, codec, n, path, seed, encoder=None, cfg_scale=2.0):
         prims = codec.decode({k: attrs[:, i].unsqueeze(0).cuda() for i, k in enumerate(codec.attr_names)})
         img = flatten_on_base(render_group(prims, 256))
         tiles.append((img[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
+        orphan.append(orphan_stats(prims, lay.cuda(), 128, proto=codec.proto)["orphan"])
     Image.fromarray(np.concatenate(tiles, 1)).save(path)
-    return [len(s) for s in seqs]
+    return [len(s) for s in seqs], round(float(np.mean(orphan)) if orphan else 0.0, 4)
 
 
 def main() -> None:
@@ -223,7 +225,9 @@ def main() -> None:
                         vals[k] = vals.get(k, 0.0) + v.item() / 10
             lens = render_samples(model, codec, 6, args.out / f"samples_{step:06d}.png", seed=step,
                                   encoder=encoder, cfg_scale=args.cfg_scale)
-            rec = {"step": step, "val": {k: round(v, 4) for k, v in vals.items()}, "sample_lengths": lens}
+            lens, orphan = lens
+            rec = {"step": step, "val": {k: round(v, 4) for k, v in vals.items()}, "sample_lengths": lens,
+                   "sample_orphan_rate": orphan}
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
