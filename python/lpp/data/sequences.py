@@ -24,13 +24,16 @@ class Example:
 def load_shards(paths: list[Path]) -> list[Example]:
     out = []
     for p in paths:
-        z = np.load(p)
-        off = z["offsets"]
-        for i, image_id in enumerate(z["ids"]):
-            a, b = off[i], off[i + 1]
-            out.append(Example(torch.from_numpy(z["tokens"][a:b].astype(np.int64)),
-                               torch.from_numpy(z["layer"][a:b].astype(np.int64)),
-                               torch.from_numpy(z["round"][a:b].astype(np.int64)), int(image_id)))
+        # read each array once: every z["key"] access decompresses the whole array again,
+        # which made loading quadratic in shard size
+        with np.load(p) as z:
+            off, ids = z["offsets"], z["ids"]
+            tokens = torch.from_numpy(z["tokens"].astype(np.int64))
+            layer = torch.from_numpy(z["layer"].astype(np.int64))
+            rounds = torch.from_numpy(z["round"].astype(np.int64))
+        for i, image_id in enumerate(ids):
+            a, b = int(off[i]), int(off[i + 1])
+            out.append(Example(tokens[a:b], layer[a:b], rounds[a:b], int(image_id)))
     return out
 
 
