@@ -27,8 +27,10 @@
 
 #if defined(__HIPCC__) || defined(USE_ROCM)
 #define SHFL_DOWN(v, d) __shfl_down((v), (d))
+#define WAVE_ANY(p) __any(p)
 #else
 #define SHFL_DOWN(v, d) __shfl_down_sync(0xffffffffu, (v), (d))
+#define WAVE_ANY(p) __any_sync(0xffffffffu, (p))
 #endif
 
 struct Prim {
@@ -99,7 +101,8 @@ __global__ void bwd_kernel(const float* __restrict__ prm, const int* __restrict_
                            const int* __restrict__ counts, const float* __restrict__ P,
                            const float* __restrict__ T, const float* __restrict__ gP,
                            const float* __restrict__ gT, float* __restrict__ grads, int N, int H, int W,
-                           int tiles_x, int n_tiles, float inv_scale, float cut2, float max_alpha) {
+                           int tiles_x, int n_tiles, float inv_scale, float cut2, float max_alpha,
+                           int skip_idle) {
   // double-buffered per-wave partial sums: one __syncthreads per primitive
   __shared__ float part[2][MAX_WAVES][NGRAD];
   const int pid = blockIdx.x, b = pid / n_tiles, t = pid % n_tiles;
@@ -128,7 +131,17 @@ __global__ void bwd_kernel(const float* __restrict__ prm, const int* __restrict_
     const Prim q = load_prim(prm + ((int64_t)b * N + n) * NPARAM);
     Eval e = eval_alpha(q, px, py, cut2, max_alpha);
     const float a = inb ? e.a : 0.f;
+    const int buf = jj & 1;
 
+    // v2: if no pixel of this wave is covered (a == 0 everywhere), all ten gradient terms are
+    // exactly zero and S, F do not change: skip the math and the 10 shuffle reductions.
+    // Small, late primitives cover only part of a 16x16 tile, so this is the common case.
+    if (skip_idle && !WAVE_ANY(a > 0.f)) {
+      if (lane == 0) {
+#pragma unroll
+        for (int k = 0; k < NGRAD; ++k) part[buf][wave][k] = 0.f;
+      }
+    } else {
     const float w = a * S;
     Fr += q.r * w; Fg += q.g * w; Fb += q.b * w;
     const float inv1m = 1.f / (1.f - a);
@@ -156,12 +169,12 @@ __global__ void bwd_kernel(const float* __restrict__ prm, const int* __restrict_
         dLda * e.f,
         gr * w, gg * w, gb * w,
     };
-    const int buf = jj & 1;
 #pragma unroll
     for (int k = 0; k < NGRAD; ++k) {
       const float s = wave_sum(v[k]);
       if (lane == 0) part[buf][wave][k] = s;
     }
+    }  // wave active
     __syncthreads();
     if (threadIdx.x < NGRAD) {   // fixed summation order over waves: deterministic
       float s = 0.f;
@@ -198,7 +211,8 @@ std::vector<torch::Tensor> raster_fwd(torch::Tensor prm, torch::Tensor lists, to
 
 torch::Tensor raster_bwd(torch::Tensor prm, torch::Tensor lists, torch::Tensor counts, torch::Tensor P,
                          torch::Tensor T, torch::Tensor gP, torch::Tensor gT, int64_t B, int64_t N,
-                         int64_t size, int64_t tiles_x, double inv_scale, double cut2, double max_alpha) {
+                         int64_t size, int64_t tiles_x, double inv_scale, double cut2, double max_alpha,
+                         bool skip_idle) {
   for (auto* x : {&prm, &lists, &counts, &P, &T, &gP, &gT}) check(*x, "input");
   const int n_tiles = tiles_x * tiles_x;
   auto grads = torch::zeros({B, n_tiles, N, NGRAD}, prm.options());
@@ -206,7 +220,7 @@ torch::Tensor raster_bwd(torch::Tensor prm, torch::Tensor lists, torch::Tensor c
     bwd_kernel<<<B * n_tiles, BLOCK, 0, at::cuda::getCurrentCUDAStream()>>>(
         prm.data_ptr<float>(), lists.data_ptr<int>(), counts.data_ptr<int>(), P.data_ptr<float>(),
         T.data_ptr<float>(), gP.data_ptr<float>(), gT.data_ptr<float>(), grads.data_ptr<float>(), N, size,
-        size, tiles_x, n_tiles, inv_scale, cut2, max_alpha);
+        size, tiles_x, n_tiles, inv_scale, cut2, max_alpha, skip_idle ? 1 : 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return grads.sum(1);   // [B, N, NGRAD], fixed-order reduction over tiles

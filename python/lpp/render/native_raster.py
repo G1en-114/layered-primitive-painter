@@ -17,6 +17,7 @@ from ..shape import conic as conic_from_shape
 from .tiles import bin_tiles, pack
 
 SRC = Path(__file__).resolve().parents[3] / "csrc" / "raster" / "raster_ext.cu"
+SKIP_IDLE_WAVES = os.environ.get("LPP_NATIVE_SKIP_IDLE", "1") != "0"   # v2 backward; 0 = v1 for benchmarks
 
 
 def _space_free_torch_lib() -> None:
@@ -78,7 +79,7 @@ class _Raster(torch.autograd.Function):
         gP = torch.zeros_like(P) if gP is None else gP.float().contiguous()
         gT = torch.zeros_like(T) if gT is None else gT.float().contiguous()
         grads = extension().bwd(params, lists, counts, P, T, gP, gT, B, N, size, tiles_x, canvas / size,
-                                cut2, max_alpha)
+                                cut2, max_alpha, SKIP_IDLE_WAVES)
         return (grads[..., 0:2], grads[..., 2:5], grads[..., 5], grads[..., 7:10], grads[..., 6],
                 None, None, None, None, None, None)
 
