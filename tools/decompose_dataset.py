@@ -37,7 +37,7 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--flip", action="store_true", help="mirror images horizontally (augmentation)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--part", default="0/1", help="i/n: process shards s with s % n == i")
+    ap.add_argument("--part", default="0/1", help="i/n: process shards s with s %% n == i")
     ap.add_argument("--limit-shards", type=int, default=None)
     args = ap.parse_args()
     part, nparts = map(int, args.part.split("/"))
