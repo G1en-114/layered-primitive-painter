@@ -18,6 +18,7 @@ from .sequence import KIND_BOS, KIND_CONTROL, KIND_PRIMITIVE, NO_ATTR, DrawSeq, 
 class SampleConfig:
     temperature: float = 1.0
     top_p: float = 0.95
+    cfg_scale: float = 1.0             # >1: classifier-free guidance (needs text)
     max_records: int | None = None     # drawing records incl. BOS; default: context minus text
 
 
@@ -47,8 +48,22 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     proto, dev = model.proto, next(model.parameters()).device
     B, A = batch, len(model.attr_names)
     Lt = 0 if text is None else text.shape[1]
+    guided = text is not None and cfg.cfg_scale != 1.0
+    if guided:   # rows B..2B-1: same records, no text (all text slots invalid)
+        text = torch.cat([text, torch.zeros_like(text)])
+        text_valid = torch.cat([text_valid, torch.zeros_like(text_valid)])
+    R = 2 * B if guided else B           # rows run through the network
     max_records = cfg.max_records or model.cfg.max_positions - Lt
-    cache = model.new_cache(B, dev, max_len=Lt + max_records)
+    cache = model.new_cache(R, dev, max_len=Lt + max_records)
+
+    def guide(logits: torch.Tensor) -> torch.Tensor:
+        if not guided:
+            return logits.float()
+        c, u = logits.float().chunk(2)
+        return u + cfg.cfg_scale * (c - u)
+
+    def rows(t: torch.Tensor) -> torch.Tensor:   # duplicate per-sample inputs for both halves
+        return torch.cat([t, t]) if guided else t
     rand = uniforms or (lambda step, field: torch.rand(B, device=dev, generator=generator))
     prim_ev = proto.event_id("PRIMITIVE")
 
@@ -59,8 +74,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     rec_event = torch.full((B, 1), -1, device=dev)
     rec_layer = torch.full((B, 1), -1, device=dev)
     rec_attrs = torch.full((B, 1, A), NO_ATTR, device=dev)
-    x = model.embed_records(rec_kind, rec_event, rec_layer, rec_attrs)
-    valid = torch.ones(B, 1, dtype=torch.bool, device=dev)
+    x = model.embed_records(rows(rec_kind), rows(rec_event), rows(rec_layer), rows(rec_attrs))
+    valid = torch.ones(R, 1, dtype=torch.bool, device=dev)
     if Lt:
         x = torch.cat([model.embed_text(text), x], 1)
         valid = torch.cat([text_valid, valid], 1)
@@ -71,9 +86,9 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     done = torch.zeros(B, dtype=torch.bool, device=dev)
     for step in range(1, max_records):
         # event, masked by each sequence's grammar
-        dh = model.decoder(h, torch.zeros(B, dtype=torch.long, device=dev),
-                           torch.zeros(B, A, dtype=torch.long, device=dev), steps=1)
-        logits = model.heads["event"](dh[:, 0]).float()
+        dh = model.decoder(h, torch.zeros(R, dtype=torch.long, device=dev),
+                           torch.zeros(R, A, dtype=torch.long, device=dev), steps=1)
+        logits = guide(model.heads["event"](dh[:, 0]))
         allowed = torch.stack([g.allowed_mask(dev) if not g.done else
                                torch.nn.functional.one_hot(torch.tensor(proto.event_id("EOS")),
                                                            len(proto.events)).bool().to(dev)
@@ -86,8 +101,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         is_prim = event == prim_ev
         if is_prim.any():
             for i, name in enumerate(model.attr_names):
-                dh = model.decoder(h, event, attrs.clamp(min=0), steps=2 + i)
-                attrs[:, i] = _sample(model.heads[name](dh[:, -1]), cfg, rand(step, name))
+                dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
+                attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name))
             attrs[~is_prim] = NO_ATTR
 
         layer = torch.empty(B, dtype=torch.long, device=dev)
@@ -105,8 +120,9 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         done = done | (event == proto.event_id("EOS"))
         if bool(done.all()):
             break
-        x = model.embed_records(kind[:, None], event[:, None], layer[:, None], attrs[:, None])
-        h = model.backbone(x, live[:, None], cache)[:, -1]
+        x = model.embed_records(rows(kind)[:, None], rows(event)[:, None], rows(layer)[:, None],
+                                rows(attrs)[:, None])
+        h = model.backbone(x, rows(live)[:, None], cache)[:, -1]
 
     kinds = torch.stack(out["kind"], 1)
     events = torch.stack(out["event"], 1)

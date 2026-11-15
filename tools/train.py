@@ -28,6 +28,7 @@ from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E4
 from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
+from lpp.text import CaptionStore, TextEncoder  # noqa: E402
 from lpp.runtime_env import available_cpus, configure_threads, default_workers  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
 from lpp.render.reference import flatten_on_base  # noqa: E402
@@ -40,6 +41,25 @@ def lr_at(step, args):
         return args.lr * (step + 1) / args.warmup
     t = min(1.0, (step - args.warmup) / max(1, args.steps - args.warmup))
     return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
+
+
+def to_gpu(batch: dict, encoder) -> dict:
+    """Tensors to the GPU; caption strings through the frozen text encoder."""
+    captions = batch.pop("captions", None)
+    batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
+    if captions is not None and encoder is not None:
+        batch["text"], batch["text_valid"] = encoder(captions)
+    return batch
+
+
+SAMPLE_PROMPTS = [
+    "金发碧眼的女性，微笑，浅色背景",
+    "黑色短发的男性，戴眼镜，深色背景",
+    "棕色长卷发的女性，涂红色口红，戴耳环",
+    "灰白头发的男性，留着胡子，表情严肃",
+    "黑色长直发的女性，有刘海，白色上衣，绿色背景",
+    "光头男性，微笑，穿深色西装",
+]
 
 
 def loader(ds, args, shuffle=True):
@@ -55,9 +75,15 @@ def loader(ds, args, shuffle=True):
 
 
 @torch.no_grad()
-def render_samples(model, codec, n, path, seed):
+def render_samples(model, codec, n, path, seed, encoder=None, cfg_scale=2.0):
+    """n samples; with a text encoder, one per fixed prompt (guided), else unconditional."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    seqs = generate(model, batch=n, cfg=SampleConfig(temperature=1.0, top_p=0.9), generator=g)
+    text = text_valid = None
+    sc = SampleConfig(temperature=1.0, top_p=0.9)
+    if encoder is not None:
+        text, text_valid = encoder(SAMPLE_PROMPTS[:n])
+        sc.cfg_scale = cfg_scale
+    seqs = generate(model, batch=n, cfg=sc, text=text, text_valid=text_valid, generator=g)
     tiles = []
     for s in seqs:
         attrs, lay = paint_order(s)
@@ -93,6 +119,11 @@ def main() -> None:
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--captions", type=Path, default=None, help="captions.jsonl from tools/caption_vlm.py")
+    ap.add_argument("--attributes", type=Path, default=None, help="attributes.json (template captions)")
+    ap.add_argument("--text-encoder", type=Path, default=None, help="Chinese-CLIP model directory")
+    ap.add_argument("--text-drop", type=float, default=0.1, help="caption dropout (for CFG)")
+    ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for text-conditioned samples")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.workers is None:
@@ -120,11 +151,21 @@ def main() -> None:
         if missing:
             raise ValueError(f"{len(missing)} image IDs missing from the split manifest")
         is_val = lambda e: splits[e.image_id] == "val"  # noqa: E731
-    train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed)
-    val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0)
+    store = encoder = None
+    if args.text_encoder:
+        store = CaptionStore(args.captions, args.attributes)
+        encoder = TextEncoder(args.text_encoder, max_positions=proto.max_text_positions).cuda()
+        print(f"text conditioning: {len(store.vlm)} VLM-captioned, {len(store.attrs)} with attributes, "
+              f"caption dropout {args.text_drop}")
+    train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed, captions=store,
+                               p_text_drop=args.text_drop)
+    val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0,
+                             captions=store, p_text_drop=0.0)
     print(f"{len(files)} shards, {len(train_ds)} train / {len(val_ds)} val sequences")
 
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
+    if encoder is not None and cfg.text_dim != encoder.dim:
+        raise SystemExit(f"model text_dim {cfg.text_dim} != text encoder width {encoder.dim}")
     model = Painter(cfg, proto, codec).cuda()
     decay = [p for n, p in model.named_parameters() if p.dim() >= 2 and "emb" not in n]
     no_decay = [p for n, p in model.named_parameters() if not (p.dim() >= 2 and "emb" not in n)]
@@ -151,7 +192,7 @@ def main() -> None:
             g["lr"] = lr_at(step, args)
         totals = {}
         for _ in range(args.accum):
-            batch = {k: v.cuda(non_blocking=True) for k, v in next(train_it).items()}
+            batch = to_gpu(next(train_it), encoder)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 losses = fwd(batch)
             (losses["loss"] / args.accum).backward()
@@ -177,10 +218,11 @@ def main() -> None:
             vals = {}
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for _ in range(10):
-                    batch = {k: v.cuda() for k, v in next(val_it).items()}
+                    batch = to_gpu(next(val_it), encoder)
                     for k, v in model(batch).items():
                         vals[k] = vals.get(k, 0.0) + v.item() / 10
-            lens = render_samples(model, codec, 6, args.out / f"samples_{step:06d}.png", seed=step)
+            lens = render_samples(model, codec, 6, args.out / f"samples_{step:06d}.png", seed=step,
+                                  encoder=encoder, cfg_scale=args.cfg_scale)
             rec = {"step": step, "val": {k: round(v, 4) for k, v in vals.items()}, "sample_lengths": lens}
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")

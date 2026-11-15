@@ -41,11 +41,14 @@ class SequenceDataset(Dataset):
     """Each __getitem__ draws a fresh mode (full / redraw / refine) for its example."""
 
     def __init__(self, examples: list[Example], proto: Protocol | None = None, seed: int = 0,
-                 p_redraw: float = 0.15, p_refine: float = 0.15, text_fn=None):
+                 p_redraw: float = 0.15, p_refine: float = 0.15, text_fn=None, captions=None,
+                 p_text_drop: float = 0.1):
         self.examples, self.proto = examples, proto or load_protocol()
         self.rng = random.Random(seed)
         self.p_redraw, self.p_refine = p_redraw, p_refine
-        self.text_fn = text_fn          # image_id -> [Lt, text_dim] tensor, or None
+        self.text_fn = text_fn          # image_id -> [Lt, text_dim] tensor, or None (precomputed)
+        self.captions = captions        # lpp.text.CaptionStore: caption strings, encoded in the train step
+        self.p_text_drop = p_text_drop
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -54,7 +57,10 @@ class SequenceDataset(Dataset):
         ex = self.examples[i]
         mode = sample_mode(ex.layer, ex.round, self.rng, self.p_redraw, self.p_refine)
         seq = build(ex.tokens, ex.layer, ex.round, proto=self.proto, **mode)
-        text = self.text_fn(ex.image_id) if self.text_fn else None
+        if self.captions is not None:
+            text = self.captions.pick(ex.image_id, self.rng, self.p_text_drop)
+        else:
+            text = self.text_fn(ex.image_id) if self.text_fn else None
         return seq, text
 
 
@@ -82,7 +88,9 @@ def collate(items: list[tuple[DrawSeq, torch.Tensor | None]], text_dim: int | No
         batch["tgt_event"][b, :n] = s.event[1:]
         batch["tgt_attrs"][b, :n] = s.attrs[1:]
     texts = [t for _, t in items]
-    if any(t is not None for t in texts):
+    if any(isinstance(t, str) for t in texts):      # caption strings: encoded on the GPU later
+        batch["captions"] = texts
+    elif any(t is not None for t in texts):
         Lt = max(t.shape[0] for t in texts if t is not None)
         dim = text_dim or next(t for t in texts if t is not None).shape[1]
         batch["text"] = torch.zeros(B, Lt, dim)

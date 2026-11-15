@@ -94,3 +94,35 @@ def test_generation_deterministic_given_uniforms(proto, codec):
     a = generate(m, batch=2, cfg=SampleConfig(max_records=60), uniforms=fixed)
     b = generate(m, batch=2, cfg=SampleConfig(max_records=60), uniforms=fixed)
     assert all(torch.equal(x.attrs, y.attrs) and torch.equal(x.event, y.event) for x, y in zip(a, b))
+
+
+def test_guided_generation(proto, codec):
+    """CFG doubles the rows internally; sequences stay grammatical, and scale 1 is exactly
+    the plain text-conditioned path."""
+    m = tiny(proto, codec)
+    text = torch.randn(2, 5, m.cfg.text_dim, device=DEV)
+    valid = torch.ones(2, 5, dtype=torch.bool, device=DEV)
+    fixed = lambda step, field: torch.full((2,), ((step * 7919 + len(field)) % 997) / 997, device=DEV)  # noqa
+    for scale in (1.0, 3.0):
+        for s in generate(m, batch=2, cfg=SampleConfig(max_records=80, cfg_scale=scale), text=text,
+                          text_valid=valid, uniforms=fixed):
+            validate(s)
+    a = generate(m, batch=2, cfg=SampleConfig(max_records=60, cfg_scale=1.0), text=text, text_valid=valid,
+                 uniforms=fixed)
+    b = generate(m, batch=2, cfg=SampleConfig(max_records=60), text=text, text_valid=valid, uniforms=fixed)
+    assert all(torch.equal(x.attrs, y.attrs) for x, y in zip(a, b))
+
+
+def test_caption_strings_collate(proto):
+    import random
+    from lpp.text import CaptionStore
+    store = CaptionStore()
+    store.attrs = {i: {"Male": i % 2 == 0, "Smiling": True, "Blond_Hair": i == 1} for i in range(4)}
+    exs = [Example(*fake_decomposition(i), image_id=i) for i in range(4)]
+    ds = SequenceDataset(exs, proto, captions=store, p_text_drop=0.0)
+    b = collate([ds[i] for i in range(4)])
+    assert len(b["captions"]) == 4 and all(isinstance(c, str) for c in b["captions"])
+    rng = random.Random(0)
+    picks = [store.pick(1, rng, p_drop=0.25) for _ in range(2000)]
+    assert 0.2 < sum(p is None for p in picks) / 2000 < 0.3
+    assert "金发" in next(p for p in picks if p) and "女性" in next(p for p in picks if p)
