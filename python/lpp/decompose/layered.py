@@ -32,7 +32,9 @@ import torch.nn.functional as F
 
 from ..codec import Codec
 from ..protocol import Protocol, load_protocol
-from ..render.reference import Primitives, flatten_on_base, over, pixel_alpha, render_group
+from ..render.dispatch import render_group
+from ..render.reference import Primitives, flatten_on_base, over
+from ..shape import conic
 from .fill import dilate, morton_code, push_pull_fill
 
 PARAM_NAMES = ("xy", "log_sigma", "theta", "log2_beta", "rgb", "alpha")
@@ -53,7 +55,7 @@ class DecomposeConfig:
     w_front_far: float = 0.0          # >0 discourages a layer sprawling far under front layers
     w_base_opaque: float = 1.0        # background layer: penalty on remaining transparency
     w_behind: float = 1.0
-    prune_alpha: float = 2e-3         # drop primitives whose peak in-canvas opacity is below this
+    prune_alpha: float = 2e-3         # drop primitives fainter than this, or entirely off-canvas
     lr: dict[str, float] = field(default_factory=lambda: dict(
         xy=0.5, log_sigma=0.03, theta=0.03, log2_beta=0.05, rgb=0.05, alpha=0.05))
     seed: int = 0
@@ -131,8 +133,7 @@ class LayeredDecomposer:
 
             prims = self._to_prims(p, active)
             with torch.no_grad():
-                peak = pixel_alpha(prims, size, proto).amax((-1, -2))
-                keep = active.bool() & (peak > cfg.prune_alpha)
+                keep = active.bool() & self._visible(prims)
                 tok = self.codec.encode(prims)
                 final = self._snapped(prims, keep.float(), straight_through=False)
                 group = render_group(final, size, proto)
@@ -161,6 +162,16 @@ class LayeredDecomposer:
                 layer_leak=[l[b].item() for l in leaks],
             ))
         return results
+
+    def _visible(self, prims: Primitives) -> torch.Tensor:
+        """Peak opacity above prune_alpha and cutoff box intersecting the canvas."""
+        A, Bc, C = conic(prims.sigma[..., 0], prims.sigma[..., 1], prims.theta).unbind(-1)
+        det = (A * C - Bc * Bc).clamp(min=1e-30)
+        rx = self.proto.cutoff_sigma * torch.sqrt(C / det)
+        ry = self.proto.cutoff_sigma * torch.sqrt(A / det)
+        x, y, size = prims.xy[..., 0], prims.xy[..., 1], self.proto.canvas_size
+        on_canvas = (x + rx > 0) & (x - rx < size) & (y + ry > 0) & (y - ry < size)
+        return on_canvas & (prims.alpha > self.cfg.prune_alpha)
 
     @property
     def codec_attrs(self) -> tuple[str, ...]:
