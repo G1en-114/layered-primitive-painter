@@ -10,7 +10,9 @@ def test_budget_fits_context(proto):
 def test_events_cover_every_layer(proto):
     ids = {proto.layer_event(k) for k in range(proto.num_layers)}
     ids |= {proto.redraw_event(k) for k in range(proto.num_layers)}
-    assert len(ids) == 2 * proto.num_layers
+    ids |= {proto.refine_event(k) for k in range(proto.num_layers)}
+    assert len(ids) == 3 * proto.num_layers
+    assert proto.events[-1] == "EOS"
     assert proto.event_id("PRIMITIVE") == 0
 
 

@@ -24,8 +24,10 @@
 - [x] 颜色（Oklab）、形状（log 协方差）参数化与 k-means 码本
 - [x] PyTorch 参考光栅化器：可微、分图层渲染、精确分层导出
 - [x] 编解码与量化感知 snap（直通估计器）
-- [ ] 分层分解器（图片 + 分割 → 分层图元序列）
-- [ ] Triton / CUDA 光栅化算子
+- [x] 分层分解器（图片 + 分割 → 分层图元序列）：量化感知拟合、amodal 补全、图层越界约束
+- [x] 协议支持文本前缀与 `REDRAW_k` / `REFINE_k`
+- [ ] Triton / CUDA tile 光栅化算子（当前稠密参考实现约 20 s/图，是数据流水线瓶颈）
+- [ ] CelebAMask-HQ 数据处理与中文标注
 - [ ] 模型与训练
 - [ ] ONNX 导出、C++ 运行时、量化工具、基准测试
 
@@ -38,6 +40,8 @@ python/lpp/
   color.py  shape.py   Oklab 颜色空间；形状的 log 协方差参数化
   codebook.py codec.py k-means 码本；连续参数 <-> token
   render/reference.py  稠密参考光栅化器（正确性基准）
+  decompose/           分层分解器：图片 + 图层标签 -> 有序、量化后的图元
+  synthetic.py         已知真值的合成分层场景（测试与 demo 用）
 assets/codebooks/      先验码本（数据驱动码本会覆盖它们）
 tests/                 性质测试：结合律、唯一性、幂等性、梯度
 tools/                 码本构建、渲染 demo
@@ -49,6 +53,7 @@ tools/                 码本构建、渲染 demo
 python -m pytest
 python tools/build_prior_codebooks.py
 python tools/render_demo.py --out out/demo
+python tools/decompose_demo.py --out out/decompose   # 合成场景分解报告
 ```
 
 需要 PyTorch（CUDA 可选）、numpy、pillow、pytest。

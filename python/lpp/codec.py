@@ -61,8 +61,9 @@ class Codec:
         proto = self.proto
         sig = p.sigma.clamp(proto.sigma_min, proto.sigma_max)
         logcov = to_logcov(*canonicalize(sig[..., 0], sig[..., 1], p.theta))
+        # beta levels are geometric (1, 2, 4, 8): pick the nearest in log space
         betas = torch.tensor(proto.beta_levels, device=p.beta.device)
-        beta_idx = (p.beta[..., None] - betas).abs().argmin(-1)
+        beta_idx = (torch.log(p.beta.clamp(min=1e-3))[..., None] - torch.log(betas)).abs().argmin(-1)
         per_beta = self.shape_codes.shape[0]
         return {
             "x": self._uniform("x").quantize(p.xy[..., 0]),

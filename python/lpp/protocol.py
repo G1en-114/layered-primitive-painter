@@ -63,6 +63,7 @@ class Protocol:
     canvas_size: int
     base_color: tuple[float, float, float]
     max_positions: int
+    max_text_positions: int
     cutoff_sigma: float
     max_alpha: float
     sigma_min: float
@@ -88,6 +89,9 @@ class Protocol:
     def redraw_event(self, layer: int) -> int:
         return self.event_id(f"REDRAW_{layer}")
 
+    def refine_event(self, layer: int) -> int:
+        return self.event_id(f"REFINE_{layer}")
+
     @property
     def num_layers(self) -> int:
         return len(self.layers)
@@ -97,8 +101,10 @@ class Protocol:
         return {a.name: (a.bins if isinstance(a, UniformAttr) else a.size) for a in self.attributes}
 
     def worst_case_positions(self) -> int:
-        """COND + BOS + one marker per layer + every layer at its cap + EOS."""
-        return 2 + self.num_layers + sum(l.max_primitives for l in self.layers) + 1
+        """Text prefix + BOS + one marker per layer + one REDRAW/REFINE marker
+        + every layer at its cap + EOS."""
+        return (self.max_text_positions + 1 + self.num_layers + 1
+                + sum(l.max_primitives for l in self.layers) + 1)
 
 
 def _parse(raw: dict) -> Protocol:
@@ -117,6 +123,7 @@ def _parse(raw: dict) -> Protocol:
         canvas_size=raw["canvas"]["size"],
         base_color=tuple(raw["canvas"]["base_color_srgb"]),
         max_positions=raw["context"]["max_positions"],
+        max_text_positions=raw["context"]["max_text_positions"],
         cutoff_sigma=float(prim["cutoff_sigma"]),
         max_alpha=float(prim["max_alpha"]),
         sigma_min=float(prim["sigma_px"]["min"]),
@@ -136,7 +143,7 @@ def _validate(p: Protocol) -> None:
     if [l.id for l in p.layers] != list(range(p.num_layers)):
         raise ValueError("layer ids must be 0..L-1 in back-to-front order")
     for k in range(p.num_layers):
-        p.layer_event(k), p.redraw_event(k)  # raises if missing
+        p.layer_event(k), p.redraw_event(k), p.refine_event(k)  # raises if missing
     if p.worst_case_positions() > p.max_positions:
         raise ValueError(
             f"layer caps need {p.worst_case_positions()} positions > context {p.max_positions}"

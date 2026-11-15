@@ -85,10 +85,10 @@ def pixel_alpha(prims: Primitives, size: int, proto: Protocol | None = None) -> 
 
     cut2 = proto.cutoff_sigma ** 2
     beta = prims.beta[..., None, None]
-    # clamp before pow: keeps d2**beta finite (and its gradient non-NaN) outside the cutoff,
-    # and removes tiny negative d2 from rounding. beta is a discrete level, never optimized
-    # (d/dbeta of d2**beta is NaN at d2 = 0).
-    g = torch.exp(-0.5 * d2.clamp(0, cut2) ** beta)
+    # clamp before pow: the upper bound keeps d2**beta finite (and its gradient non-NaN)
+    # outside the cutoff; the tiny lower bound removes negative d2 from rounding and keeps
+    # d/dbeta = d2**beta * ln(d2) finite at the center, so the decomposer can optimize beta.
+    g = torch.exp(-0.5 * d2.clamp(1e-12, cut2) ** beta)
     # Shift-and-rescale so the falloff reaches exactly 0 *at* the cutoff instead of
     # jumping from g(cut) to 0 there (1.1% for beta = 1): no ring artifact, no gradient
     # discontinuity. Pixels beyond the cutoff are clamped to d2 = cut2 and so get 0.

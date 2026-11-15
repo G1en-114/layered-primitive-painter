@@ -9,7 +9,8 @@
   },
 
   "context": {
-    "max_positions": 1024
+    "max_positions": 1024,
+    "max_text_positions": 32
   },
 
   "primitive": {
@@ -37,9 +38,10 @@
   "events": ["PRIMITIVE",
              "LAYER_0", "LAYER_1", "LAYER_2", "LAYER_3", "LAYER_4", "LAYER_5",
              "REDRAW_0", "REDRAW_1", "REDRAW_2", "REDRAW_3", "REDRAW_4", "REDRAW_5",
+             "REFINE_0", "REFINE_1", "REFINE_2", "REFINE_3", "REFINE_4", "REFINE_5",
              "EOS"],
 
-  "position_kinds": ["COND", "BOS", "CONTROL", "PRIMITIVE"],
+  "position_kinds": ["TEXT", "BOS", "CONTROL", "PRIMITIVE"],
 
   "layers": [
     { "id": 0, "name": "background",  "max_primitives": 96,
@@ -56,8 +58,17 @@
       "celebamask": ["hat", "eye_g", "ear_r", "neck_l"] }
   ],
 
+  "sequence_modes": {
+    "full":      "TEXT* BOS (LAYER_k P*)* EOS, layers strictly increasing",
+    "redraw":    "TEXT* BOS (LAYER_j P*)* REDRAW_k P* EOS, layer k absent from the prefix",
+    "refine":    "TEXT* BOS (LAYER_j P*)* REFINE_k P* EOS, layer k holds only its first rounds in the prefix",
+    "note":      "compositing order is always by layer id, then by position inside the layer"
+  },
+
   "condition": {
-    "source": "celeba_hq_40_attributes",
+    "type": "text",
+    "encoder": "frozen pretrained Chinese text encoder, projected to at most max_text_positions prefix positions",
+    "captions": "VLM-written Chinese captions, plus CelebA-HQ 40-attribute template captions as a fallback",
     "dropout_for_cfg": 0.1
   }
 }
