@@ -1,74 +1,190 @@
 {
   "name": "layered-primitive-painter",
-  "version": 1,
-
+  "version": 2,
   "canvas": {
     "size": 256,
-    "base_color_srgb": [1.0, 1.0, 1.0],
+    "base_color_srgb": [
+      1.0,
+      1.0,
+      1.0
+    ],
     "compositing": "srgb_over"
   },
-
   "context": {
     "max_positions": 1024,
     "max_text_positions": 32
   },
-
   "primitive": {
     "kind": "generalized_gaussian",
     "formula": "alpha_px = min(alpha * (g(min(d2, c2)) - g(c2)) / (1 - g(c2)), max_alpha); g(t) = exp(-0.5 * t**beta); d2 = squared Mahalanobis distance; c2 = cutoff_sigma**2",
     "cutoff_sigma": 3.0,
     "max_alpha": 0.99,
-    "sigma_px": { "min": 0.5, "max": 128.0 },
-    "beta_levels": [1.0, 2.0, 4.0, 8.0]
+    "sigma_px": {
+      "min": 0.5,
+      "max": 128.0
+    }
   },
-
   "attributes": [
-    { "name": "x",     "type": "uniform",  "bins": 256, "min": 0.5,  "max": 255.5 },
-    { "name": "y",     "type": "uniform",  "bins": 256, "min": 0.5,  "max": 255.5 },
-    { "name": "shape", "type": "codebook", "size": 4096,
-      "layout": "beta_index * 1024 + logcov_code",
-      "codes_per_beta": 1024,
-      "file": "assets/codebooks/shape_logcov.npy" },
-    { "name": "color", "type": "codebook", "size": 4096,
+    {
+      "name": "x",
+      "type": "uniform",
+      "bins": 512,
+      "min": 0.25,
+      "max": 255.75
+    },
+    {
+      "name": "y",
+      "type": "uniform",
+      "bins": 512,
+      "min": 0.25,
+      "max": 255.75
+    },
+    {
+      "name": "sigma_x",
+      "type": "log_uniform",
+      "bins": 128,
+      "min": 0.5,
+      "max": 128.0,
+      "note": "canonical form: sigma_x >= sigma_y, theta in [0, pi)"
+    },
+    {
+      "name": "sigma_y",
+      "type": "log_uniform",
+      "bins": 128,
+      "min": 0.5,
+      "max": 128.0
+    },
+    {
+      "name": "theta",
+      "type": "periodic",
+      "bins": 128,
+      "period": 3.141592653589793
+    },
+    {
+      "name": "beta",
+      "type": "log_uniform",
+      "bins": 8,
+      "min": 1.0,
+      "max": 8.0
+    },
+    {
+      "name": "color",
+      "type": "codebook",
+      "size": 4096,
       "space": "oklab",
-      "file": "assets/codebooks/color_oklab.npy" },
-    { "name": "alpha", "type": "uniform",  "bins": 16,  "min": 0.06, "max": 0.99 }
+      "file": "assets/codebooks/color_oklab_v2.npy",
+      "note": "k-means on continuous face decompositions plus 20% uniform prior colours"
+    },
+    {
+      "name": "alpha",
+      "type": "uniform",
+      "bins": 16,
+      "min": 0.06,
+      "max": 0.99
+    }
   ],
-
-  "events": ["PRIMITIVE",
-             "LAYER_0", "LAYER_1", "LAYER_2", "LAYER_3", "LAYER_4", "LAYER_5",
-             "REDRAW_0", "REDRAW_1", "REDRAW_2", "REDRAW_3", "REDRAW_4", "REDRAW_5",
-             "REFINE_0", "REFINE_1", "REFINE_2", "REFINE_3", "REFINE_4", "REFINE_5",
-             "EOS"],
-
-  "position_kinds": ["TEXT", "BOS", "CONTROL", "PRIMITIVE"],
-
+  "events": [
+    "PRIMITIVE",
+    "LAYER_0",
+    "LAYER_1",
+    "LAYER_2",
+    "LAYER_3",
+    "LAYER_4",
+    "LAYER_5",
+    "REDRAW_0",
+    "REDRAW_1",
+    "REDRAW_2",
+    "REDRAW_3",
+    "REDRAW_4",
+    "REDRAW_5",
+    "REFINE_0",
+    "REFINE_1",
+    "REFINE_2",
+    "REFINE_3",
+    "REFINE_4",
+    "REFINE_5",
+    "EOS"
+  ],
+  "position_kinds": [
+    "TEXT",
+    "BOS",
+    "CONTROL",
+    "PRIMITIVE"
+  ],
   "layers": [
-    { "id": 0, "name": "background",  "max_primitives": 96,
-      "celebamask": ["background"] },
-    { "id": 1, "name": "body",        "max_primitives": 128,
-      "celebamask": ["neck", "cloth"] },
-    { "id": 2, "name": "skin",        "max_primitives": 192,
-      "celebamask": ["skin", "l_ear", "r_ear"] },
-    { "id": 3, "name": "features",    "max_primitives": 224,
-      "celebamask": ["nose", "l_eye", "r_eye", "l_brow", "r_brow", "mouth", "u_lip", "l_lip"] },
-    { "id": 4, "name": "hair",        "max_primitives": 256,
-      "celebamask": ["hair"] },
-    { "id": 5, "name": "accessories", "max_primitives": 64,
-      "celebamask": ["hat", "eye_g", "ear_r", "neck_l"] }
+    {
+      "id": 0,
+      "name": "background",
+      "max_primitives": 96,
+      "celebamask": [
+        "background"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "body",
+      "max_primitives": 128,
+      "celebamask": [
+        "neck",
+        "cloth"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "skin",
+      "max_primitives": 192,
+      "celebamask": [
+        "skin",
+        "l_ear",
+        "r_ear"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "features",
+      "max_primitives": 224,
+      "celebamask": [
+        "nose",
+        "l_eye",
+        "r_eye",
+        "l_brow",
+        "r_brow",
+        "mouth",
+        "u_lip",
+        "l_lip"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "hair",
+      "max_primitives": 256,
+      "celebamask": [
+        "hair"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "accessories",
+      "max_primitives": 64,
+      "celebamask": [
+        "hat",
+        "eye_g",
+        "ear_r",
+        "neck_l"
+      ]
+    }
   ],
-
   "sequence_modes": {
-    "full":      "TEXT* BOS (LAYER_k P*)* EOS, layers strictly increasing",
-    "redraw":    "TEXT* BOS (LAYER_j P*)* REDRAW_k P* EOS, layer k absent from the prefix",
-    "refine":    "TEXT* BOS (LAYER_j P*)* REFINE_k P* EOS, layer k holds only its first rounds in the prefix",
-    "note":      "compositing order is always by layer id, then by position inside the layer"
+    "full": "TEXT* BOS (LAYER_k P*)* EOS, layers strictly increasing",
+    "redraw": "TEXT* BOS (LAYER_j P*)* REDRAW_k P* EOS, layer k absent from the prefix",
+    "refine": "TEXT* BOS (LAYER_j P*)* REFINE_k P* EOS, layer k holds only its first rounds in the prefix",
+    "note": "compositing order is always by layer id, then by position inside the layer"
   },
-
   "condition": {
     "type": "text",
     "encoder": "frozen pretrained Chinese text encoder, projected to at most max_text_positions prefix positions",
     "captions": "VLM-written Chinese captions, plus CelebA-HQ 40-attribute template captions as a fallback",
     "dropout_for_cfg": 0.1
-  }
+  },
+  "changes_from_v1": "v1 shape codebook (1024 log-covariance codes per beta level) cost 6.6 dB on held-out faces; factorized log-sigma/theta bins cost 0.2 dB. Positions 256 -> 512 bins, beta 4 -> 8 levels, data-driven colour codebook. Full discretization: 24.9 dB (v1) -> 30.2 dB (v2) vs 32.4 dB continuous. See docs/protocol_v2.md."
 }

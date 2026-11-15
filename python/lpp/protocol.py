@@ -1,12 +1,16 @@
 """Load protocol.json and expose it as typed constants.
 
 protocol.json is the single source of truth shared by the Python side and the
-C++ runtime; nothing in this package should hard-code a bin count, a layer id
-or an event id.
+C++ runtime; nothing in this package should hard-code a bin count, a layer id,
+an event id or the list of primitive attributes.
+
+Versions: protocol.json is v2 (factorized shape: sigma_x, sigma_y, theta, beta bins).
+protocols/v1.json keeps v1 (one shape codebook token) for data and checkpoints made with it.
 """
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +46,44 @@ class UniformAttr:
 
 
 @dataclass(frozen=True)
+class LogUniformAttr:
+    """Levels evenly spaced in log(value) over [min, max] (scales: sigma, beta)."""
+
+    name: str
+    bins: int
+    min: float
+    max: float
+
+    def _lin(self) -> UniformAttr:
+        return UniformAttr(self.name, self.bins, math.log(self.min), math.log(self.max))
+
+    def quantize(self, value: torch.Tensor) -> torch.Tensor:
+        return self._lin().quantize(torch.log(value.clamp(min=self.min * 1e-3)))
+
+    def dequantize(self, idx: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self._lin().dequantize(idx))
+
+
+@dataclass(frozen=True)
+class PeriodicAttr:
+    """`bins` levels i * period / bins on a circle; values wrap (angles)."""
+
+    name: str
+    bins: int
+    period: float
+
+    def quantize(self, value: torch.Tensor) -> torch.Tensor:
+        idx = torch.round(torch.remainder(value, self.period) / self.period * self.bins).long()
+        return torch.remainder(idx, self.bins)
+
+    def dequantize(self, idx: torch.Tensor) -> torch.Tensor:
+        return idx.to(torch.float32) * (self.period / self.bins)
+
+
+OrdinalAttr = UniformAttr | LogUniformAttr | PeriodicAttr
+
+
+@dataclass(frozen=True)
 class CodebookAttr:
     name: str
     size: int
@@ -69,12 +111,22 @@ class Protocol:
     sigma_min: float
     sigma_max: float
     beta_levels: tuple[float, ...]
-    attributes: tuple[UniformAttr | CodebookAttr, ...]
+    attributes: tuple[OrdinalAttr | CodebookAttr, ...]
     events: tuple[str, ...]
     layers: tuple[Layer, ...]
+    version: int = 1
 
     # ---- lookups -------------------------------------------------------
-    def attr(self, name: str) -> UniformAttr | CodebookAttr:
+    @property
+    def attr_names(self) -> tuple[str, ...]:
+        """Primitive attribute tokens in decoding order."""
+        return tuple(a.name for a in self.attributes)
+
+    @property
+    def factorized_shape(self) -> bool:
+        return "sigma_x" in self.attr_names
+
+    def attr(self, name: str) -> OrdinalAttr | CodebookAttr:
         for a in self.attributes:
             if a.name == name:
                 return a
@@ -98,7 +150,7 @@ class Protocol:
 
     @property
     def attr_vocab_sizes(self) -> dict[str, int]:
-        return {a.name: (a.bins if isinstance(a, UniformAttr) else a.size) for a in self.attributes}
+        return {a.name: (a.size if isinstance(a, CodebookAttr) else a.bins) for a in self.attributes}
 
     def worst_case_positions(self) -> int:
         """Text prefix + BOS + one marker per layer + one REDRAW/REFINE marker
@@ -109,10 +161,14 @@ class Protocol:
 
 def _parse(raw: dict) -> Protocol:
     prim = raw["primitive"]
-    attrs: list[UniformAttr | CodebookAttr] = []
+    attrs: list[OrdinalAttr | CodebookAttr] = []
     for a in raw["attributes"]:
         if a["type"] == "uniform":
             attrs.append(UniformAttr(a["name"], a["bins"], float(a["min"]), float(a["max"])))
+        elif a["type"] == "log_uniform":
+            attrs.append(LogUniformAttr(a["name"], a["bins"], float(a["min"]), float(a["max"])))
+        elif a["type"] == "periodic":
+            attrs.append(PeriodicAttr(a["name"], a["bins"], float(a["period"])))
         elif a["type"] == "codebook":
             attrs.append(CodebookAttr(a["name"], a["size"], a["file"], a.get("codes_per_beta")))
         else:
@@ -128,12 +184,13 @@ def _parse(raw: dict) -> Protocol:
         max_alpha=float(prim["max_alpha"]),
         sigma_min=float(prim["sigma_px"]["min"]),
         sigma_max=float(prim["sigma_px"]["max"]),
-        beta_levels=tuple(float(b) for b in prim["beta_levels"]),
+        beta_levels=_beta_levels(raw, attrs),
         attributes=tuple(attrs),
         events=tuple(raw["events"]),
         layers=tuple(
             Layer(l["id"], l["name"], l["max_primitives"], tuple(l["celebamask"])) for l in raw["layers"]
         ),
+        version=int(raw.get("version", 1)),
     )
     _validate(proto)
     return proto
@@ -148,16 +205,29 @@ def _validate(p: Protocol) -> None:
         raise ValueError(
             f"layer caps need {p.worst_case_positions()} positions > context {p.max_positions}"
         )
-    shape = p.attr("shape")
-    assert isinstance(shape, CodebookAttr)
-    if shape.codes_per_beta * len(p.beta_levels) != shape.size:
-        raise ValueError("shape codebook size must equal codes_per_beta * len(beta_levels)")
+    if "shape" in p.attr_names:
+        shape = p.attr("shape")
+        assert isinstance(shape, CodebookAttr)
+        if shape.codes_per_beta * len(p.beta_levels) != shape.size:
+            raise ValueError("shape codebook size must equal codes_per_beta * len(beta_levels)")
+    elif not {"sigma_x", "sigma_y", "theta", "beta"} <= set(p.attr_names):
+        raise ValueError("protocol needs either a 'shape' codebook or sigma_x/sigma_y/theta/beta")
+    if len(set(p.attr_names)) != len(p.attr_names):
+        raise ValueError("duplicate attribute names")
     seen: set[str] = set()
     for l in p.layers:
         dup = seen.intersection(l.celebamask)
         if dup:
             raise ValueError(f"CelebAMask classes assigned to two layers: {dup}")
         seen.update(l.celebamask)
+
+
+def _beta_levels(raw: dict, attrs) -> tuple[float, ...]:
+    """v1 lists beta levels explicitly; v2 derives them from the beta attribute's bins."""
+    if "beta_levels" in raw["primitive"]:
+        return tuple(float(b) for b in raw["primitive"]["beta_levels"])
+    beta = next(a for a in attrs if a.name == "beta")
+    return tuple(float(v) for v in beta.dequantize(torch.arange(beta.bins)))
 
 
 @lru_cache(maxsize=None)

@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from lpp.codec import ATTR_ORDER, Codec  # noqa: E402
+from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, collate, load_shards  # noqa: E402
 from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
@@ -64,7 +64,7 @@ def render_samples(model, codec, n, path, seed):
         if attrs.shape[0] == 0:
             tiles.append(np.full((256, 256, 3), 255, np.uint8))
             continue
-        prims = codec.decode({k: attrs[:, i].unsqueeze(0).cuda() for i, k in enumerate(ATTR_ORDER)})
+        prims = codec.decode({k: attrs[:, i].unsqueeze(0).cuda() for i, k in enumerate(codec.attr_names)})
         img = flatten_on_base(render_group(prims, 256))
         tiles.append((img[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
     Image.fromarray(np.concatenate(tiles, 1)).save(path)
@@ -106,6 +106,12 @@ def main() -> None:
     files = sorted(Path(p) for p in glob.glob(args.data))
     if not files:
         raise SystemExit(f"no shards match {args.data}")
+    for d in sorted({f.parent for f in files}):        # data and model must use the same protocol
+        cfg_file = d / "config.json"
+        data_version = json.loads(cfg_file.read_text()).get("protocol_version", 1) if cfg_file.exists() else 1
+        if data_version != proto.version:
+            raise SystemExit(f"{d} was made with protocol v{data_version}, training uses v{proto.version}; "
+                             f"pass --protocol for that version")
     examples = load_shards(files)
     is_val = lambda e: (e.image_id * 2654435761 % 2**32) / 2**32 < args.val_frac  # noqa: E731  same split for flips
     if args.split_manifest:

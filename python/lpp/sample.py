@@ -10,8 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .codec import ATTR_ORDER
-from .model import DEC_STEPS, Painter
+from .model import Painter
 from .sequence import KIND_BOS, KIND_CONTROL, KIND_PRIMITIVE, NO_ATTR, DrawSeq, Grammar
 
 
@@ -46,7 +45,7 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     cfg = cfg or SampleConfig()
     model.eval()
     proto, dev = model.proto, next(model.parameters()).device
-    B, A = batch, len(ATTR_ORDER)
+    B, A = batch, len(model.attr_names)
     Lt = 0 if text is None else text.shape[1]
     max_records = cfg.max_records or model.cfg.max_positions - Lt
     cache = model.new_cache(B, dev, max_len=Lt + max_records)
@@ -86,7 +85,7 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         attrs = torch.full((B, A), NO_ATTR, dtype=torch.long, device=dev)
         is_prim = event == prim_ev
         if is_prim.any():
-            for i, name in enumerate(ATTR_ORDER):
+            for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, event, attrs.clamp(min=0), steps=2 + i)
                 attrs[:, i] = _sample(model.heads[name](dh[:, -1]), cfg, rand(step, name))
             attrs[~is_prim] = NO_ATTR
@@ -122,4 +121,4 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     return seqs
 
 
-__all__ = ["SampleConfig", "generate", "DEC_STEPS"]
+__all__ = ["SampleConfig", "generate"]

@@ -68,3 +68,23 @@ def test_fit_beats_flat_color_and_respects_layers(result):
         flat = -10 * torch.log10(((img[b] - img[b].mean((1, 2), keepdim=True)) ** 2).mean()).item()
         assert d.psnr > flat + 6, (d.psnr, flat)
         assert max(d.layer_leak[1:]) < 0.15, d.layer_leak
+
+
+def test_continuous_mode_never_snaps(proto):
+    """quantize=False: the returned continuous parameters reproduce the reported PSNR
+    exactly (no codebook involved), and they are not snapped to code values."""
+    try:
+        codec = Codec.load(device=DEV)
+    except FileNotFoundError:
+        pytest.skip("codebooks missing")
+    from lpp.render import Primitives
+    img, label, _, _ = synthetic_scene(1, 64, seed=3, device=DEV)
+    cfg = DecomposeConfig(size=64, round_sigmas=(48.0, 12.0), round_fracs=(0.4, 0.6), steps_per_round=30,
+                          budget_scale=0.6, quantize=False)
+    d = LayeredDecomposer(codec, cfg)(img, label)[0]
+    c = {k: v.unsqueeze(0).to(DEV) for k, v in d.continuous.items()}
+    layers = render_layers(Primitives(**c), d.layer.unsqueeze(0).to(DEV), 64)
+    psnr = -10 * torch.log10(((stack_layers(layers) - img) ** 2).mean()).item()
+    assert abs(psnr - d.psnr) < 0.05
+    snapped = codec.snap(Primitives(**c), straight_through=False)
+    assert not torch.allclose(snapped.xy, c["xy"])

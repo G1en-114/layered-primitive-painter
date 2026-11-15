@@ -47,6 +47,8 @@ class DecomposeConfig:
     round_fracs: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25, 0.25)  # share of layer budget
     steps_per_round: int = 120
     snap_frac: float = 0.3            # last fraction of each round fitted through snap()
+    quantize: bool = True             # False: never snap, stack layers continuously (for fitting
+                                      # new codebooks without a bias towards the current ones)
     budget_scale: float = 2.5         # budget = cap * min(1, budget_scale * sqrt(area fraction))
     min_budget: int = 4
     stop_mse: float = 2e-4            # skip a layer's remaining rounds below this region MSE
@@ -68,8 +70,9 @@ class Decomposition:
     tokens: dict[str, torch.Tensor]   # attr -> [N] long
     layer: torch.Tensor               # [N] long, non-decreasing
     round: torch.Tensor               # [N] long, non-decreasing inside each layer
-    psnr: float                       # quantized render vs. input image
+    psnr: float                       # render vs. input image (quantized unless cfg.quantize=False)
     layer_leak: list[float]           # per layer: mean coverage over pixels of layers behind it
+    continuous: dict[str, torch.Tensor] | None = None   # pre-snap xy/sigma/theta/beta/rgb/alpha [N, ...]
 
 
 class LayeredDecomposer:
@@ -111,7 +114,7 @@ class LayeredDecomposer:
         label = label.unsqueeze(1)
 
         before = (torch.zeros_like(img), torch.ones_like(img[:, :1]))  # empty group
-        out_tok, out_keep, out_layer, out_round, leaks = [], [], [], [], []
+        out_tok, out_cont, out_keep, out_layer, out_round, leaks = [], [], [], [], [], []
 
         for k, layer in enumerate(proto.layers):
             region = label == k
@@ -135,11 +138,15 @@ class LayeredDecomposer:
             with torch.no_grad():
                 keep = active.bool() & self._visible(prims)
                 tok = self.codec.encode(prims)
-                final = self._snapped(prims, keep.float(), straight_through=False)
+                if cfg.quantize:
+                    final = self._snapped(prims, keep.float(), straight_through=False)
+                else:
+                    final = prims.with_alpha(prims.alpha * keep)
                 group = render_group(final, size, proto)
                 leak = ((1 - group[1]) * behind).sum((1, 2, 3)) / behind.sum((1, 2, 3)).clamp(min=1)
                 before = over(before, group)
             out_tok.append(tok)
+            out_cont.append(prims)
             out_keep.append(keep)
             out_layer.append(torch.full_like(rounds, k))
             out_round.append(rounds)
@@ -160,6 +167,8 @@ class LayeredDecomposer:
                 round=torch.cat([r[b] for r in out_round])[keep].cpu(),
                 psnr=psnr[b].item(),
                 layer_leak=[l[b].item() for l in leaks],
+                continuous={f: torch.cat([getattr(c, f)[b] for c in out_cont])[keep].detach().cpu()
+                            for f in ("xy", "sigma", "theta", "beta", "rgb", "alpha")},
             ))
         return results
 
@@ -255,7 +264,7 @@ class LayeredDecomposer:
             snap_from = int(cfg.steps_per_round * (1 - cfg.snap_frac))
             for step in range(cfg.steps_per_round):
                 prims = self._to_prims(leaves, active)
-                if step >= snap_from:
+                if cfg.quantize and step >= snap_from:
                     prims = self._snapped(prims, active, straight_through=True)
                 comp, T = composite(prims)
                 cover = 1 - T
@@ -272,7 +281,8 @@ class LayeredDecomposer:
             p = {n: t.detach() for n, t in leaves.items()}
 
             with torch.no_grad():
-                comp, _ = composite(self._snapped(self._to_prims(p, active), active, straight_through=False))
+                cur = self._to_prims(p, active)
+                comp, _ = composite(self._snapped(cur, active, straight_through=False) if cfg.quantize else cur)
                 mse = (((comp - img) ** 2).mean(1, keepdim=True) * region).sum((1, 2, 3)) / region_n
                 done = done | (mse < cfg.stop_mse)
 

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from lpp.codec import Codec  # noqa: E402
 from lpp.decompose import DecomposeConfig, LayeredDecomposer  # noqa: E402
-from lpp.protocol import load_protocol  # noqa: E402
+from lpp.protocol import PROTOCOL_PATH, load_protocol  # noqa: E402
 
 
 def main() -> None:
@@ -59,9 +59,11 @@ def main() -> None:
     codec = Codec.load(proto=proto, device=dev)
     dec = LayeredDecomposer(codec, DecomposeConfig(steps_per_round=args.steps, seed=args.seed))
     config = {"flip": args.flip, "seed": args.seed, "steps": args.steps, "data": str(args.data)}
-    if args.protocol:
-        config.update(protocol=str(args.protocol),
-                      protocol_sha256=hashlib.sha256(args.protocol.read_bytes()).hexdigest())
+    # always record the protocol actually used: the default changed from v1 to v2, and
+    # resuming an old directory with the new default must be refused, not mixed in
+    proto_file = args.protocol or PROTOCOL_PATH
+    config.update(protocol=str(proto_file), protocol_version=proto.version,
+                  protocol_sha256=hashlib.sha256(Path(proto_file).read_bytes()).hexdigest())
     if args.ids_file:
         config.update(ids_file=str(args.ids_file),
                       ids_sha256=hashlib.sha256(args.ids_file.read_bytes()).hexdigest())

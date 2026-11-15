@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from lpp.codec import ATTR_ORDER, Codec  # noqa: E402
+from lpp.codec import Codec  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
 from lpp.render.reference import Primitives, flatten_on_base, over  # noqa: E402
@@ -77,12 +77,12 @@ def main():
         width = max(map(len, tokens))
         if width == 0:
             continue
-        packed = torch.zeros(args.count, width, len(ATTR_ORDER), dtype=torch.long, device=args.device)
+        packed = torch.zeros(args.count, width, len(codec.attr_names), dtype=torch.long, device=args.device)
         active = torch.zeros(args.count, width, device=args.device)
         for b, tok in enumerate(tokens):
             packed[b, :len(tok)] = torch.tensor(tok.astype(np.int64), device=args.device)
             active[b, :len(tok)] = 1
-        p = codec.decode({name: packed[..., j] for j, name in enumerate(ATTR_ORDER)})
+        p = codec.decode({name: packed[..., j] for j, name in enumerate(codec.attr_names)})
         base = dict(xy=p.xy, log_sigma=p.sigma.log(), theta=p.theta, rgb=p.rgb, alpha=p.alpha)
         leaves = {name: value.detach().clone().requires_grad_() for name, value in base.items()}
         for name, leaf in leaves.items():

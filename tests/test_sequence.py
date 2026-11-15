@@ -3,7 +3,8 @@ import random
 import pytest
 import torch
 
-from lpp.codec import ATTR_ORDER, Codec
+from lpp.codec import Codec
+from lpp.protocol import load_protocol
 from lpp.render.reference import render_layers, stack_layers
 from lpp.sequence import Grammar, build, paint_order, sample_mode, validate
 
@@ -16,7 +17,7 @@ def fake_decomposition(seed=0, layers=(0, 2, 3, 4)):
         lay += [k] * n
         rnd += sorted(torch.randint(0, 4, (n,), generator=g).tolist())
     N = len(lay)
-    vocab = (256, 256, 4096, 4096, 16)
+    vocab = tuple(load_protocol().attr_vocab_sizes.values())
     tokens = torch.stack([torch.randint(v, (N,), generator=g) for v in vocab], 1)
     return tokens, torch.tensor(lay), torch.tensor(rnd)
 
@@ -48,7 +49,7 @@ def test_modes_paint_identically(proto):
     imgs = []
     for seq in seqs:
         attrs, lay = paint_order(seq)
-        prims = codec.decode({n: attrs[:, i].unsqueeze(0) for i, n in enumerate(ATTR_ORDER)})
+        prims = codec.decode({n: attrs[:, i].unsqueeze(0) for i, n in enumerate(codec.attr_names)})
         imgs.append(stack_layers(render_layers(prims, lay.unsqueeze(0), 64)))
     assert torch.equal(imgs[0], imgs[1]) and torch.equal(imgs[0], imgs[2])
 

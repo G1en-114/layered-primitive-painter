@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from lpp.protocol import UniformAttr
@@ -17,19 +18,37 @@ def test_events_cover_every_layer(proto):
 
 
 def test_vocab_sizes(proto):
-    assert proto.attr_vocab_sizes == {"x": 256, "y": 256, "shape": 4096, "color": 4096, "alpha": 16}
+    assert proto.version == 2
+    assert proto.attr_vocab_sizes == {"x": 512, "y": 512, "sigma_x": 128, "sigma_y": 128, "theta": 128,
+                                      "beta": 8, "color": 4096, "alpha": 16}
+
+
+def test_v1_still_loads():
+    from lpp.protocol import REPO_ROOT, load_protocol
+    v1 = load_protocol(REPO_ROOT / "protocols" / "v1.json")
+    assert v1.version == 1 and v1.attr_names == ("x", "y", "shape", "color", "alpha")
+    assert v1.beta_levels == (1.0, 2.0, 4.0, 8.0)
+
+
+def test_periodic_and_log_attrs(proto):
+    import math
+    th = proto.attr("theta")
+    assert th.quantize(torch.tensor([math.pi - 1e-4, -1e-4, 0.0])).tolist() == [0, 0, 0]
+    sx = proto.attr("sigma_x")
+    assert sx.dequantize(torch.tensor(0)).item() == pytest.approx(0.5)
+    assert sx.dequantize(torch.tensor(127)).item() == pytest.approx(128.0, rel=1e-5)
 
 
 def test_uniform_roundtrip_and_ends(proto):
-    for name in ("x", "y", "alpha"):
+    for name in ("x", "y", "alpha", "sigma_x", "theta", "beta"):
         a = proto.attr(name)
-        assert isinstance(a, UniformAttr)
         idx = torch.arange(a.bins)
         assert torch.equal(a.quantize(a.dequantize(idx)), idx)
-        assert abs(a.dequantize(torch.tensor(0)).item() - a.min) < 1e-6
-        assert abs(a.dequantize(torch.tensor(a.bins - 1)).item() - a.max) < 1e-5
-        # out-of-range values clamp instead of producing invalid tokens
-        assert a.quantize(torch.tensor([-1e9, 1e9])).tolist() == [0, a.bins - 1]
+        if isinstance(a, UniformAttr):
+            assert abs(a.dequantize(torch.tensor(0)).item() - a.min) < 1e-6
+            assert abs(a.dequantize(torch.tensor(a.bins - 1)).item() - a.max) < 1e-5
+        # out-of-range values never produce invalid tokens
+        assert all(0 <= t < a.bins for t in a.quantize(torch.tensor([-1e9, 1e-9, 1e9])).tolist())
 
 
 def test_quantization_error_bounded(proto):

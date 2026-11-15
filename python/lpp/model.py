@@ -20,13 +20,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .codec import ATTR_ORDER, Codec
-from .protocol import Protocol, UniformAttr
+from .codec import Codec
+from .protocol import CodebookAttr, PeriodicAttr, Protocol
 from .sequence import KIND_PRIMITIVE
 
 N_KINDS = 4          # TEXT, BOS, CONTROL, PRIMITIVE
-DEC_STEPS = 1 + len(ATTR_ORDER)
-SOFT_LABEL_SIGMA = {"x": 1.0, "y": 1.0, "alpha": 0.5}   # in bins; ordinal attributes only
+SOFT_LABEL_SIGMA = {"alpha": 0.5, "beta": 0.5}   # in bins; other ordinal attributes use 1.0
 
 
 @dataclass
@@ -135,16 +134,21 @@ class Block(nn.Module):
 
 
 class Fourier(nn.Module):
-    """Ordinal token -> sin/cos features of its normalized value -> Linear."""
+    """Ordinal token -> sin/cos features of its normalized value -> Linear.
 
-    def __init__(self, bins: int, d: int, n_freqs: int):
+    Periodic attributes (angles) use integer frequencies on v = idx / bins, so the
+    first and last bins are neighbours in feature space."""
+
+    def __init__(self, bins: int, d: int, n_freqs: int, periodic: bool = False):
         super().__init__()
-        self.bins = bins
-        self.register_buffer("freqs", math.pi * 2.0 ** torch.arange(n_freqs).float(), persistent=False)
+        self.bins, self.periodic = bins, periodic
+        freqs = (2 * math.pi * torch.arange(1, n_freqs + 1).float() if periodic
+                 else math.pi * 2.0 ** torch.arange(n_freqs).float())
+        self.register_buffer("freqs", freqs, persistent=False)
         self.proj = nn.Linear(2 * n_freqs, d)
 
     def forward(self, idx):
-        v = idx.float().unsqueeze(-1) / max(self.bins - 1, 1)
+        v = idx.float().unsqueeze(-1) / (self.bins if self.periodic else max(self.bins - 1, 1))
         ang = v * self.freqs
         return self.proj(torch.cat([ang.sin(), ang.cos()], dim=-1))
 
@@ -170,8 +174,8 @@ class AttrEmbed(nn.Module):
         super().__init__()
         mods = {}
         for a in proto.attributes:
-            mods[a.name] = (Fourier(a.bins, d, n_freqs) if isinstance(a, UniformAttr)
-                            else CodeEmbed(code_features[a.name], d))
+            mods[a.name] = (CodeEmbed(code_features[a.name], d) if isinstance(a, CodebookAttr)
+                            else Fourier(a.bins, d, n_freqs, periodic=isinstance(a, PeriodicAttr)))
         self.mods = nn.ModuleDict(mods)
 
     def forward(self, name: str, idx):
@@ -179,12 +183,14 @@ class AttrEmbed(nn.Module):
 
 
 def code_features(codec: Codec) -> dict[str, torch.Tensor]:
-    """shape code -> (log-cov (3), beta one-hot); color code -> Oklab (3)."""
-    nb = len(codec.proto.beta_levels)
-    per_beta = codec.shape_codes.shape[0]
-    shape = torch.cat([codec.shape_codes.repeat(nb, 1).cpu(),
-                       torch.eye(nb).repeat_interleave(per_beta, 0)], dim=1)
-    return {"shape": shape, "color": codec.color_codes.cpu()}
+    """color code -> Oklab (3); v1 shape code -> (log-cov (3), beta one-hot)."""
+    feats = {"color": codec.color_codes.cpu()}
+    if codec.shape_codes is not None:
+        nb = len(codec.proto.beta_levels)
+        per_beta = codec.shape_codes.shape[0]
+        feats["shape"] = torch.cat([codec.shape_codes.repeat(nb, 1).cpu(),
+                                    torch.eye(nb).repeat_interleave(per_beta, 0)], dim=1)
+    return feats
 
 
 # --------------------------------------------------------------------------- the model
@@ -194,6 +200,8 @@ class Painter(nn.Module):
         self.cfg, self.proto = cfg, proto
         self.n_events = len(proto.events)
         self.vocab = proto.attr_vocab_sizes
+        self.attr_names = proto.attr_names
+        self.dec_steps = 1 + len(self.attr_names)
         feats = code_features(codec)
         d, dd = cfg.d_model, cfg.d_dec
 
@@ -212,12 +220,12 @@ class Painter(nn.Module):
         self.dec_in = nn.Linear(d, dd)
         self.dec_event_emb = nn.Embedding(self.n_events, dd)
         self.dec_attr_emb = AttrEmbed(proto, feats, dd, cfg.fourier_freqs)
-        self.dec_step = nn.Parameter(torch.zeros(DEC_STEPS, dd))
+        self.dec_step = nn.Parameter(torch.zeros(self.dec_steps, dd))
         self.dec_blocks = nn.ModuleList(Block(dd, cfg.dec_heads, cfg.dec_heads, cfg.dec_ff, None)
                                         for _ in range(cfg.dec_layers))
         self.dec_norm = nn.RMSNorm(dd)
         self.heads = nn.ModuleDict({"event": nn.Linear(dd, self.n_events)} |
-                                   {n: nn.Linear(dd, self.vocab[n]) for n in ATTR_ORDER})
+                                   {n: nn.Linear(dd, self.vocab[n]) for n in self.attr_names})
         self.apply(self._init)
 
     @staticmethod
@@ -235,7 +243,7 @@ class Painter(nn.Module):
         """kind/event/layer [B, T], attrs [B, T, A] (-1 = none) -> [B, T, d]."""
         x = self.kind_emb(kind) + self.event_emb(event + 1) + self.layer_emb(layer + 1)
         prim = (kind == KIND_PRIMITIVE).unsqueeze(-1)
-        for i, name in enumerate(ATTR_ORDER):
+        for i, name in enumerate(self.attr_names):
             x = x + self.attr_emb(name, attrs[..., i].clamp(min=0)) * prim
         return x
 
@@ -271,12 +279,13 @@ class Painter(nn.Module):
                        device, dtype)
 
     # ---- attribute decoder ----------------------------------------------
-    def decoder(self, h, event, attrs, steps: int = DEC_STEPS):
+    def decoder(self, h, event, attrs, steps: int | None = None):
         """h [M, d]; event [M]; attrs [M, A] (teacher inputs) -> hidden [M, steps, d_dec]."""
+        steps = steps or self.dec_steps
         toks = [self.dec_in(h)]
         if steps > 1:
             toks.append(self.dec_event_emb(event.clamp(min=0)))
-        for i, name in enumerate(ATTR_ORDER[: steps - 2]):
+        for i, name in enumerate(self.attr_names[: steps - 2]):
             toks.append(self.dec_attr_emb(name, attrs[:, i].clamp(min=0)))
         x = torch.stack(toks, 1) + self.dec_step[:steps]
         T = x.shape[1]
@@ -303,20 +312,27 @@ class Painter(nn.Module):
         out = self.decoder(hs, ev, at)
         losses = {"event": F.cross_entropy(self.heads["event"](out[:, 0]).float(), ev)}
         prim = ev == self.proto.event_id("PRIMITIVE")
-        for i, name in enumerate(ATTR_ORDER):
+        for i, name in enumerate(self.attr_names):
             logits = self.heads[name](out[prim, 1 + i]).float()
             target = at[prim, i]
-            if name in SOFT_LABEL_SIGMA:
-                losses[name] = soft_ce(logits, target, SOFT_LABEL_SIGMA[name])
-            else:
+            attr = self.proto.attr(name)
+            if isinstance(attr, CodebookAttr):
                 losses[name] = F.cross_entropy(logits, target)
+            else:
+                losses[name] = soft_ce(logits, target, SOFT_LABEL_SIGMA.get(name, 1.0),
+                                       periodic=isinstance(attr, PeriodicAttr))
         losses["loss"] = sum(losses.values())
         return losses
 
 
-def soft_ce(logits, target, sigma: float):
-    """Cross-entropy against a Gaussian over neighbouring bins (ordinal targets)."""
-    bins = torch.arange(logits.shape[-1], device=logits.device, dtype=torch.float32)
-    q = torch.exp(-0.5 * ((bins[None, :] - target[:, None].float()) / sigma) ** 2)
+def soft_ce(logits, target, sigma: float, periodic: bool = False):
+    """Cross-entropy against a Gaussian over neighbouring bins (ordinal targets).
+    Periodic attributes measure bin distance around the circle."""
+    n = logits.shape[-1]
+    bins = torch.arange(n, device=logits.device, dtype=torch.float32)
+    dist = bins[None, :] - target[:, None].float()
+    if periodic:
+        dist = torch.remainder(dist + n / 2, n) - n / 2
+    q = torch.exp(-0.5 * (dist / sigma) ** 2)
     q = q / q.sum(-1, keepdim=True)
     return -(q * F.log_softmax(logits, -1)).sum(-1).mean()

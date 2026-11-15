@@ -41,7 +41,7 @@ def test_full_config_size(proto, codec):
 def test_forward_losses_finite(proto, codec):
     m = tiny(proto, codec)
     out = m(batch_of(proto, text_dim=m.cfg.text_dim))
-    assert set(out) == {"event", "x", "y", "shape", "color", "alpha", "loss"}
+    assert set(out) == {"event", "loss", *proto.attr_names}
     assert all(torch.isfinite(v) for v in out.values())
 
 
