@@ -3,11 +3,15 @@
     python tools/caption_vlm.py --model /root/private_data/models/Qwen2.5-VL-7B-Instruct \
         --images /root/private_data/caption_images --out /root/private_data/captions.jsonl
 
-Two captions per image: a short one (~20 characters) and a detailed one (~60). The
+Two captions per image as two plain lines (no JSON: fewer tokens to generate): a short
+one (<= 15 characters) and a detailed one (<= 50). The
 prompt asks for what the layers can actually express: hair, face and skin, features
 and expression, makeup, accessories, clothing, background color and framing.
 Resumable: ids already in the output file are skipped. Output lines:
     {"id": 123, "short": "...", "long": "...", "raw": "..."}
+
+Throughput note (Hygon DCU, DTK 26.04): generation is overhead-bound, not bandwidth-bound,
+so fewer output tokens and bigger batches are what help.
 """
 from __future__ import annotations
 
@@ -22,18 +26,26 @@ import torch
 from PIL import Image
 
 PROMPT = (
-    "请用中文描述这张人像照片，输出 JSON：{\"short\": 约20字的简短描述, \"long\": 约60字的详细描述}。"
-    "描述要具体、客观，覆盖：发型与发色、脸型与肤色、眼睛眉毛鼻子嘴巴与表情、妆容、"
-    "饰品（眼镜、帽子、耳环、项链，没有就不提）、服装、背景颜色、取景（如头部和肩颈）。"
-    "不要猜测身份、年龄数字或姓名，不要输出 JSON 以外的内容。"
+    "用中文描述这张人像照片，只输出两行，不要编号、引号或其他内容：\n"
+    "第一行：15字以内的简短描述。\n"
+    "第二行：50字以内的详细描述，依次写发型发色、肤色、五官与表情、妆容、"
+    "饰品（眼镜、帽子、耳环、项链，没有就不写）、服装、背景颜色。"
+    "不要猜测身份、年龄数字或姓名。"
 )
 
 
 def load(model_dir: str, dtype=torch.bfloat16):
     from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
     from transformers import Qwen2VLImageProcessor  # slow processor: needs no torchvision
+    if torch.version.hip:
+        # DTK builds of PyTorch dispatch SDPA to a FlashAttention library they do not ship
+        # ("No matching libraries found for flash_attn_2_cuda*.so") and are compiled without
+        # memory-efficient attention: allow only the plain math kernel.
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_dir, torch_dtype=dtype, attn_implementation="sdpa").to("cuda").eval()
+        model_dir, dtype=dtype, attn_implementation="sdpa").to("cuda").eval()
     tok = AutoTokenizer.from_pretrained(model_dir, padding_side="left")
     imgp = Qwen2VLImageProcessor.from_pretrained(model_dir)
     return model, tok, imgp
@@ -55,14 +67,16 @@ def build_inputs(tok, imgp, images: list[Image.Image]):
 
 
 def parse(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        try:
-            d = json.loads(m.group(0))
-            if isinstance(d.get("short"), str) and isinstance(d.get("long"), str):
-                return {"short": d["short"].strip(), "long": d["long"].strip()}
-        except json.JSONDecodeError:
-            pass
+    """Two plain lines: short, then long. Tolerates stray labels like '第一行：'."""
+    lines = [re.sub(r"^\s*(第[一二]行|简短描述|详细描述)?\s*[:：]?\s*", "", line).strip()
+             for line in text.strip().splitlines() if line.strip()]
+    if len(lines) >= 2 and lines[0] and lines[1]:
+        return {"short": lines[0], "long": lines[1]}
+    if len(lines) == 1 and len(lines[0]) >= 8:
+        # ~20% of outputs skip the short line and give only the detailed one:
+        # keep it, and use its first two clauses as the short caption
+        clauses = [c for c in re.split(r"[，,。；;]", lines[0]) if c]
+        return {"short": "，".join(clauses[:2]), "long": lines[0]}
     return {"short": "", "long": ""}
 
 
@@ -71,8 +85,8 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--images", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--batch", type=int, default=48)
-    ap.add_argument("--max-new-tokens", type=int, default=200)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--max-new-tokens", type=int, default=110)
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -82,7 +96,7 @@ def main() -> None:
     ids = sorted(int(p.stem) for p in args.images.glob("*.jpg"))[: args.limit]
     done = set()
     if args.out.exists():
-        done = {json.loads(l)["id"] for l in args.out.read_text().splitlines() if l.strip()}
+        done = {json.loads(line)["id"] for line in args.out.read_text().splitlines() if line.strip()}
     todo = [i for i in ids if i not in done]
     print(f"{len(ids)} images, {len(done)} done, {len(todo)} to caption", flush=True)
 
