@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from lpp.clip_score import ClipScorer  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
+from lpp.data.sequences import ImageTokenStore  # noqa: E402
 from lpp.metrics import orphan_stats  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import _parse  # noqa: E402
@@ -98,6 +99,9 @@ def main() -> None:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-grid", type=int, default=16, help="samples (with their real images) in the grid")
+    ap.add_argument("--image-tokens", type=Path, default=None,
+                    help="image-conditioned models: condition each sample on its validation image's CLIP tokens")
+    ap.add_argument("--no-text", action="store_true", help="with --image-tokens: image only, no prompt")
     ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto",
                     help="math avoids unavailable FlashAttention libraries on some DTK builds")
     args = ap.parse_args()
@@ -117,6 +121,13 @@ def main() -> None:
     model.load_state_dict(state["model"])
     encoder = TextEncoder(args.text_encoder).to(dev)
     ids, prompts, real = load_val(args)
+    store = None
+    if args.image_tokens is not None:
+        if not model.cfg.image:
+            raise SystemExit("--image-tokens needs an image-conditioned checkpoint")
+        store = ImageTokenStore(args.image_tokens)
+    elif args.no_text:
+        raise SystemExit("--no-text only makes sense with --image-tokens")
     print(f"checkpoint step {state['step']}, {model.num_params() / 1e6:.1f}M; {len(ids)} prompts", flush=True)
 
     sc = SampleConfig(temperature=1.0, top_p=args.top_p, cfg_scale=args.cfg_scale)
@@ -132,10 +143,14 @@ def main() -> None:
     started = time.perf_counter()
     for b0 in range(len(gen), args.n, args.batch):
         batch_prompts = prompts[b0:b0 + args.batch]
-        text, text_valid = encoder(batch_prompts)
+        text, text_valid = (None, None) if args.no_text else encoder(batch_prompts)
+        image = image_valid = None
+        if store is not None:
+            image = torch.from_numpy(np.stack([store.get(i, False) for i in ids[b0:b0 + args.batch]])).float().to(dev)
+            image_valid = torch.ones(image.shape[:2], dtype=torch.bool, device=dev)
         g = torch.Generator(device=dev).manual_seed(args.seed * 100003 + b0)
         for s in generate(model, batch=len(batch_prompts), cfg=sc, text=text, text_valid=text_valid,
-                          generator=g, codec=codec):
+                          generator=g, codec=codec, image=image, image_valid=image_valid):
             attrs, lay = paint_order(s)
             lengths.append(len(s))
             early += int(2 not in lay.tolist())
@@ -167,9 +182,15 @@ def main() -> None:
                       "orphan_rate": round(float(np.mean(orphan)), 4) if orphan else None,
                       "early_stop": round(early / args.n, 4), "mean_length": round(float(np.mean(lengths)), 1),
                       "images_per_s": round(args.n / gen_seconds, 3)},
+        "condition": ("image" if args.no_text else "image+text") if store is not None else "text",
         "real_reference": {"clip_score": round(100 * float((ri * t).sum(1).mean()), 3), **retrieval(ri, t),
                            "real_split_fd": round(frechet(r_np[:half], r_np[half:]), 4)},
     }
+    if store is not None:      # image -> painting: how faithful is the result to its input image
+        g_img, r_img = np.stack(gen).astype(np.float64), np.stack(real).astype(np.float64)
+        mse = ((g_img - r_img) ** 2).mean((1, 2, 3))
+        result["generated"]["input_psnr"] = round(float(np.mean(10 * np.log10(255.0 ** 2 / np.maximum(mse, 1e-9)))), 3)
+        result["generated"]["clip_image_to_input"] = round(float((gi * ri).sum(1).mean()), 4)
     (args.out / "metrics.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
     (args.out / "prompts.json").write_text(json.dumps(dict(zip(map(str, ids), prompts)), indent=1,
                                                       ensure_ascii=False))
