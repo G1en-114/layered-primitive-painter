@@ -82,8 +82,8 @@ class TargetImageStore:
     def get(self, image_id: int, flip: bool) -> np.ndarray:
         if self._mm is None:
             self._mm = np.load(self.root / "images.npy", mmap_mode="r")
-        img = np.asarray(self._mm[self.row[int(image_id)]])
-        return np.ascontiguousarray(img[:, ::-1]) if flip else img
+        img = self._mm[self.row[int(image_id)]]
+        return np.array(img[:, ::-1] if flip else img)      # a writable copy (torch warns on read-only memmaps)
 
 
 class SequenceDataset(Dataset):
