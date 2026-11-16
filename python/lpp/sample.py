@@ -58,8 +58,11 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
 @torch.no_grad()
 def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, text=None, text_valid=None,
              generator: torch.Generator | None = None, uniforms=None, codec=None,
-             canvas_history: list | None = None) -> list[DrawSeq]:
-    """Generate `batch` drawing sequences from BOS (optionally text-conditioned).
+             canvas_history: list | None = None, image=None, image_valid=None) -> list[DrawSeq]:
+    """Generate `batch` drawing sequences from BOS (optionally text- and/or image-conditioned).
+
+    image/image_valid: CLIP image tokens [B, Li, D] for image-conditioned models; guidance (cfg_scale)
+    contrasts with and without the text only, both halves keep the image.
 
     uniforms: optional callable (step, field) -> [B] tensor in [0, 1) replacing the RNG.
     codec: required for models with canvas feedback (decodes primitives to render the canvas).
@@ -74,6 +77,12 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     if guided:   # rows B..2B-1: same records, no text (all text slots invalid)
         text = torch.cat([text, torch.zeros_like(text)])
         text_valid = torch.cat([text_valid, torch.zeros_like(text_valid)])
+        if image is not None:
+            image, image_valid = torch.cat([image, image]), torch.cat([image_valid, image_valid])
+    if image is not None and image.shape[1] > 0:
+        if not model.cfg.image:
+            raise ValueError("image tokens given to a model without image conditioning")
+        Lt += image.shape[1]               # the prefix is [image tokens][text tokens]
     R = 2 * B if guided else B           # rows run through the network
     max_records = cfg.max_records or model.cfg.max_positions - Lt
     cache = model.new_cache(R, dev, max_len=Lt + max_records)
@@ -99,9 +108,11 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     rec_attrs = torch.full((B, 1, A), NO_ATTR, device=dev)
     x = model.embed_records(rows(rec_kind), rows(rec_event), rows(rec_layer), rows(rec_attrs))
     valid = torch.ones(R, 1, dtype=torch.bool, device=dev)
-    if Lt:
-        x = torch.cat([model.embed_text(text), x], 1)
-        valid = torch.cat([text_valid, valid], 1)
+    prefix, prefix_valid = model.embed_prefix({"text": text, "text_valid": text_valid,
+                                               "image": image, "image_valid": image_valid})
+    if prefix is not None:
+        x = torch.cat([prefix, x], 1)
+        valid = torch.cat([prefix_valid, valid], 1)
     tracker = None
     if model.cfg.canvas:
         if codec is None:

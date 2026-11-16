@@ -50,6 +50,10 @@ class ModelConfig:
     canvas_size: int = 64
     canvas_every: int = 4
     canvas_width: int = 64
+    # image conditioning (image -> layered primitives, editing): frozen CLIP image tokens as a
+    # prefix before the text, see tools/extract_image_features.py
+    image: bool = False
+    image_dim: int = 768
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -290,6 +294,9 @@ class Painter(nn.Module):
         self.layer_emb = nn.Embedding(proto.num_layers + 1, d)       # +1: "no layer"
         self.attr_emb = AttrEmbed(proto, feats, d, cfg.fourier_freqs)
         self.text_proj = nn.Linear(cfg.text_dim, d)
+        if cfg.image:
+            self.image_proj = nn.Linear(cfg.image_dim, d)
+            self.image_type = nn.Parameter(torch.zeros(d))
         rope = Rotary(d // cfg.n_heads, cfg.max_positions, cfg.rope_base)
         self.blocks = nn.ModuleList(Block(d, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, rope)
                                     for _ in range(cfg.n_layers))
@@ -332,6 +339,22 @@ class Painter(nn.Module):
 
     def embed_text(self, text):
         return self.text_proj(text) + self.kind_emb.weight[0]
+
+    def embed_image(self, image):
+        return self.image_proj(image) + self.image_type
+
+    def embed_prefix(self, batch: dict) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Condition prefix [image tokens][text tokens] -> (x [B, L, d], valid [B, L]) or (None, None)."""
+        parts, valids = [], []
+        if self.cfg.image and batch.get("image") is not None and batch["image"].shape[1] > 0:
+            parts.append(self.embed_image(batch["image"]))
+            valids.append(batch["image_valid"])
+        if batch.get("text") is not None and batch["text"].shape[1] > 0:
+            parts.append(self.embed_text(batch["text"]))
+            valids.append(batch["text_valid"])
+        if not parts:
+            return None, None
+        return torch.cat(parts, 1), torch.cat(valids, 1)
 
     def backbone(self, x, valid, cache: KVCache | None = None, canvas_ctx=None):
         """x [B, T, d], valid [B, T] -> hidden [B, T, d]. With a cache, x continues it.
@@ -429,14 +452,15 @@ class Painter(nn.Module):
         return res
 
     def _hidden(self, batch: dict) -> torch.Tensor:
-        """Backbone states at the record positions [B, T, d] (text prefix and canvas included)."""
+        """Backbone states at the record positions [B, T, d] (image/text prefix and canvas included)."""
         x = self.embed_records(batch["kind"], batch["event"], batch["layer"], batch["attrs"])
         valid = batch["valid"]
         Lt = 0
-        if batch.get("text") is not None and batch["text"].shape[1] > 0:
-            Lt = batch["text"].shape[1]
-            x = torch.cat([self.embed_text(batch["text"]), x], 1)
-            valid = torch.cat([batch["text_valid"], valid], 1)
+        prefix, prefix_valid = self.embed_prefix(batch)
+        if prefix is not None:
+            Lt = prefix.shape[1]
+            x = torch.cat([prefix, x], 1)
+            valid = torch.cat([prefix_valid, valid], 1)
         canvas_ctx = None
         if self.cfg.canvas and batch.get("canvas") is not None:
             B, S = batch["canvas"].shape[:2]

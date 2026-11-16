@@ -45,13 +45,36 @@ def load_shards(paths: list[Path]) -> list[Example]:
     return out
 
 
+class ImageTokenStore:
+    """Precomputed CLIP image tokens (tools/extract_image_features.py), memory-mapped.
+
+    get(image_id, flip) -> float16 array [Li, D], the mirrored image's tokens for flipped
+    trajectories. Opened lazily so DataLoader workers each map the files themselves."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.row = {int(i): r for r, i in enumerate(json.loads((self.root / "ids.json").read_text()))}
+        self._mm: dict[str, np.ndarray] = {}
+
+    def __contains__(self, image_id: int) -> bool:
+        return int(image_id) in self.row
+
+    def get(self, image_id: int, flip: bool) -> np.ndarray:
+        key = "flip" if flip else "orig"
+        if key not in self._mm:
+            self._mm[key] = np.load(self.root / f"tokens_{key}.npy", mmap_mode="r")
+        return np.asarray(self._mm[key][self.row[int(image_id)]])
+
+
 class SequenceDataset(Dataset):
     """Each __getitem__ draws a fresh mode (full / redraw / refine) for its example."""
 
     def __init__(self, examples: list[Example], proto: Protocol | None = None, seed: int = 0,
                  p_redraw: float = 0.15, p_refine: float = 0.15, text_fn=None, captions=None,
-                 p_text_drop: float = 0.1, p_perturb: float = 0.0):
+                 p_text_drop: float = 0.1, p_perturb: float = 0.0, image_tokens: ImageTokenStore | None = None,
+                 p_image: float = 0.0):
         self.examples, self.proto = examples, proto or load_protocol()
+        self.image_tokens, self.p_image = image_tokens, p_image   # image condition with probability p_image
         self.rng = random.Random(seed)
         self.p_redraw, self.p_refine = p_redraw, p_refine
         self.text_fn = text_fn          # image_id -> [Lt, text_dim] tensor, or None (precomputed)
@@ -74,12 +97,19 @@ class SequenceDataset(Dataset):
                 text = mirror_caption(text)
         else:
             text = self.text_fn(ex.image_id) if self.text_fn else None
+        if self.image_tokens is not None:
+            image = None
+            if self.p_image > 0 and ex.image_id in self.image_tokens and self.rng.random() < self.p_image:
+                image = self.image_tokens.get(ex.image_id, ex.flip)
+            return seq, text, image
         return seq, text
 
 
-def collate(items: list[tuple[DrawSeq, torch.Tensor | None]], text_dim: int | None = None) -> dict:
-    """Right-pad to the longest sequence; targets are the next record."""
-    seqs = [s for s, _ in items]
+def collate(items: list[tuple[DrawSeq, ...]], text_dim: int | None = None) -> dict:
+    """Right-pad to the longest sequence; targets are the next record.
+
+    items: (seq, text) or (seq, text, image) with image a [Li, D] array/tensor or None."""
+    seqs = [it[0] for it in items]
     B, T = len(seqs), max(len(s) for s in seqs) - 1
     A = seqs[0].attrs.shape[1]
     batch = {
@@ -102,7 +132,16 @@ def collate(items: list[tuple[DrawSeq, torch.Tensor | None]], text_dim: int | No
         batch["tgt_attrs"][b, :n] = s.attrs[1:]
         if s.no_target is not None:                     # never learn to produce a perturbed record
             batch["tgt_event"][b, :n][s.no_target[1:]] = -1
-    texts = [t for _, t in items]
+    images = [it[2] if len(it) > 2 else None for it in items]
+    if any(im is not None for im in images):
+        Li, D = next(im.shape for im in images if im is not None)
+        batch["image"] = torch.zeros(B, Li, D)
+        batch["image_valid"] = torch.zeros(B, Li, dtype=torch.bool)
+        for b, im in enumerate(images):
+            if im is not None:
+                batch["image"][b] = torch.as_tensor(np.asarray(im, dtype=np.float32))
+                batch["image_valid"][b] = True
+    texts = [it[1] for it in items]
     if any(isinstance(t, str) for t in texts):      # caption strings: encoded on the GPU later
         batch["captions"] = texts
     elif any(t is not None for t in texts):
