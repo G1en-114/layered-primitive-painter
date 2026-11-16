@@ -180,3 +180,20 @@ wc -l /root/private_data/captions.jsonl
 pgrep -af '[c]aption_vlm.py'
 tail -2 /root/private_data/runs/small_v0a/log.jsonl
 ```
+
+## 2026-11-16：反向 kernel v2（跳过空闲 wave）在 DCU 上的实测
+
+脚本：`bench/bench_native_versions.py`，同一份编译好的扩展、同一组张量，v1 与 v2 交替测量（AB/BA），
+各 5 次预热、40 次计时。测量的是完整的一步：前向 + 反向 + MSE。batch 16，每张 256 个图元，256px。
+
+| 设备 | v1 中位数 | v2 中位数 | 加速 |
+|---|---:|---:|---:|
+| 海光 BW（DTK 26.04，HIP 6.3） | 4.548 ms | 3.968 ms | **1.15×**（延迟降低 12.7%） |
+| RTX 5070 Laptop（之前测的） | — | — | 反向 1.41× |
+
+p10 到 p90 的波动小于 1%，所以这个差距是真实的，不是噪声。
+DCU 上的收益明显比 5070 小。v2 省掉的是“wave 里没有任何被覆盖像素”时的归约；
+猜测 DCU 的 wave 是 64 线程，空闲 wave 的比例和调度开销都和 NVIDIA 的 32 线程 warp 不同，
+加上这里测的是整步时间，前向和其他小 kernel 冲淡了占比。这只是猜测，还要用 rocprof 按 kernel 拆时间来验证。
+
+原始结果：`bench/results/native_versions_dcu_2026-11-16.json`。

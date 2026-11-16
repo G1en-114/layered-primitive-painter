@@ -1,0 +1,25 @@
+{
+  "device": "BW",
+  "torch": "2.9.0",
+  "hip": "6.3.26093",
+  "batch": 16,
+  "primitives": 256,
+  "size": 256,
+  "measurement": "complete forward + backward MSE step, GPU events, AB/BA",
+  "warmup_each": 5,
+  "repeats_each": 40,
+  "modes": {
+    "v1": {
+      "median_ms": 4.548077583312988,
+      "p10_ms": 4.531357765197754,
+      "p90_ms": 4.577276229858398
+    },
+    "v2_skip_idle": {
+      "median_ms": 3.9683974981307983,
+      "p10_ms": 3.9558379650115967,
+      "p90_ms": 3.9943981170654297
+    }
+  },
+  "speedup": 1.1460740980345925,
+  "latency_reduction": 0.12745606787998753
+}
