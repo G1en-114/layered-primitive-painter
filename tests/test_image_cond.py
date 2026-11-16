@@ -59,3 +59,47 @@ def test_generate_with_image_prefix_runs_and_guards():
         pass
     else:
         raise AssertionError("image tokens accepted by a model without image conditioning")
+
+
+def _target_model(codec):
+    torch.manual_seed(0)
+    cfg = ModelConfig.tiny()
+    cfg.target, cfg.target_size = True, 32
+    cfg.canvas_every = 1                       # tiny has 2 layers: cross-attention at every layer
+    m = Painter(cfg, codec.proto, codec).to(DEV)
+    assert len(m.target_cross) == cfg.n_layers
+    return m
+
+
+def test_collate_targets():
+    seq = build(*fake_decomposition(1))
+    t = np.full((32, 32, 3), 255, np.uint8)
+    b = collate([(seq, None, None, t), (seq, None, None, None)])
+    assert b["target"].shape == (2, 3, 32, 32) and b["target_valid"].tolist() == [True, False]
+    assert float(b["target"][0].max()) == 1.0 and float(b["target"][1].abs().sum()) == 0.0
+
+
+def test_target_cross_starts_as_noop_then_conditions_and_trains():
+    codec = Codec.load(device=DEV)
+    m = _target_model(codec)
+    seq = build(*fake_decomposition(2))
+    rng = np.random.default_rng(0)
+    tg = [rng.integers(0, 255, (32, 32, 3), dtype=np.uint8) for _ in range(2)]
+    b = {k: v.to(DEV) for k, v in collate([(seq, None, None, tg[0]), (seq, None, None, tg[1])]).items()}
+    plain = {k: v for k, v in b.items() if not k.startswith("target")}
+    with torch.no_grad():
+        assert torch.allclose(m.record_logprobs(b), m.record_logprobs(plain), atol=1e-6)   # gates at 0
+        for c in m.target_cross.values():
+            c.gate.fill_(0.5)
+        lp = m.record_logprobs(b)
+    assert (lp[0] - lp[1]).abs().max() > 1e-4                       # same records, different targets
+    m(b)["loss"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.target_enc.parameters())
+
+
+def test_generate_with_target_runs():
+    codec = Codec.load(device=DEV)
+    m = _target_model(codec).eval()
+    seqs = generate(m, batch=2, cfg=SampleConfig(max_records=20), target=torch.rand(2, 3, 32, 32, device=DEV),
+                    generator=torch.Generator(device=DEV).manual_seed(0), codec=codec)
+    assert len(seqs) == 2

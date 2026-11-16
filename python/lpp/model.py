@@ -54,6 +54,9 @@ class ModelConfig:
     # prefix before the text, see tools/extract_image_features.py
     image: bool = False
     image_dim: int = 768
+    # pixel-level target image read by cross-attention (see Painter.target_enc)
+    target: bool = False
+    target_size: int = 128
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -305,6 +308,12 @@ class Painter(nn.Module):
             self.canvas_enc = CanvasEncoder(3 + proto.num_layers, d, cfg.canvas_size, cfg.canvas_width)
             self.cross = nn.ModuleDict({str(li): CanvasCross(d, cfg.n_heads) for li in range(cfg.n_layers)
                                         if (li + 1) % cfg.canvas_every == 0})
+        if cfg.target:
+            # pixel-level target image (image -> painting): a trainable conv encoder and gated
+            # cross-attention at the canvas layers; gates start at 0 (a no-op until trained)
+            self.target_enc = CanvasEncoder(3, d, cfg.target_size, cfg.canvas_width)
+            self.target_cross = nn.ModuleDict({str(li): CanvasCross(d, cfg.n_heads) for li in range(cfg.n_layers)
+                                               if (li + 1) % cfg.canvas_every == 0})
 
         # attribute decoder
         self.dec_in = nn.Linear(d, dd)
@@ -356,9 +365,11 @@ class Painter(nn.Module):
             return None, None
         return torch.cat(parts, 1), torch.cat(valids, 1)
 
-    def backbone(self, x, valid, cache: KVCache | None = None, canvas_ctx=None):
+    def backbone(self, x, valid, cache: KVCache | None = None, canvas_ctx=None, target_ctx=None):
         """x [B, T, d], valid [B, T] -> hidden [B, T, d]. With a cache, x continues it.
-        canvas_ctx: see CanvasCross.forward (None: no canvas feedback)."""
+        canvas_ctx: see CanvasCross.forward (None: no canvas feedback).
+        target_ctx: (tokens [B, n, d], has [B] bool) from target_tokens(): every position of a row
+        with a target image reads it."""
         B, T, _ = x.shape
         if cache is None:
             pos = (valid.long().cumsum(1) - 1).clamp(min=0)
@@ -373,14 +384,25 @@ class Painter(nn.Module):
             k = torch.arange(s + T, device=x.device)
             mask = ((k[None, :] <= q[:, None]) & cache.valid[:, None, : s + T]) | (k[None, :] == q[:, None])
         mask = mask.unsqueeze(1)
+        tgt = None
+        if target_ctx is not None:
+            tgt = ("current", target_ctx[0], target_ctx[1][:, None].expand(B, T))
         for li, blk in enumerate(self.blocks):
             x = blk(x, pos, mask, cache, li)
             if canvas_ctx is not None and str(li) in getattr(self, "cross", {}):
                 x = self.cross[str(li)](x, canvas_ctx)
+            if tgt is not None and str(li) in self.target_cross:
+                x = self.target_cross[str(li)](x, tgt)
         if cache is not None:
             cache.length += T
             cache.next_pos += valid.long().sum(1)
         return self.norm(x)
+
+    def target_tokens(self, batch: dict):
+        """(tokens [B, n, d], has [B]) for target-conditioned rows, or None."""
+        if not self.cfg.target or batch.get("target") is None:
+            return None
+        return self.target_enc(batch["target"]), batch["target_valid"]
 
     def new_cache(self, B, device, dtype=torch.float32, max_len=None) -> KVCache:
         c = self.cfg
@@ -469,7 +491,7 @@ class Painter(nn.Module):
             if Lt:
                 seg = torch.cat([torch.full((B, Lt), -1, dtype=seg.dtype, device=seg.device), seg], 1)
             canvas_ctx = ("segments", tokens, seg)
-        return self.backbone(x, valid, canvas_ctx=canvas_ctx)[:, Lt:]
+        return self.backbone(x, valid, canvas_ctx=canvas_ctx, target_ctx=self.target_tokens(batch))[:, Lt:]
 
 
 def soft_ce(logits, target, sigma: float, periodic: bool = False):

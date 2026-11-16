@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from lpp.canvas import build_training_canvases  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
-from lpp.data.sequences import ImageTokenStore, SequenceDataset, collate, load_shards  # noqa: E402
+from lpp.data.sequences import ImageTokenStore, SequenceDataset, TargetImageStore, collate, load_shards  # noqa: E402
 from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.metrics import orphan_stats  # noqa: E402
@@ -142,6 +142,9 @@ def main() -> None:
     ap.add_argument("--image-tokens", type=Path, default=None,
                     help="CLIP image tokens (tools/extract_image_features.py): enables image conditioning")
     ap.add_argument("--p-image", type=float, default=0.5, help="share of sequences conditioned on their image")
+    ap.add_argument("--target-images", type=Path, default=None,
+                    help="pixel target store (tools/build_target_store.py): enables target-image cross-attention")
+    ap.add_argument("--p-target", type=float, default=0.5, help="share of sequences given their pixel target")
     ap.add_argument("--init-weights", type=Path, default=None,
                     help="start a NEW run from these weights (fresh optimizer and step; missing modules such "
                          "as canvas layers start at their init). Not the same as --resume.")
@@ -191,11 +194,18 @@ def main() -> None:
         if missing:
             raise SystemExit(f"{len(missing)} image IDs have no image tokens in {args.image_tokens}")
         print(f"image conditioning: {len(image_tokens.row)} images, p_image {args.p_image}")
+    targets = TargetImageStore(args.target_images) if args.target_images else None
+    if targets is not None:
+        missing = {e.image_id for e in examples} - set(targets.row)
+        if missing:
+            raise SystemExit(f"{len(missing)} image IDs have no target image in {args.target_images}")
+        print(f"target-image conditioning: {len(targets.row)} images, p_target {args.p_target}")
     train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed, captions=store,
                                p_text_drop=args.text_drop, p_perturb=args.perturb, image_tokens=image_tokens,
-                               p_image=args.p_image)
+                               p_image=args.p_image, targets=targets, p_target=args.p_target)
     val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0,
-                             captions=store, p_text_drop=0.0, image_tokens=image_tokens, p_image=args.p_image)
+                             captions=store, p_text_drop=0.0, image_tokens=image_tokens, p_image=args.p_image,
+                             targets=targets, p_target=args.p_target)
     print(f"{len(files)} shards, {len(train_ds)} train / {len(val_ds)} val sequences")
 
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
@@ -206,6 +216,9 @@ def main() -> None:
         # the image prefix comes on top of the protocol's worst case (rotary tables are not saved,
         # so a larger context still loads checkpoints trained without images)
         cfg.image, cfg.max_positions = True, max(cfg.max_positions, proto.worst_case_positions() + n_img)
+    if targets is not None:
+        cfg.target = True
+        cfg.target_size = int(json.loads((args.target_images / "meta.json").read_text())["size"])
     if encoder is not None and cfg.text_dim != encoder.dim:
         raise SystemExit(f"model text_dim {cfg.text_dim} != text encoder width {encoder.dim}")
     model = Painter(cfg, proto, codec).cuda()

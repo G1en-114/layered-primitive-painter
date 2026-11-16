@@ -66,15 +66,36 @@ class ImageTokenStore:
         return np.asarray(self._mm[key][self.row[int(image_id)]])
 
 
+class TargetImageStore:
+    """Pixel target images for target-conditioned painting (tools/build_target_store.py):
+    images.npy uint8 [N, S, S, 3] memory-mapped + ids.json. get(image_id, flip) mirrors the image
+    for flipped trajectories."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.row = {int(i): r for r, i in enumerate(json.loads((self.root / "ids.json").read_text()))}
+        self._mm: np.ndarray | None = None
+
+    def __contains__(self, image_id: int) -> bool:
+        return int(image_id) in self.row
+
+    def get(self, image_id: int, flip: bool) -> np.ndarray:
+        if self._mm is None:
+            self._mm = np.load(self.root / "images.npy", mmap_mode="r")
+        img = np.asarray(self._mm[self.row[int(image_id)]])
+        return np.ascontiguousarray(img[:, ::-1]) if flip else img
+
+
 class SequenceDataset(Dataset):
     """Each __getitem__ draws a fresh mode (full / redraw / refine) for its example."""
 
     def __init__(self, examples: list[Example], proto: Protocol | None = None, seed: int = 0,
                  p_redraw: float = 0.15, p_refine: float = 0.15, text_fn=None, captions=None,
                  p_text_drop: float = 0.1, p_perturb: float = 0.0, image_tokens: ImageTokenStore | None = None,
-                 p_image: float = 0.0):
+                 p_image: float = 0.0, targets: TargetImageStore | None = None, p_target: float = 0.0):
         self.examples, self.proto = examples, proto or load_protocol()
         self.image_tokens, self.p_image = image_tokens, p_image   # image condition with probability p_image
+        self.targets, self.p_target = targets, p_target           # pixel target with probability p_target
         self.rng = random.Random(seed)
         self.p_redraw, self.p_refine = p_redraw, p_refine
         self.text_fn = text_fn          # image_id -> [Lt, text_dim] tensor, or None (precomputed)
@@ -97,18 +118,23 @@ class SequenceDataset(Dataset):
                 text = mirror_caption(text)
         else:
             text = self.text_fn(ex.image_id) if self.text_fn else None
-        if self.image_tokens is not None:
-            image = None
-            if self.p_image > 0 and ex.image_id in self.image_tokens and self.rng.random() < self.p_image:
-                image = self.image_tokens.get(ex.image_id, ex.flip)
-            return seq, text, image
-        return seq, text
+        if self.image_tokens is None and self.targets is None:
+            return seq, text
+        image = target = None
+        if self.image_tokens is not None and self.p_image > 0 and ex.image_id in self.image_tokens \
+                and self.rng.random() < self.p_image:
+            image = self.image_tokens.get(ex.image_id, ex.flip)
+        if self.targets is not None and self.p_target > 0 and ex.image_id in self.targets \
+                and self.rng.random() < self.p_target:
+            target = self.targets.get(ex.image_id, ex.flip)
+        return seq, text, image, target
 
 
 def collate(items: list[tuple[DrawSeq, ...]], text_dim: int | None = None) -> dict:
     """Right-pad to the longest sequence; targets are the next record.
 
-    items: (seq, text) or (seq, text, image) with image a [Li, D] array/tensor or None."""
+    items: (seq, text), (seq, text, image) or (seq, text, image, target): image a [Li, D] array or
+    None, target a uint8 [S, S, 3] image or None (-> batch["target"] [B, 3, S, S] in [0, 1])."""
     seqs = [it[0] for it in items]
     B, T = len(seqs), max(len(s) for s in seqs) - 1
     A = seqs[0].attrs.shape[1]
@@ -141,6 +167,15 @@ def collate(items: list[tuple[DrawSeq, ...]], text_dim: int | None = None) -> di
             if im is not None:
                 batch["image"][b] = torch.as_tensor(np.asarray(im, dtype=np.float32))
                 batch["image_valid"][b] = True
+    targets = [it[3] if len(it) > 3 else None for it in items]
+    if any(t is not None for t in targets):
+        S = next(t.shape[0] for t in targets if t is not None)
+        batch["target"] = torch.zeros(B, 3, S, S)
+        batch["target_valid"] = torch.zeros(B, dtype=torch.bool)
+        for b, t in enumerate(targets):
+            if t is not None:
+                batch["target"][b] = torch.from_numpy(np.ascontiguousarray(t)).permute(2, 0, 1).float() / 255
+                batch["target_valid"][b] = True
     texts = [it[1] for it in items]
     if any(isinstance(t, str) for t in texts):      # caption strings: encoded on the GPU later
         batch["captions"] = texts

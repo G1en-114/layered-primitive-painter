@@ -64,11 +64,13 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
 @torch.no_grad()
 def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, text=None, text_valid=None,
              generator: torch.Generator | None = None, uniforms=None, codec=None,
-             canvas_history: list | None = None, image=None, image_valid=None) -> list[DrawSeq]:
+             canvas_history: list | None = None, image=None, image_valid=None, target=None) -> list[DrawSeq]:
     """Generate `batch` drawing sequences from BOS (optionally text- and/or image-conditioned).
 
     image/image_valid: CLIP image tokens [B, Li, D] for image-conditioned models; guidance (cfg_scale)
     contrasts with and without the text only, both halves keep the image.
+    target: pixel target images [B, 3, S, S] in [0, 1] for target-conditioned models (cfg.target);
+    read by cross-attention at every step, kept by both guidance halves.
 
     uniforms: optional callable (step, field) -> [B] tensor in [0, 1) replacing the RNG.
     codec: required for models with canvas feedback (decodes primitives to render the canvas).
@@ -129,7 +131,12 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         ctx = ("current", rows(tracker.tokens), draw)
     else:
         ctx = None
-    h = model.backbone(x, valid, cache, canvas_ctx=ctx)[:, -1]
+    tctx = None
+    if target is not None:
+        if not model.cfg.target:
+            raise ValueError("a target image given to a model without target conditioning")
+        tctx = (rows(model.target_enc(target)), torch.ones(R, dtype=torch.bool, device=dev))
+    h = model.backbone(x, valid, cache, canvas_ctx=ctx, target_ctx=tctx)[:, -1]
 
     out = {k: [v[:, 0]] for k, v in (("kind", rec_kind), ("event", rec_event), ("layer", rec_layer),
                                       ("attrs", rec_attrs))}
@@ -186,7 +193,7 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         if tracker is not None:
             tracker.update(kind, attrs, layer, live, kind_cpu=kind_cpu, layer_cpu=layer_cpu, live_cpu=live_cpu)
             ctx = ("current", rows(tracker.tokens), torch.ones(R, 1, dtype=torch.bool, device=dev))
-        h = model.backbone(x, rows(live)[:, None], cache, canvas_ctx=ctx)[:, -1]
+        h = model.backbone(x, rows(live)[:, None], cache, canvas_ctx=ctx, target_ctx=tctx)[:, -1]
 
     if tracker is not None and canvas_history is not None:
         canvas_history.extend(tracker.history)
