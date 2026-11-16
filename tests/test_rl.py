@@ -85,3 +85,35 @@ def test_generate_forced_end_with_unmet_eos_requirement(setup):
     seqs = generate(model, batch=3, cfg=sc, generator=torch.Generator(device=DEV).manual_seed(5), codec=codec)
     eos = codec.proto.event_id("EOS")
     assert all(int(s.event[-1]) == eos and len(s) <= 4 for s in seqs)
+
+
+def test_generate_continues_forced_prefixes(setup):
+    """Prefix records are reproduced exactly and generation continues legally from them,
+    for a full-mode prefix and a REFINE edit prefix; a BOS-only prefix changes nothing."""
+    from lpp.sequence import DrawSeq, build, validate
+    from test_sequence import fake_decomposition
+    codec, model, _ = setup
+    proto = codec.proto
+    tokens, layer, rounds = fake_decomposition(5)
+    full = build(tokens, layer, rounds, "full", proto=proto)
+    refine = build(tokens, layer, rounds, "refine", target=2, split_round=1, proto=proto)
+
+    def cut(s, n):
+        return DrawSeq(s.kind[:n], s.event[:n], s.attrs[:n], s.layer[:n])
+
+    eos = proto.event_id("EOS")
+    n_ref = int((refine.event == proto.refine_event(2)).nonzero()[0]) + 2      # marker + one primitive
+    prefixes = [cut(full, 9), cut(refine, n_ref)]
+    sc = SampleConfig(temperature=1.0, top_p=1.0, max_records=n_ref + 40)
+    out = generate(model, batch=2, cfg=sc, forced=prefixes, codec=codec,
+                   generator=torch.Generator(device=DEV).manual_seed(0))
+    for o, p in zip(out, prefixes):
+        n = len(p)
+        assert torch.equal(o.event[:n], p.event) and torch.equal(o.attrs[:n], p.attrs)
+        assert int(o.event[-1]) == eos
+        validate(o, proto)
+    g = lambda: torch.Generator(device=DEV).manual_seed(3)
+    sc2 = SampleConfig(temperature=1.0, top_p=1.0, max_records=30)
+    a = generate(model, batch=1, cfg=sc2, codec=codec, generator=g())
+    b = generate(model, batch=1, cfg=sc2, codec=codec, generator=g(), forced=[cut(full, 1)])
+    assert torch.equal(a[0].event, b[0].event) and torch.equal(a[0].attrs, b[0].attrs)

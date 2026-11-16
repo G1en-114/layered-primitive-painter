@@ -64,13 +64,17 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
 @torch.no_grad()
 def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, text=None, text_valid=None,
              generator: torch.Generator | None = None, uniforms=None, codec=None,
-             canvas_history: list | None = None, image=None, image_valid=None, target=None) -> list[DrawSeq]:
+             canvas_history: list | None = None, image=None, image_valid=None, target=None,
+             forced: list[DrawSeq] | None = None) -> list[DrawSeq]:
     """Generate `batch` drawing sequences from BOS (optionally text- and/or image-conditioned).
 
     image/image_valid: CLIP image tokens [B, Li, D] for image-conditioned models; guidance (cfg_scale)
     contrasts with and without the text only, both halves keep the image.
     target: pixel target images [B, 3, S, S] in [0, 1] for target-conditioned models (cfg.target);
     read by cross-attention at every step, kept by both guidance halves.
+    forced: per sample, a prefix DrawSeq starting with BOS (e.g. a decomposer's coarse layers, or a
+    REFINE_k / REDRAW_k edit prefix): its records are taken instead of sampled, through the same
+    grammar, cache and canvas path, and the model continues from where each prefix ends.
 
     uniforms: optional callable (step, field) -> [B] tensor in [0, 1) replacing the RNG.
     codec: required for models with canvas feedback (decodes primitives to render the canvas).
@@ -106,8 +110,21 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     rand = uniforms or (lambda step, field: torch.rand(B, device=dev, generator=generator))
     prim_ev = proto.event_id("PRIMITIVE")
 
-    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=False)
+    special_ids = {proto.redraw_event(k) for k in range(proto.num_layers)} | \
+                  {proto.refine_event(k) for k in range(proto.num_layers)}
+    if forced is not None and len(forced) != B:
+        raise ValueError("one forced prefix per sample")
+    allow_special = forced is not None and any(int(e) in special_ids for f in forced for e in f.event.tolist())
+    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=allow_special)
                 for _ in range(B)]
+    if forced is not None:
+        f_len = torch.tensor([len(f) for f in forced], device=dev)
+        Tf = int(f_len.max())
+        f_event = torch.full((B, Tf), -1, dtype=torch.long, device=dev)
+        f_attrs = torch.full((B, Tf, A), NO_ATTR, dtype=torch.long, device=dev)
+        for b, f in enumerate(forced):
+            f_event[b, : len(f)] = f.event.to(dev)
+            f_attrs[b, : len(f)] = f.attrs.to(dev)
     for g in grammars:
         g.bos()
     rec_kind = torch.full((B, 1), KIND_BOS, device=dev)
@@ -157,6 +174,9 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
                 allowed_cpu[b, [eos] if g.done else g.allowed_events()] = True
         allowed = allowed_cpu.to(dev, non_blocking=True)
         event = _sample(logits.masked_fill(~allowed, float("-inf")), cfg, rand(step, "event"), "event")
+        if forced is not None and step < Tf:
+            in_prefix = step < f_len
+            event = torch.where(in_prefix, f_event[:, step], event)
         ev = event.tolist()              # the one device->host sync for this record
 
         attrs = torch.full((B, A), NO_ATTR, dtype=torch.long, device=dev)
@@ -166,6 +186,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
                 attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name), name)
             attrs[~is_prim] = NO_ATTR
+        if forced is not None and step < Tf:
+            attrs = torch.where(in_prefix[:, None], f_attrs[:, step], attrs)
 
         layer_cpu = []
         for b, g in enumerate(grammars):
