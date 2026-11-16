@@ -29,17 +29,17 @@ CANVAS_CHANNELS_BASE = 3
 
 def checkpoint_flags(kind: torch.Tensor, k: int) -> torch.Tensor:
     """kind [B, T] -> bool [B, T]: records that are checkpoints."""
-    B, T = kind.shape
-    flags = torch.zeros(B, T, dtype=torch.bool, device=kind.device)
-    since = torch.zeros(B, dtype=torch.long, device=kind.device)
-    for t in range(T):     # T <= ~1000: a cheap sequential scan on small integer tensors
-        kd = kind[:, t]
-        marker = (kd == KIND_BOS) | (kd == KIND_CONTROL)
-        since = torch.where(kd == KIND_PRIMITIVE, since + 1, since)
-        hit = marker | (since >= k)
-        flags[:, t] = hit
-        since = torch.where(hit, torch.zeros_like(since), since)
-    return flags
+    # Vectorized form of the sequential rule "count primitives since the last checkpoint; a
+    # marker or the k-th primitive is a checkpoint and resets the count". Markers reset the
+    # count, and between markers the count resets exactly at every k-th primitive, so a
+    # primitive is a checkpoint iff its index within its run since the last marker is a
+    # multiple of k. A per-position Python loop cost ~5 launches x T (37 ms per batch).
+    marker = (kind == KIND_BOS) | (kind == KIND_CONTROL)
+    prim = kind == KIND_PRIMITIVE
+    count = prim.long().cumsum(1)                                   # primitives up to and incl. t
+    at_marker = torch.where(marker, count, torch.zeros_like(count)).cummax(1).values
+    since = count - at_marker                                       # primitives since last marker
+    return marker | (prim & (since % k == 0))
 
 
 def is_checkpoint(kind: int, prims_since_last: int, k: int) -> bool:
@@ -106,7 +106,8 @@ def build_training_canvases(batch: dict, codec: Codec, k: int = 32, size: int = 
     lay = torch.where(is_prim, layer, torch.full_like(layer, -1))
 
     # pack records into [B*S, max_len] by (segment, position inside the segment)
-    first = torch.stack([torch.searchsorted(member[b].contiguous(), member[b].contiguous()) for b in range(B)])
+    member = member.contiguous()
+    first = torch.searchsorted(member, member)            # row-wise: index of each segment's first record
     pos = torch.arange(T, device=dev)[None] - first
     keep = is_prim
     max_len = int(pos[keep].max()) + 1 if bool(keep.any()) else 1

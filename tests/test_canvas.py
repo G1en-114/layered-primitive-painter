@@ -124,3 +124,32 @@ def test_decoding_canvases_equal_training_canvases(codec):
         assert n >= 2
         for j in range(n):    # decoding also records the EOS checkpoint, which inputs never contain
             assert torch.allclose(hist[i][j], canvas[i, j], atol=2e-4), (i, j)
+
+
+def _checkpoint_flags_loop(kind, k):
+    """The original sequential definition, kept as the reference."""
+    from lpp.sequence import KIND_BOS, KIND_CONTROL, KIND_PRIMITIVE
+    B, T = kind.shape
+    flags = torch.zeros(B, T, dtype=torch.bool)
+    since = torch.zeros(B, dtype=torch.long)
+    for t in range(T):
+        kd = kind[:, t]
+        marker = (kd == KIND_BOS) | (kd == KIND_CONTROL)
+        since = torch.where(kd == KIND_PRIMITIVE, since + 1, since)
+        hit = marker | (since >= k)
+        flags[:, t] = hit
+        since = torch.where(hit, torch.zeros_like(since), since)
+    return flags
+
+
+def test_checkpoint_flags_vectorized_matches_sequential_rule():
+    from lpp.canvas import checkpoint_flags
+    g = torch.Generator().manual_seed(0)
+    for k in (1, 3, 32):
+        # mostly primitives, some markers, text prefix and trailing padding (kind 0)
+        kind = torch.multinomial(torch.tensor([0.05, 0.02, 0.05, 0.88]), 64 * 300, replacement=True,
+                                 generator=g).view(64, 300)
+        kind[:, :5] = 0
+        kind[:, 5] = 1
+        kind[::3, 250:] = 0
+        assert torch.equal(checkpoint_flags(kind, k), _checkpoint_flags_loop(kind, k))
