@@ -75,11 +75,20 @@ Graphs::Graphs(const std::string& dir, const std::string& provider) : env_(ORT_L
   Ort::SessionOptions so;
   so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   so.SetIntraOpNumThreads(4);
-  if (provider == "cuda") {
-    OrtCUDAProviderOptions cuda{};
-    so.AppendExecutionProvider_CUDA(cuda);
+  if (provider == "cuda" || provider == "cuda-tf32") {
+    // V2 options: ORT's CUDA EP runs FP32 matmuls in TF32 by default (10-bit mantissa), which
+    // changes logits enough to fork sampled sequences within a few records. Parity runs keep
+    // full FP32; "cuda-tf32" opts into the faster mode.
+    const OrtApi& api = Ort::GetApi();
+    OrtCUDAProviderOptionsV2* opt = nullptr;
+    Ort::ThrowOnError(api.CreateCUDAProviderOptions(&opt));
+    const char* keys[] = {"device_id", "use_tf32"};
+    const char* vals[] = {"0", provider == "cuda-tf32" ? "1" : "0"};
+    Ort::ThrowOnError(api.UpdateCUDAProviderOptions(opt, keys, vals, 2));
+    so.AppendExecutionProvider_CUDA_V2(*opt);
+    api.ReleaseCUDAProviderOptions(opt);
   } else if (provider != "cpu") {
-    throw std::runtime_error("provider must be cpu or cuda");
+    throw std::runtime_error("provider must be cpu, cuda or cuda-tf32");
   }
   for (auto& [name, g] : m["graphs"].items())
     graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(), so,
