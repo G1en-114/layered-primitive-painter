@@ -1,0 +1,118 @@
+"""Export a trained Painter to ONNX graphs for a C++ runtime, and check them with onnxruntime.
+
+    python tools/export_onnx.py --ckpt out/small_v2_t0_text_canvas/model_step8000.pt --out out/onnx/small_t0
+
+Writes one .onnx per graph (python/lpp/export.py) plus manifest.json (model config, protocol,
+tensor names and dynamic axes) and a parity report: every graph is run with onnxruntime on random
+inputs at two sizes and compared with PyTorch (max abs difference).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+
+from lpp.codec import Codec  # noqa: E402
+from lpp.export import graphs  # noqa: E402
+from lpp.model import ModelConfig, Painter  # noqa: E402
+from lpp.protocol import _parse  # noqa: E402
+
+
+def specs(m: Painter, B: int, T: int, P: int, Lt: int) -> dict:
+    """Example inputs, input/output names and dynamic axes per graph."""
+    c, A = m.cfg, len(m.attr_names)
+    hd = c.d_model // c.n_heads
+    g = torch.Generator().manual_seed(B * 1000 + T)
+    vocab = list(m.proto.attr_vocab_sizes.values())
+    attrs = torch.stack([torch.randint(0, n, (B, T), generator=g) for n in vocab], -1)
+    out = {
+        "embed_record": dict(
+            inputs=(torch.randint(1, 4, (B, T), generator=g), torch.randint(0, m.n_events, (B, T), generator=g),
+                    torch.randint(-1, m.proto.num_layers, (B, T), generator=g), attrs),
+            names=["kind", "event", "layer", "attrs"], outputs=["x"],
+            axes={"kind": {0: "B", 1: "T"}, "event": {0: "B", 1: "T"}, "layer": {0: "B", 1: "T"},
+                  "attrs": {0: "B", 1: "T"}, "x": {0: "B", 1: "T"}}),
+        "embed_text": dict(
+            inputs=(torch.randn(B, Lt, c.text_dim, generator=g),), names=["text"], outputs=["x"],
+            axes={"text": {0: "B", 1: "Lt"}, "x": {0: "B", 1: "Lt"}}),
+        "chunk": dict(
+            inputs=(torch.randn(B, T, c.d_model, generator=g), torch.rand(B, T, generator=g) > 0.1,
+                    torch.randn(c.n_layers, B, c.n_kv_heads, P, hd, generator=g),
+                    torch.randn(c.n_layers, B, c.n_kv_heads, P, hd, generator=g),
+                    torch.rand(B, P, generator=g) > 0.3, torch.randint(0, 50, (B,), generator=g),
+                    torch.randn(B, (c.canvas_size // 8) ** 2, c.d_model, generator=g),
+                    torch.rand(B, T, generator=g) > 0.5),
+            names=["x", "valid", "past_k", "past_v", "past_mask", "start_pos", "canvas_tokens", "draw"],
+            outputs=["h", "k_new", "v_new"],
+            axes={"x": {0: "B", 1: "T"}, "valid": {0: "B", 1: "T"}, "past_k": {1: "B", 3: "P"},
+                  "past_v": {1: "B", 3: "P"}, "past_mask": {0: "B", 1: "P"}, "start_pos": {0: "B"},
+                  "canvas_tokens": {0: "B"}, "draw": {0: "B", 1: "T"}, "h": {0: "B", 1: "T"},
+                  "k_new": {1: "B", 3: "T"}, "v_new": {1: "B", 3: "T"}}),
+        "decode_heads": dict(
+            inputs=(torch.randn(B, c.d_model, generator=g), torch.randint(0, m.n_events, (B,), generator=g),
+                    attrs[:, 0]),
+            names=["h", "event", "attrs"], outputs=["event_logits"] + [f"{n}_logits" for n in m.attr_names],
+            axes={"h": {0: "B"}, "event": {0: "B"}, "attrs": {0: "B"}, "event_logits": {0: "B"},
+                  **{f"{n}_logits": {0: "B"} for n in m.attr_names}}),
+    }
+    if c.canvas:
+        out["canvas_enc"] = dict(
+            inputs=(torch.rand(B, 3 + m.proto.num_layers, c.canvas_size, c.canvas_size, generator=g),),
+            names=["canvas"], outputs=["tokens"], axes={"canvas": {0: "B"}, "tokens": {0: "B"}})
+    if A != attrs.shape[-1]:
+        raise AssertionError("attribute count mismatch")
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ckpt", type=Path, required=True)
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--opset", type=int, default=18)
+    args = ap.parse_args()
+    import onnxruntime as ort
+    args.out.mkdir(parents=True, exist_ok=True)
+    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    proto = _parse(state["protocol"])
+    codec = Codec.load(proto=proto, device="cpu")
+    m = Painter(ModelConfig(**state["config"]), proto, codec).eval()
+    m.load_state_dict(state["model"])
+    mods = graphs(m)
+    export_specs = specs(m, B=2, T=3, P=5, Lt=4)
+    check_specs = [export_specs, specs(m, B=3, T=1, P=17, Lt=9)]
+    manifest = {"checkpoint": str(args.ckpt), "step": state.get("step"), "config": state["config"],
+                "protocol": state["protocol"], "attr_names": m.attr_names, "opset": args.opset, "graphs": {}}
+    report = {}
+    for name, mod in mods.items():
+        sp = export_specs[name]
+        path = args.out / f"{name}.onnx"
+        t0 = time.perf_counter()
+        torch.onnx.export(mod, sp["inputs"], str(path), input_names=sp["names"], output_names=sp["outputs"],
+                          dynamic_axes=sp["axes"], opset_version=args.opset, dynamo=False)
+        sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        diffs = []
+        for cs in check_specs:
+            ins = cs[name]["inputs"]
+            with torch.no_grad():
+                ref = mod(*ins)
+            ref = ref if isinstance(ref, tuple) else (ref,)
+            got = sess.run(None, {n: t.numpy() for n, t in zip(sp["names"], ins)})
+            diffs.append(max(float(np.abs(g - r.numpy()).max()) for g, r in zip(got, ref)))
+        report[name] = {"max_abs_diff": max(diffs), "bytes": path.stat().st_size,
+                        "export_s": round(time.perf_counter() - t0, 2)}
+        manifest["graphs"][name] = {"file": path.name, "inputs": sp["names"], "outputs": sp["outputs"],
+                                    "dynamic_axes": {k: {str(a): v for a, v in ax.items()} for k, ax in sp["axes"].items()}}
+        print(f"{name:13s} max|ort - torch| = {max(diffs):.2e}  ({path.stat().st_size / 1e6:.1f} MB)", flush=True)
+    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    (args.out / "parity.json").write_text(json.dumps(report, indent=1))
+
+
+if __name__ == "__main__":
+    main()
