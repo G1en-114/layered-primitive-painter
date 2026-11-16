@@ -64,6 +64,7 @@ def main() -> None:
     ap.add_argument("--beta", type=float, default=0.04, help="KL weight to the initial model")
     ap.add_argument("--clip-eps", type=float, default=0.2)
     ap.add_argument("--ppo-epochs", type=int, default=1, help="updates per rollout batch (1 = on-policy)")
+    ap.add_argument("--micro-batch", type=int, default=16, help="sequences per forward/backward chunk")
     ap.add_argument("--orphan-weight", type=float, default=0.2)
     ap.add_argument("--early-penalty", type=float, default=5.0)
     ap.add_argument("--max-records", type=int, default=None)
@@ -127,20 +128,32 @@ def main() -> None:
         images, orphans, faces = render(seqs, codec)
         r = rewards(images, orphans, faces, rep, clip, rcfg)
         adv = group_advantages(r["reward"], args.group).to(dev)
-        batch = to_gpu(rollout_batch(seqs, rep, proto, REQUIRE), encoder, codec, cfg)
-        allowed, mask = batch["event_allowed"], batch["tgt_event"] >= 0
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            logp_old = policy.record_logprobs(batch, allowed)
-            logp_ref = ref.record_logprobs(batch, allowed)
+        # micro-batches with gradient accumulation: the loss is a mean over sequences, so
+        # chunk losses weighted by chunk/total sum to the full-batch loss (same gradient)
+        chunks = []
+        for c0 in range(0, len(seqs), args.micro_batch):
+            sl = slice(c0, c0 + args.micro_batch)
+            b = to_gpu(rollout_batch(seqs[sl], rep[sl], proto, REQUIRE), encoder, codec, cfg)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                old = policy.record_logprobs(b, b["event_allowed"])
+                refl = ref.record_logprobs(b, b["event_allowed"])
+            chunks.append((b, old, refl, adv[sl]))
         policy.train()
         for _ in range(args.ppo_epochs):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logp = policy.record_logprobs(batch, allowed)
-            loss, stats = grpo_loss(logp, logp_old, logp_ref, adv, mask, args.clip_eps, args.beta)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            stats = {}
+            for b, old, refl, a in chunks:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logp = policy.record_logprobs(b, b["event_allowed"])
+                loss, st = grpo_loss(logp, old, refl, a, b["tgt_event"] >= 0, args.clip_eps, args.beta)
+                w = a.shape[0] / len(seqs)
+                (loss * w).backward()
+                for k, v in st.items():
+                    stats[k] = stats.get(k, 0.0) + v * w
+                del logp, loss
             gnorm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0).item()
             opt.step()
+        del chunks
         step += 1
         rec = {"step": step, "reward": round(float(r["reward"].mean()), 4),
                "reward_std_in_group": round(float(r["reward"].view(-1, args.group).std(1).mean()), 4),
