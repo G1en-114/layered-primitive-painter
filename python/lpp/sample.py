@@ -159,7 +159,10 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
             if g.done:
                 layer_cpu.append(-1)
                 continue
-            g.step(ev[b])
+            if step == max_records - 1 and ev[b] == eos:   # forced end: may break decoding-only EOS rules
+                g.done = True
+            else:
+                g.step(ev[b])
             layer_cpu.append(g.current if not g.done else -1)
         layer = torch.tensor(layer_cpu, device=dev)
         kind_cpu = [KIND_PRIMITIVE if e == prim_ev else KIND_CONTROL for e in ev]

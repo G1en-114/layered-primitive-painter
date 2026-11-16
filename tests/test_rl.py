@@ -76,3 +76,12 @@ def test_grpo_loss_on_policy_gradient_is_advantage_weighted_logprob():
     (g2,) = torch.autograd.grad(want, theta)
     assert torch.allclose(g1, g2, atol=1e-6)
     assert stats["kl"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_generate_forced_end_with_unmet_eos_requirement(setup):
+    """Running out of records must end the sample even if the EOS requirement is not met."""
+    codec, model, _ = setup
+    sc = SampleConfig(temperature=1.0, top_p=1.0, max_records=4, require_before_eos=(0, 2))
+    seqs = generate(model, batch=3, cfg=sc, generator=torch.Generator(device=DEV).manual_seed(5), codec=codec)
+    eos = codec.proto.event_id("EOS")
+    assert all(int(s.event[-1]) == eos and len(s) <= 4 for s in seqs)
