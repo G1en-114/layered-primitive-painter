@@ -25,5 +25,11 @@ target_link_libraries(lpp_paint PRIVATE ${ORT_LIB})
 # give the loader that name next to the binary
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/ortlib)
 file(CREATE_LINK ${ORT_LIB} ${CMAKE_BINARY_DIR}/ortlib/libonnxruntime.so.1 SYMBOLIC)
+# execution-provider plugins are looked up next to the loaded libonnxruntime
+foreach(ep providers_shared providers_cuda providers_tensorrt)
+  if(EXISTS ${ORT_LIB_DIR}/libonnxruntime_${ep}.so)
+    file(CREATE_LINK ${ORT_LIB_DIR}/libonnxruntime_${ep}.so ${CMAKE_BINARY_DIR}/ortlib/libonnxruntime_${ep}.so SYMBOLIC)
+  endif()
+endforeach()
 set_target_properties(lpp_paint PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}/ortlib;${ORT_LIB_DIR}")
 target_compile_options(lpp_paint PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
