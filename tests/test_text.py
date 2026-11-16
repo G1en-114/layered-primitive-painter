@@ -29,3 +29,18 @@ def test_cached_text_encoder_matches_encoder_under_bf16():
         assert torch.equal(v1, v2)
         assert torch.equal(f1.to(torch.bfloat16), f2.to(torch.bfloat16))
     assert cached.hits >= 2 and len(cached.store) <= 3
+
+
+def test_domain_prefix_applies_to_every_variant(tmp_path):
+    import json
+    import random
+    from lpp.text import CaptionStore
+    f = tmp_path / "c.jsonl"
+    f.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
+        {"id": 1, "domain": "动漫", "short": "女孩。", "long": "女孩，长发。"},
+        {"id": 2, "short": "女性。", "long": "女性，短发。"}]), encoding="utf-8")
+    store, rng = CaptionStore(f), random.Random(0)
+    seen = {store.pick(1, rng, p_drop=0.0) for _ in range(50)}
+    assert seen == {"动漫，女孩。", "动漫，女孩，长发。"}
+    assert {store.pick(2, rng, p_drop=0.0) for _ in range(50)} == {"女性。", "女性，短发。"}
+    assert store.pick(1, rng, p_drop=1.0) is None

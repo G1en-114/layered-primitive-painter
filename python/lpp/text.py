@@ -76,15 +76,23 @@ def template_caption(attrs: dict[str, bool], rng: random.Random | None = None) -
     return ("、".join(words) + "的" if words else "") + who + "肖像"
 
 
+def with_domain(text: str | None, domain: str | None) -> str | None:
+    """'动漫' + '女孩，长发。' -> '动漫，女孩，长发。' (no domain, or no text: unchanged)."""
+    return f"{domain}，{text}" if text and domain else text
+
+
 class CaptionStore:
     def __init__(self, captions_jsonl: Path | None = None, attributes_json: Path | None = None):
         self.vlm: dict[int, dict[str, str]] = {}
+        self.domain: dict[int, str] = {}     # e.g. 真人照片 / 动漫: prepended to every variant of that image
         if captions_jsonl:
             for line in Path(captions_jsonl).read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     r = json.loads(line)
                     if r.get("short") and r.get("long"):
                         self.vlm[int(r["id"])] = {"short": r["short"], "long": r["long"]}
+                    if r.get("domain"):
+                        self.domain[int(r["id"])] = r["domain"]
         self.attrs: dict[int, dict[str, bool]] = {}
         if attributes_json:
             a = json.loads(Path(attributes_json).read_text())
@@ -107,7 +115,8 @@ class CaptionStore:
             acc += w
             if u <= acc:
                 break
-        return template_caption(self.attrs[image_id], rng) if k == "template" else self.vlm[image_id][k]
+        text = template_caption(self.attrs[image_id], rng) if k == "template" else self.vlm[image_id][k]
+        return with_domain(text, self.domain.get(image_id))
 
 
 class CachedTextEncoder:

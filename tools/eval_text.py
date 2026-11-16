@@ -68,8 +68,8 @@ def load_val(args) -> tuple[list[int], list[str], list[np.ndarray]]:
     for line in args.captions.read_text(encoding="utf-8").splitlines():
         if line.strip():
             r = json.loads(line)
-            if r.get("long"):
-                caps[int(r["id"])] = r["long"]
+            if r.get("long"):                    # same domain prefix as training (CaptionStore)
+                caps[int(r["id"])] = f"{r['domain']}，{r['long']}" if r.get("domain") else r["long"]
     val = [int(r["id"]) for r in map(json.loads, args.split_manifest.read_text().splitlines())
            if r["split"] == "val" and int(r["id"]) in caps]
     if len(val) < args.n:
