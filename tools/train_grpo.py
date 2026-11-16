@@ -73,6 +73,12 @@ def main() -> None:
                     help="tools/attr_classifier.py checkpoint: reward agreement with the prompt image's attributes")
     ap.add_argument("--attributes", type=Path, default=None, help="CelebA attributes.json (source labels)")
     ap.add_argument("--attr-weight", type=float, default=5.0, help="points for full agreement on REWARD_ATTRS")
+    ap.add_argument("--adv-mode", choices=["sum", "per-component"], default="sum",
+                    help="per-component: normalise CLIP, attribute and orphan terms within each group separately and "
+                         "add them with --w-* weights, so no term drowns the others by raw scale")
+    ap.add_argument("--w-clip", type=float, default=1.0)
+    ap.add_argument("--w-attr", type=float, default=1.0)
+    ap.add_argument("--w-orphan", type=float, default=0.5)
     ap.add_argument("--max-records", type=int, default=None)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--sample-every", type=int, default=50)
@@ -151,7 +157,15 @@ def main() -> None:
         images, orphans, faces = render(seqs, codec)
         r = rewards(images, orphans, faces, rep, clip, rcfg,
                     attr_agreement=attr_fn(images, rep_ids) if attr_fn is not None else None)
-        adv = group_advantages(r["reward"], args.group).to(dev)
+        if args.adv_mode == "sum":
+            adv = group_advantages(r["reward"], args.group)
+        else:
+            clip_term = r["clip"] - args.early_penalty * (1 - r["face"])
+            adv = args.w_clip * group_advantages(clip_term, args.group)
+            adv = adv + args.w_orphan * group_advantages(-r["orphan"], args.group)
+            if "attr" in r:
+                adv = adv + args.w_attr * group_advantages(r["attr"], args.group)
+        adv = adv.to(dev)
         # micro-batches with gradient accumulation: the loss is a mean over sequences, so
         # chunk losses weighted by chunk/total sum to the full-batch loss (same gradient)
         chunks = []
