@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,14 +40,15 @@ from train import render_samples, to_gpu  # noqa: E402
 REQUIRE = (0, 2)       # background and skin before EOS, in rollouts and in the replayed grammar
 
 
-def prompt_pool(captions: Path, split_manifest: Path) -> list[str]:
+def prompt_pool(captions: Path, split_manifest: Path) -> list[tuple[str, int]]:
+    """(caption, source image id) for every long/short caption of a training-split image."""
     splits = load_split_manifest(split_manifest)
     pool = []
     for line in captions.read_text(encoding="utf-8").splitlines():
         if line.strip():
             r = json.loads(line)
             if splits.get(int(r["id"])) == "train":
-                pool += [c for c in (r.get("long"), r.get("short")) if c]
+                pool += [(c, int(r["id"])) for c in (r.get("long"), r.get("short")) if c]
     return pool
 
 
@@ -67,6 +69,10 @@ def main() -> None:
     ap.add_argument("--micro-batch", type=int, default=16, help="sequences per forward/backward chunk")
     ap.add_argument("--orphan-weight", type=float, default=0.2)
     ap.add_argument("--early-penalty", type=float, default=5.0)
+    ap.add_argument("--attr-classifier", type=Path, default=None,
+                    help="tools/attr_classifier.py checkpoint: reward agreement with the prompt image's attributes")
+    ap.add_argument("--attributes", type=Path, default=None, help="CelebA attributes.json (source labels)")
+    ap.add_argument("--attr-weight", type=float, default=5.0, help="points for full agreement on REWARD_ATTRS")
     ap.add_argument("--max-records", type=int, default=None)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--sample-every", type=int, default=50)
@@ -106,7 +112,23 @@ def main() -> None:
     encoder = TextEncoder(args.text_encoder, max_positions=proto.max_text_positions).to(dev)
     clip = ClipScorer(args.text_encoder, dev)
     pool = prompt_pool(args.captions, args.split_manifest)
-    rcfg = RewardConfig(orphan_weight=args.orphan_weight, early_penalty=args.early_penalty)
+    rcfg = RewardConfig(orphan_weight=args.orphan_weight, early_penalty=args.early_penalty,
+                        attr_weight=args.attr_weight if args.attr_classifier else 0.0)
+    attr_fn = None
+    if args.attr_classifier is not None:
+        from attr_classifier import REWARD_ATTRS, AttrClassifier
+        if args.attributes is None:
+            ap.error("--attr-classifier needs --attributes")
+        a = json.loads(args.attributes.read_text())
+        cols = [a["names"].index(n) for n in REWARD_ATTRS]
+        labels = {int(k): torch.tensor([v[c] for c in cols], dtype=torch.float32) for k, v in a["values"].items()}
+        clf = AttrClassifier(args.attr_classifier, dev)
+
+        def attr_fn(images, image_ids):
+            """mean probability the classifier gives the source image's true value, over REWARD_ATTRS"""
+            p = clf.probs(np.stack(images))[:, cols].cpu()
+            t = torch.stack([labels[i] for i in image_ids])
+            return (t * p + (1 - t) * (1 - p)).mean(1)
     sc = SampleConfig(temperature=1.0, top_p=1.0, cfg_scale=1.0, require_before_eos=REQUIRE,
                       max_records=args.max_records)
     (args.out / "config.json").write_text(json.dumps(vars(args) | {"init_step": src.get("step"),
@@ -118,15 +140,17 @@ def main() -> None:
 
     while step < args.steps:
         t0 = time.perf_counter()
-        prompts = [rng.choice(pool) for _ in range(args.prompts)]
-        rep = [p for p in prompts for _ in range(args.group)]
+        picks = [rng.choice(pool) for _ in range(args.prompts)]
+        rep = [c for c, _ in picks for _ in range(args.group)]
+        rep_ids = [i for _, i in picks for _ in range(args.group)]
         with torch.no_grad():
             text, text_valid = encoder(rep)
             seqs = generate(policy, batch=len(rep), cfg=sc, text=text, text_valid=text_valid,
                             generator=gen, codec=codec)
         t_gen = time.perf_counter()
         images, orphans, faces = render(seqs, codec)
-        r = rewards(images, orphans, faces, rep, clip, rcfg)
+        r = rewards(images, orphans, faces, rep, clip, rcfg,
+                    attr_agreement=attr_fn(images, rep_ids) if attr_fn is not None else None)
         adv = group_advantages(r["reward"], args.group).to(dev)
         # micro-batches with gradient accumulation: the loss is a mean over sequences, so
         # chunk losses weighted by chunk/total sum to the full-batch loss (same gradient)
@@ -158,6 +182,7 @@ def main() -> None:
         rec = {"step": step, "reward": round(float(r["reward"].mean()), 4),
                "reward_std_in_group": round(float(r["reward"].view(-1, args.group).std(1).mean()), 4),
                "clip": round(float(r["clip"].mean()), 4), "orphan": round(float(r["orphan"].mean()), 4),
+               **({"attr": round(float(r["attr"].mean()), 4)} if "attr" in r else {}),
                "face": round(float(r["face"].mean()), 4),
                "length": round(sum(len(s) for s in seqs) / len(seqs), 1), "gnorm": round(gnorm, 4),
                **{k: round(v, 5) for k, v in stats.items()},

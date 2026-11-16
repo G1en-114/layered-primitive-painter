@@ -19,6 +19,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# RL rewards use REWARD_ATTRS; the rest of EVAL_ATTRS stays held out for evaluation
+REWARD_ATTRS = ["Male", "Smiling", "Eyeglasses", "Black_Hair", "Blond_Hair", "Brown_Hair", "Gray_Hair", "Bald",
+                "Wearing_Lipstick"]
 EVAL_ATTRS = ["Male", "Smiling", "Eyeglasses", "Black_Hair", "Blond_Hair", "Brown_Hair", "Gray_Hair", "Bald",
               "Wearing_Hat", "Wearing_Lipstick", "Wearing_Earrings", "Bangs", "No_Beard"]
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -88,6 +91,15 @@ class AttrClassifier:
         self.model = build_model(len(self.names), pretrained=False).to(device).eval()
         self.model.load_state_dict(s["model"])
         self.device = device
+
+    @torch.no_grad()
+    def probs(self, imgs: np.ndarray, batch: int = 128) -> torch.Tensor:
+        """Sigmoid probabilities [N, 40] (float32, on the classifier's device)."""
+        out = []
+        for i in range(0, len(imgs), batch):
+            x = prep(torch.from_numpy(np.ascontiguousarray(imgs[i:i + batch])).to(self.device))
+            out.append(torch.sigmoid(self.model(x).float()))
+        return torch.cat(out)
 
     @torch.no_grad()
     def predict(self, imgs: np.ndarray, batch: int = 128) -> np.ndarray:

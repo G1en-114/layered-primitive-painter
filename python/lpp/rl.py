@@ -7,7 +7,8 @@ used at inference; RL improves the conditional distribution it is built from.
 
 Reward per sample = 100 * cos(CLIP image, CLIP prompt)
                     - orphan_weight * 100 * orphan rate
-                    - early_penalty if the skin layer (2) was never painted.
+                    - early_penalty if the skin layer (2) was never painted
+                    + attr_weight * attribute agreement (optional, see rewards()).
 Advantages are normalised inside each prompt's group (GRPO), so the reward scale only
 matters relative to the KL weight.
 """
@@ -32,6 +33,7 @@ from .sequence import DrawSeq, Grammar, paint_order
 class RewardConfig:
     orphan_weight: float = 0.2      # 100 * orphan rate * this: 5% orphans -> -1 point
     early_penalty: float = 5.0      # no skin layer: not a face
+    attr_weight: float = 0.0        # points for full agreement with the prompt image's attributes
     image_size: int = 256
 
 
@@ -87,13 +89,22 @@ def render(seqs: list[DrawSeq], codec: Codec, size: int = 256) -> tuple[list[np.
 
 
 @torch.no_grad()
-def rewards(images, orphans, faces, prompts: list[str], clip: ClipScorer, cfg: RewardConfig) -> dict:
+def rewards(images, orphans, faces, prompts: list[str], clip: ClipScorer, cfg: RewardConfig,
+            attr_agreement: torch.Tensor | None = None) -> dict:
+    """attr_agreement [B] in [0, 1]: optional, e.g. mean classifier probability of the prompt
+    image's true attribute values (computed by the caller, which knows the source labels)."""
     img, txt = clip.images(images), clip.texts(prompts)
     clip_score = 100 * (img * txt).sum(1).cpu()
     orphan = torch.tensor(orphans)
     face = torch.tensor(faces, dtype=torch.float32)
     total = clip_score - cfg.orphan_weight * 100 * orphan - cfg.early_penalty * (1 - face)
-    return {"reward": total, "clip": clip_score, "orphan": orphan, "face": face}
+    out = {"clip": clip_score, "orphan": orphan, "face": face}
+    if attr_agreement is not None:
+        agree = attr_agreement.float().cpu()
+        total = total + cfg.attr_weight * agree
+        out["attr"] = agree
+    out["reward"] = total
+    return out
 
 
 def group_advantages(reward: torch.Tensor, group: int, eps: float = 1e-4) -> torch.Tensor:
