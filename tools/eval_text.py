@@ -29,6 +29,7 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lpp.clip_score import ClipScorer  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
@@ -102,6 +103,10 @@ def main() -> None:
     ap.add_argument("--judge-encoder", type=Path, default=None,
                     help="second, independent Chinese-CLIP (e.g. ViT-L/14) to re-score: guards against reward hacking "
                          "when the RL reward uses the conditioning encoder")
+    ap.add_argument("--attr-classifier", type=Path, default=None,
+                    help="tools/attr_classifier.py checkpoint: CLIP-independent attribute agreement with the "
+                         "prompt's source image (needs --attributes)")
+    ap.add_argument("--attributes", type=Path, default=None, help="CelebA attributes.json (ground truth)")
     ap.add_argument("--image-tokens", type=Path, default=None,
                     help="image-conditioned models: condition each sample on its validation image's CLIP tokens")
     ap.add_argument("--no-text", action="store_true", help="with --image-tokens: image only, no prompt")
@@ -201,6 +206,23 @@ def main() -> None:
                            "real_reference": {"clip_score": round(100 * float((jr * jt).sum(1).mean()), 3),
                                               **retrieval(jr, jt),
                                               "real_split_fd": round(frechet(jr_np[:half], jr_np[half:]), 4)}}
+    if args.attr_classifier is not None:
+        from attr_classifier import AttrClassifier, balanced_accuracy
+        if args.attributes is None:
+            raise SystemExit("--attr-classifier needs --attributes")
+        attrs = json.loads(args.attributes.read_text())
+        truth = np.array([attrs["values"][str(i)] for i in ids], dtype=bool)
+        clf = AttrClassifier(args.attr_classifier, dev)
+        pg, pr = clf.predict(np.stack(gen)), clf.predict(np.stack(real))
+        col = {n: k for k, n in enumerate(attrs["names"])}
+        ev = torch.load(args.attr_classifier, map_location="cpu", weights_only=False)["eval_attrs"]
+        per = {n: {"generated": round(balanced_accuracy(pg[:, col[n]], truth[:, col[n]]), 4),
+                   "real": round(balanced_accuracy(pr[:, col[n]], truth[:, col[n]]), 4)} for n in ev}
+        ok = [n for n in ev if not (np.isnan(per[n]["generated"]) or np.isnan(per[n]["real"]))]
+        result["attributes"] = {"mean_balanced_acc_generated": round(float(np.mean([per[n]["generated"] for n in ok])), 4),
+                                "mean_balanced_acc_real": round(float(np.mean([per[n]["real"] for n in ok])), 4),
+                                "attributes_scored": ok, "per_attribute": per,
+                                "note": "classifier on the prompt's source-image labels; real = classifier ceiling"}
     if store is not None:      # image -> painting: how faithful is the result to its input image
         g_img, r_img = np.stack(gen).astype(np.float64), np.stack(real).astype(np.float64)
         mse = ((g_img - r_img) ** 2).mean((1, 2, 3))
