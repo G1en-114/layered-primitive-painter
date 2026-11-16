@@ -31,7 +31,7 @@ from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import SequenceDataset, load_shards  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
-from lpp.text import CaptionStore, TextEncoder  # noqa: E402
+from lpp.text import CachedTextEncoder, CaptionStore, TextEncoder  # noqa: E402
 from train import loader  # noqa: E402
 
 
@@ -48,6 +48,7 @@ def main() -> None:
     ap.add_argument("--captions", type=Path, default=None)
     ap.add_argument("--attributes", type=Path, default=None)
     ap.add_argument("--canvas", action="store_true")
+    ap.add_argument("--text-cache", action="store_true", help="memoize caption features as train.py does")
     ap.add_argument("--perturb", type=float, default=0.0)
     ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto")
     ap.add_argument("--out", type=Path, default=None)
@@ -63,6 +64,8 @@ def main() -> None:
     if args.text_encoder:
         store = CaptionStore(args.captions, args.attributes)
         encoder = TextEncoder(args.text_encoder, max_positions=proto.max_text_positions).cuda()
+        if args.text_cache:
+            encoder = CachedTextEncoder(encoder)
     ds = SequenceDataset(examples, proto, seed=0, captions=store, p_text_drop=0.1, p_perturb=args.perturb)
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
     if args.canvas:

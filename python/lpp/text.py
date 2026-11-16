@@ -110,6 +110,56 @@ class CaptionStore:
         return template_caption(self.attrs[image_id], rng) if k == "template" else self.vlm[image_id][k]
 
 
+class CachedTextEncoder:
+    """Memoizes a frozen TextEncoder by caption string (training-time speedup).
+
+    Captions repeat every epoch (VLM long/short, their mirrored forms), so running the
+    ~100M-parameter frozen tower each step is wasted work. Features are stored on the CPU
+    in bfloat16: the model's first use is text_proj under bf16 autocast, which casts its
+    input to bf16 anyway, so the model sees the same values. Returned as float32 like the
+    encoder. Least-recently-used entries are evicted beyond max_entries (random template
+    captions would otherwise grow the cache without bound).
+    """
+
+    def __init__(self, encoder: "TextEncoder", max_entries: int = 250_000):
+        from collections import OrderedDict
+        self.encoder, self.max_entries = encoder, max_entries
+        self.store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.hits = self.misses = 0
+
+    @property
+    def dim(self) -> int:
+        return self.encoder.dim
+
+    def __call__(self, captions: list[str | None]) -> tuple[torch.Tensor, torch.Tensor]:
+        dev = next(self.encoder.model.parameters()).device
+        todo = list(dict.fromkeys(c for c in captions if c and c not in self.store))
+        if todo:
+            feats, valid = self.encoder(todo)
+            for i, c in enumerate(todo):
+                self.store[c] = feats[i, : int(valid[i].sum())].to("cpu", torch.bfloat16)
+        rows = []
+        for c in captions:
+            if c:
+                self.store.move_to_end(c)
+                rows.append(self.store[c])
+        while len(self.store) > self.max_entries:        # evict only after this batch is gathered
+            self.store.popitem(last=False)
+        self.misses += len(todo)
+        self.hits += len(rows) - len(todo)
+        B, D = len(captions), self.encoder.dim
+        L = max((r.shape[0] for r in rows), default=0)
+        out = torch.zeros(B, L, D, dtype=torch.bfloat16)
+        valid = torch.zeros(B, L, dtype=torch.bool)
+        j = 0
+        for i, c in enumerate(captions):
+            if c:
+                n = rows[j].shape[0]
+                out[i, :n], valid[i, :n] = rows[j], True
+                j += 1
+        return out.to(dev, non_blocking=True).float(), valid.to(dev, non_blocking=True)
+
+
 class TextEncoder(torch.nn.Module):
     """Frozen Chinese-CLIP text tower -> per-token features [B, L<=max_positions, 768]."""
 

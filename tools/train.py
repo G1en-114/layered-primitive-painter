@@ -30,7 +30,7 @@ from lpp.data.splits import load_split_manifest  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.metrics import orphan_stats  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
-from lpp.text import CaptionStore, TextEncoder  # noqa: E402
+from lpp.text import CachedTextEncoder, CaptionStore, TextEncoder  # noqa: E402
 from lpp.runtime_env import available_cpus, configure_threads, default_workers  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
 from lpp.render.reference import flatten_on_base  # noqa: E402
@@ -132,6 +132,8 @@ def main() -> None:
     ap.add_argument("--attributes", type=Path, default=None, help="attributes.json (template captions)")
     ap.add_argument("--text-encoder", type=Path, default=None, help="Chinese-CLIP model directory")
     ap.add_argument("--text-drop", type=float, default=0.1, help="caption dropout (for CFG)")
+    ap.add_argument("--no-text-cache", action="store_true",
+                    help="run the frozen text encoder every step instead of memoizing caption features")
     ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for text-conditioned samples")
     ap.add_argument("--canvas", action="store_true", help="canvas feedback (docs/canvas_feedback_design.md)")
     ap.add_argument("--canvas-k", type=int, default=32)
@@ -171,10 +173,13 @@ def main() -> None:
         if missing:
             raise ValueError(f"{len(missing)} image IDs missing from the split manifest")
         is_val = lambda e: splits[e.image_id] == "val"  # noqa: E731
-    store = encoder = None
+    store = encoder = sample_encoder = None
     if args.text_encoder:
         store = CaptionStore(args.captions, args.attributes)
         encoder = TextEncoder(args.text_encoder, max_positions=proto.max_text_positions).cuda()
+        sample_encoder = encoder
+        if not args.no_text_cache:
+            encoder = CachedTextEncoder(encoder)
         print(f"text conditioning: {len(store.vlm)} VLM-captioned, {len(store.attrs)} with attributes, "
               f"caption dropout {args.text_drop}")
     train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed, captions=store,
@@ -253,7 +258,7 @@ def main() -> None:
                     for k, v in model(batch).items():
                         vals[k] = vals.get(k, 0.0) + v.item() / 10
             lens = render_samples(model, codec, 6, args.out / f"samples_{step:06d}.png", seed=step,
-                                  encoder=encoder, cfg_scale=args.cfg_scale)
+                                  encoder=sample_encoder, cfg_scale=args.cfg_scale)
             lens, orphan = lens
             rec = {"step": step, "val": {k: round(v, 4) for k, v in vals.items()}, "sample_lengths": lens,
                    "sample_orphan_rate": orphan}
