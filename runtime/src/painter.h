@@ -1,0 +1,42 @@
+// The decode loop (tools/ort_generate.py, lpp.sample.generate): grammar-masked event, attributes
+// one by one, classifier-free guidance, KV cache owned here, canvas checkpoints re-encoded.
+#pragma once
+#include <array>
+#include <functional>
+#include <set>
+#include <vector>
+
+#include "protocol.h"
+#include "sampler.h"
+#include "session.h"
+
+namespace lpp {
+
+struct Record {
+  int64_t kind, event, layer;
+  std::vector<int64_t> attrs;
+};
+
+struct GenerateConfig {
+  SampleConfig sample;
+  int max_records = 0;                 // 0: context minus text
+  std::set<int> require_before_eos;    // e.g. {0, 2}: background and skin before EOS
+};
+
+// uniform(step, field, b): field 0 = event, 1 + i = attribute i
+using Uniforms = std::function<float(int step, int field, int b)>;
+
+class Painter {
+ public:
+  Painter(const std::string& export_dir, const std::string& provider);
+  const Protocol& protocol() const { return proto_; }
+  // text [B, Lt, text_dim] (row-major), text_valid [B, Lt]; Lt may be 0
+  std::vector<std::vector<Record>> generate(int B, const GenerateConfig& cfg, const std::vector<float>& text,
+                                            const std::vector<uint8_t>& text_valid, int Lt, const Uniforms& u);
+
+ private:
+  Protocol proto_;
+  Graphs g_;
+};
+
+}  // namespace lpp

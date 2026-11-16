@@ -50,9 +50,15 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
         cum = sp.cumsum(-1)
         keep = (cum - sp) < cfg.top_p                  # always keeps the top token
         sp = sp * keep
-    cdf = sp.cumsum(-1) / sp.sum(-1, keepdim=True)
+    # The support is chosen in probability order, but the inverse CDF runs over the kept tokens
+    # in vocabulary order: the same distribution, while near-equal probabilities (common among
+    # neighbouring position bins) can no longer swap places in a sort and send the same uniform
+    # to a distant token. That makes samples reproducible across runtimes (PyTorch, ORT, C++).
+    w = torch.zeros_like(probs).scatter(-1, si, sp)
+    cdf = w.cumsum(-1) / w.sum(-1, keepdim=True)
     j = torch.searchsorted(cdf, u.unsqueeze(-1).clamp(max=1 - 1e-7)).clamp(max=cdf.shape[-1] - 1)
-    return si.gather(-1, j).squeeze(-1)
+    j = torch.where(w.gather(-1, j) > 0, j, (w > 0).float().argmax(-1, keepdim=True))   # never a zero-weight token
+    return j.squeeze(-1)
 
 
 @torch.no_grad()

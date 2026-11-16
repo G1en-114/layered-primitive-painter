@@ -205,6 +205,8 @@ def main() -> None:
     ap.add_argument("--cfg-scale", type=float, default=2.0)
     ap.add_argument("--provider", default="CPUExecutionProvider")
     ap.add_argument("--compare", action="store_true")
+    ap.add_argument("--dump", type=Path, default=None,
+                    help="write text.npy, text_valid.npy, uniforms.npy (full table) and the ORT records for the C++ runtime")
     args = ap.parse_args()
     from lpp.text import TextEncoder
     m = OrtPainter(args.onnx, [args.provider])
@@ -215,19 +217,31 @@ def main() -> None:
     text, tv = enc(prompts)
     sc = SampleConfig(temperature=1.0, top_p=0.9, cfg_scale=args.cfg_scale, max_records=args.max_records,
                       require_before_eos=(0, 2))
+    # one full table [max_records, 1 + A, B] (field 0 = event, 1 + i = attribute i), shared with C++
     g = torch.Generator().manual_seed(0)
-    table = {}
+    fields = ["event"] + list(m.attr_names)
+    table = torch.rand(args.max_records, len(fields), len(prompts), generator=g)
 
     def uniforms(step, field):
-        if (step, field) not in table:
-            table[(step, field)] = torch.rand(len(prompts), generator=g)
-        return table[(step, field)]
+        return table[step, fields.index(field)]
 
     t0 = time.perf_counter()
     seqs = ort_generate(m, codec, len(prompts), sc, text.numpy(), tv.numpy(), uniforms)
     dt = time.perf_counter() - t0
     n_rec = sum(len(s) for s in seqs)
     print(f"ORT ({args.provider}): {len(seqs)} sequences, {n_rec} records in {dt:.1f}s ({n_rec / dt:.0f} records/s)")
+    if args.dump is not None:
+        args.dump.mkdir(parents=True, exist_ok=True)
+        np.save(args.dump / "text.npy", text.numpy().astype(np.float32))
+        np.save(args.dump / "text_valid.npy", tv.numpy().astype(bool))
+        np.save(args.dump / "uniforms.npy", table.numpy().astype(np.float32))
+        A = len(m.attr_names)
+        rec = np.full((len(seqs), max(len(s) for s in seqs), 3 + A), -2, np.int64)
+        for b, s in enumerate(seqs):
+            rec[b, :len(s), 0], rec[b, :len(s), 1], rec[b, :len(s), 2] = s.kind, s.event, s.layer
+            rec[b, :len(s), 3:] = s.attrs
+        np.save(args.dump / "ort_python_records.npy", rec)
+        print(f"wrote {args.dump}")
     if args.compare:
         from lpp.model import ModelConfig, Painter
         from lpp.sample import generate

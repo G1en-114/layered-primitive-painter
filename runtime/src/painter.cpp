@@ -1,0 +1,223 @@
+#include "painter.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+
+#include "grammar.h"
+#include "raster.h"
+
+namespace lpp {
+
+Painter::Painter(const std::string& dir, const std::string& provider) : proto_(Protocol::load(dir)), g_(dir, provider) {
+  if (!proto_.canvas) throw std::runtime_error("runtime v0 expects a canvas-feedback model");
+}
+
+namespace {
+
+// rows R = 2B when guided: [conditional rows ; unconditional rows] share everything but the text
+template <class T>
+std::vector<T> dup(const std::vector<T>& v, bool guided) {
+  if (!guided) return v;
+  std::vector<T> out(v);
+  out.insert(out.end(), v.begin(), v.end());
+  return out;
+}
+
+}  // namespace
+
+std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& cfg, const std::vector<float>& text,
+                                                   const std::vector<uint8_t>& text_valid, int Lt, const Uniforms& uni) {
+  const Protocol& P = proto_;
+  const int A = static_cast<int>(P.attrs.size()), E = static_cast<int>(P.events.size());
+  const int L = P.n_layers, KV = P.n_kv_heads, HD = P.head_dim(), D = P.d_model, NL = P.num_layers();
+  const bool guided = Lt > 0 && cfg.sample.cfg_scale != 1.f;
+  const int R = guided ? 2 * B : B;
+  const int max_records = cfg.max_records ? cfg.max_records : P.max_positions - Lt;
+  const int Tmax = Lt + max_records;
+  const int prim_ev = P.event_id("PRIMITIVE"), eos = P.event_id("EOS");
+
+  // ---- KV cache owned by the runtime: static [L, R, KV, Tmax, HD]; graphs see all slots + a mask
+  Tensor K = Tensor::F({L, R, KV, Tmax, HD}), V = Tensor::F({L, R, KV, Tmax, HD});
+  Tensor kmask = Tensor::B({R, Tmax});
+  Tensor next_pos = Tensor::I({R});
+  int length = 0;
+
+  auto chunk = [&](const Tensor& x, const Tensor& valid, const Tensor& tokens, const Tensor& draw) {
+    const int T = static_cast<int>(x.shape[1]);
+    auto out = g_["chunk"].run({&x, &valid, &K, &V, &kmask, &next_pos, &tokens, &draw});
+    const Tensor &kn = out[1], &vn = out[2];       // [L, R, KV, T, HD]
+    for (int l = 0; l < L; ++l)
+      for (int r = 0; r < R; ++r)
+        for (int h = 0; h < KV; ++h)
+          for (int t = 0; t < T; ++t) {
+            const size_t src = ((((size_t(l) * R + r) * KV + h) * T + t) * HD);
+            const size_t dst = ((((size_t(l) * R + r) * KV + h) * Tmax + length + t) * HD);
+            std::copy_n(kn.f.begin() + src, HD, K.f.begin() + dst);
+            std::copy_n(vn.f.begin() + src, HD, V.f.begin() + dst);
+          }
+    for (int r = 0; r < R; ++r)
+      for (int t = 0; t < T; ++t) {
+        kmask.b[size_t(r) * Tmax + length + t] = valid.b[size_t(r) * T + t];
+        next_pos.i[r] += valid.b[size_t(r) * T + t];
+      }
+    length += T;
+    return std::move(out[0]);                      // h [R, T, D]
+  };
+
+  // ---- canvas state and its tokens
+  const int S = P.canvas_cfg_size, NT = (S / 8) * (S / 8);
+  std::vector<Layered> canvas(B, Layered(NL, S));
+  Tensor ctok;                                      // [B, NT, D]
+  {
+    Tensor cv = Tensor::F({B, 3 + NL, S, S});
+    for (int b = 0; b < B; ++b) compose(P, canvas[b], cv.f.data() + size_t(b) * (3 + NL) * S * S);
+    ctok = g_["canvas_enc"].run({&cv})[0];
+  }
+  auto canvas_rows = [&]() {
+    Tensor t = Tensor::F({R, NT, D});
+    for (int r = 0; r < R; ++r) std::copy_n(ctok.f.begin() + size_t(r % B) * NT * D, size_t(NT) * D, t.f.begin() + size_t(r) * NT * D);
+    return t;
+  };
+
+  // ---- prefix: [text][BOS]
+  Tensor h;
+  {
+    Tensor kind = Tensor::I({R, 1}, P.kind_bos), ev = Tensor::I({R, 1}, -1), lay = Tensor::I({R, 1}, -1),
+           at = Tensor::I({R, 1, A}, P.no_attr);
+    Tensor xr = g_["embed_record"].run({&kind, &ev, &lay, &at})[0];      // [R, 1, D]
+    Tensor x = Tensor::F({R, Lt + 1, D}), valid = Tensor::B({R, Lt + 1}), draw = Tensor::B({R, Lt + 1});
+    if (Lt) {
+      Tensor tx = Tensor::F({R, Lt, P.text_dim});
+      std::copy(text.begin(), text.end(), tx.f.begin());                // uncond rows stay zero
+      Tensor xt = g_["embed_text"].run({&tx})[0];                       // [R, Lt, D]
+      for (int r = 0; r < R; ++r) {
+        std::copy_n(xt.f.begin() + size_t(r) * Lt * D, size_t(Lt) * D, x.f.begin() + size_t(r) * (Lt + 1) * D);
+        for (int t = 0; t < Lt; ++t) valid.b[size_t(r) * (Lt + 1) + t] = r < B ? text_valid[size_t(r) * Lt + t] : 0;
+      }
+    }
+    for (int r = 0; r < R; ++r) {
+      std::copy_n(xr.f.begin() + size_t(r) * D, D, x.f.begin() + (size_t(r) * (Lt + 1) + Lt) * D);
+      valid.b[size_t(r) * (Lt + 1) + Lt] = 1;
+      draw.b[size_t(r) * (Lt + 1) + Lt] = 1;
+    }
+    Tensor tok = canvas_rows();
+    Tensor hall = chunk(x, valid, tok, draw);
+    h = Tensor::F({R, D});
+    for (int r = 0; r < R; ++r) std::copy_n(hall.f.begin() + (size_t(r) * (Lt + 1) + Lt) * D, D, h.f.begin() + size_t(r) * D);
+  }
+
+  // ---- decode loop
+  std::vector<Grammar> gram;
+  for (int b = 0; b < B; ++b) {
+    gram.emplace_back(P, cfg.require_before_eos, false);
+  }
+  std::vector<std::vector<Record>> out(B);
+  for (int b = 0; b < B; ++b) out[b].push_back({P.kind_bos, -1, -1, std::vector<int64_t>(A, P.no_attr)});
+  std::vector<bool> done(B, false);
+  std::vector<std::vector<std::pair<std::vector<int64_t>, int>>> pending(B);
+  std::vector<int> since(B, 0);
+  std::vector<float> lg;
+
+  auto guided_row = [&](const Tensor& t, int b, int n) {      // [R, n] -> guided logits of sample b
+    lg.resize(n);
+    const float* c = t.f.data() + size_t(b) * n;
+    if (guided) guide(c, t.f.data() + size_t(B + b) * n, cfg.sample.cfg_scale, lg.data(), n);
+    else std::copy_n(c, n, lg.begin());
+    return lg.data();
+  };
+
+  Tensor zeros_e = Tensor::I({R}), zeros_a = Tensor::I({R, A});
+  for (int step = 1; step < max_records; ++step) {
+    auto heads0 = g_["decode_heads"].run({&h, &zeros_e, &zeros_a});
+    std::vector<int64_t> ev(B);
+    for (int b = 0; b < B; ++b) {
+      float* l = guided_row(heads0[0], b, E);
+      std::vector<int> allowed = step == max_records - 1 ? std::vector<int>{eos}
+                                 : done[b] ? std::vector<int>{eos} : gram[b].allowed_events();
+      std::vector<float> m(E, -std::numeric_limits<float>::infinity());
+      for (int e : allowed) m[e] = l[e];
+      ev[b] = sample_top_p(m.data(), E, cfg.sample, uni(step, 0, b));
+    }
+    std::vector<std::vector<int64_t>> attrs(B, std::vector<int64_t>(A, P.no_attr));
+    if (std::find(ev.begin(), ev.end(), prim_ev) != ev.end()) {
+      Tensor evt = Tensor::I({R}), at = Tensor::I({R, A});
+      for (int r = 0; r < R; ++r) evt.i[r] = ev[r % B];
+      for (int i = 0; i < A; ++i) {
+        for (int r = 0; r < R; ++r)
+          for (int j = 0; j < A; ++j) at.i[size_t(r) * A + j] = std::max<int64_t>(attrs[r % B][j], 0);
+        auto heads = g_["decode_heads"].run({&h, &evt, &at});
+        const int n = static_cast<int>(P.vocab[i]);
+        for (int b = 0; b < B; ++b) attrs[b][i] = sample_top_p(guided_row(heads[1 + i], b, n), n, cfg.sample, uni(step, 1 + i, b));
+      }
+      for (int b = 0; b < B; ++b)
+        if (ev[b] != prim_ev) std::fill(attrs[b].begin(), attrs[b].end(), P.no_attr);
+    }
+    std::vector<int64_t> layer(B), kind(B);
+    std::vector<uint8_t> live(B);
+    for (int b = 0; b < B; ++b) {
+      live[b] = !done[b];
+      kind[b] = ev[b] == prim_ev ? P.kind_primitive : P.kind_control;
+      if (gram[b].done()) {
+        layer[b] = -1;
+      } else {
+        if (step == max_records - 1 && ev[b] == eos) gram[b].force_done();
+        else gram[b].step(static_cast<int>(ev[b]));
+        layer[b] = gram[b].done() ? -1 : gram[b].current();
+      }
+      if (live[b]) out[b].push_back({kind[b], ev[b], layer[b], attrs[b]});
+      done[b] = done[b] || ev[b] == eos;
+    }
+    if (std::all_of(done.begin(), done.end(), [](bool d) { return d; })) break;
+
+    // canvas checkpoints (lpp.canvas.CanvasTracker.update)
+    std::vector<int> hit;
+    for (int b = 0; b < B; ++b) {
+      if (!live[b]) continue;
+      if (kind[b] == P.kind_primitive) {
+        pending[b].push_back({attrs[b], static_cast<int>(layer[b])});
+        ++since[b];
+      }
+      if (kind[b] == P.kind_bos || kind[b] == P.kind_control || since[b] >= P.canvas_k) {
+        hit.push_back(b);
+        since[b] = 0;
+      }
+    }
+    if (!hit.empty()) {
+      Tensor cv = Tensor::F({static_cast<int64_t>(hit.size()), 3 + NL, S, S});
+      for (size_t j = 0; j < hit.size(); ++j) {
+        const int b = hit[j];
+        auto& st = canvas[b];
+        const size_t plane = size_t(S) * S;
+        for (auto& [a, k] : pending[b]) {
+          if (k < 0) continue;
+          std::vector<int64_t> t(a);
+          for (auto& v : t) v = std::max<int64_t>(v, 0);
+          paint(P, P.decode(t.data()), S, st.P.data() + size_t(k) * 3 * plane, st.T.data() + size_t(k) * plane);
+        }
+        pending[b].clear();
+        compose(P, st, cv.f.data() + j * (3 + NL) * plane);
+      }
+      Tensor nt = g_["canvas_enc"].run({&cv})[0];
+      for (size_t j = 0; j < hit.size(); ++j)
+        std::copy_n(nt.f.begin() + j * NT * D, size_t(NT) * D, ctok.f.begin() + size_t(hit[j]) * NT * D);
+    }
+
+    Tensor kd = Tensor::I({R, 1}), evt = Tensor::I({R, 1}), lay = Tensor::I({R, 1}), at = Tensor::I({R, 1, A});
+    Tensor valid = Tensor::B({R, 1}), draw = Tensor::B({R, 1}, true);
+    for (int r = 0; r < R; ++r) {
+      const int b = r % B;
+      kd.i[r] = kind[b], evt.i[r] = ev[b], lay.i[r] = layer[b], valid.b[r] = live[b];
+      std::copy(attrs[b].begin(), attrs[b].end(), at.i.begin() + size_t(r) * A);
+    }
+    Tensor x = g_["embed_record"].run({&kd, &evt, &lay, &at})[0];
+    Tensor tok = canvas_rows();
+    Tensor hn = chunk(x, valid, tok, draw);
+    h = Tensor::F({R, D});
+    std::copy(hn.f.begin(), hn.f.end(), h.f.begin());
+  }
+  return out;
+}
+
+}  // namespace lpp
