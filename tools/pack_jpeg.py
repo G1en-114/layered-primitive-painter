@@ -2,7 +2,8 @@
 
     python tools/pack_jpeg.py --data data/celebamask256 --out data/celebamask256_jpeg --shards 0 2 4
 
-Each pack holds `jpeg` (object array of bytes), `ids` and the source SHA-256. JPEG is lossy:
+Each pack holds `data` (all JPEG bytes, uint8) with `offsets`, `ids` and the source SHA-256; no
+pickle, so any NumPy version reads it (first-version packs with a pickled `jpeg` array still load). JPEG is lossy:
 packs are for consumers that tolerate it (CLIP image features, previews), never for
 decomposition targets or PSNR. tools/extract_image_features.py reads either format.
 """
@@ -18,9 +19,25 @@ import numpy as np
 from PIL import Image
 
 
+def _numpy2_pickle_alias() -> None:
+    """Packs written by the first version hold a pickled object array; NumPy 2 pickles reference
+    numpy._core, which NumPy 1.x lacks. Alias it so those packs load on older installs."""
+    import sys
+    if "numpy._core" not in sys.modules and not hasattr(np, "_core"):
+        import numpy.core as core
+        sys.modules["numpy._core"] = core
+        sys.modules["numpy._core.multiarray"] = core.multiarray
+
+
 def decode_pack(path: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(path, allow_pickle=True) as z:
-        imgs = np.stack([np.asarray(Image.open(io.BytesIO(b)).convert("RGB")) for b in z["jpeg"]])
+        if "data" in z.files:                       # portable layout: bytes + offsets, no pickle
+            data, off = z["data"], z["offsets"]
+            blobs = [data[off[i]:off[i + 1]].tobytes() for i in range(len(off) - 1)]
+        else:
+            _numpy2_pickle_alias()
+            blobs = list(z["jpeg"])
+        imgs = np.stack([np.asarray(Image.open(io.BytesIO(b)).convert("RGB")) for b in blobs])
         return imgs, z["ids"]
 
 
@@ -43,10 +60,10 @@ def main() -> None:
             buf = io.BytesIO()
             Image.fromarray(np.asarray(im)).save(buf, "JPEG", quality=args.quality, subsampling=0)
             blobs.append(buf.getvalue())
-        arr = np.empty(len(blobs), dtype=object)
-        arr[:] = blobs
+        offsets = np.concatenate([[0], np.cumsum([len(b) for b in blobs])]).astype(np.int64)
+        data = np.frombuffer(b"".join(blobs), dtype=np.uint8)
         sha = hashlib.sha256(src.read_bytes()).hexdigest()
-        np.savez(args.out / f"images_{s['shard']:03d}.jpg.npz", jpeg=arr, ids=np.array(s["ids"]),
+        np.savez(args.out / f"images_{s['shard']:03d}.jpg.npz", data=data, offsets=offsets, ids=np.array(s["ids"]),
                  source_sha256=np.array(sha), quality=np.array(args.quality))
         print(f"shard {s['shard']:03d}: {sum(map(len, blobs)) / 1e6:.1f} MB", flush=True)
     (args.out / "index.json").write_text(json.dumps(index))
