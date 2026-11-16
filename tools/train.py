@@ -9,9 +9,11 @@ a few unconditional samples at every evaluation (<out>/samples_<step>.png).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -68,16 +70,26 @@ SAMPLE_PROMPTS = [
 ]
 
 
-def loader(ds, args, shuffle=True):
+def loader(ds, args, shuffle=True, rank: int = 0, world: int = 1):
     """Endless batches. Training drops the ragged last batch; a dataset smaller than one
-    batch (a tiny validation split) keeps it, otherwise the epoch would be empty forever."""
+    batch (a tiny validation split) keeps it, otherwise the epoch would be empty forever.
+    With world > 1 each rank reads a disjoint shard of every epoch (DistributedSampler,
+    reshuffled per epoch with the same seed on all ranks)."""
     if len(ds) == 0:
         raise ValueError("empty dataset")
-    drop_last = shuffle and len(ds) >= args.batch
-    dl = DataLoader(ds, batch_size=args.batch, shuffle=shuffle, collate_fn=collate,
+    drop_last = shuffle and len(ds) >= args.batch * world
+    sampler = None
+    if world > 1 and shuffle:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True)
+    dl = DataLoader(ds, batch_size=args.batch, shuffle=shuffle and sampler is None, sampler=sampler, collate_fn=collate,
                     num_workers=args.workers, drop_last=drop_last, persistent_workers=args.workers > 0)
+    epoch = 0
     while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         yield from dl
+        epoch += 1
 
 
 @torch.no_grad()
@@ -153,6 +165,19 @@ def main() -> None:
                     help="start a NEW run from these weights (fresh optimizer and step; missing modules such "
                          "as canvas layers start at their init). Not the same as --resume.")
     args = ap.parse_args()
+    # data parallelism: launched by torchrun (RANK / LOCAL_RANK / WORLD_SIZE set) -> one process per GPU,
+    # gradients all-reduced by DistributedDataParallel (NCCL on NVIDIA, RCCL under the same name on ROCm/DTK)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank, local_rank = int(os.environ.get("RANK", "0")), int(os.environ.get("LOCAL_RANK", "0"))
+    ddp = world > 1
+    if ddp:
+        dev = local_rank % torch.cuda.device_count()     # several ranks may share a GPU in smoke tests
+        torch.cuda.set_device(dev)
+        # LPP_DDP_BACKEND=gloo lets several ranks share one GPU (smoke tests on a single-GPU machine)
+        torch.distributed.init_process_group(backend=os.environ.get("LPP_DDP_BACKEND", "nccl"))
+    is_main = rank == 0
+    if not is_main:                                   # one copy of the console output
+        sys.stdout = open(os.devnull, "w")
     if args.sdpa_backend == "math":
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -204,7 +229,7 @@ def main() -> None:
         if missing:
             raise SystemExit(f"{len(missing)} image IDs have no target image in {args.target_images}")
         print(f"target-image conditioning: {len(targets.row)} images, p_target {args.p_target}")
-    train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed, captions=store,
+    train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed + 1000 * rank, captions=store,
                                p_text_drop=args.text_drop, p_perturb=args.perturb, image_tokens=image_tokens,
                                p_image=args.p_image, targets=targets, p_target=args.p_target)
     val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0,
@@ -257,21 +282,40 @@ def main() -> None:
         step = state["step"]
         print(f"resumed at step {step}")
     print(f"model {args.config}: {model.num_params() / 1e6:.1f}M parameters")
-    fwd = torch.compile(model) if args.compile else model
+    net = model
+    if ddp:
+        # parameters that can never receive a gradient would make DDP wait forever for their all-reduce:
+        # the last attribute's embedding (nothing in the decoder comes after it) and the text projection
+        # when training without text. They never change in single-GPU training either; freezing them
+        # beats find_unused_parameters=True, which walks the autograd graph every step.
+        dead = [f"dec_attr_emb.mods.{proto.attr_names[-1]}."] + ([] if encoder is not None else ["text_proj."])
+        for n, prm in model.named_parameters():
+            if any(n.startswith(d) for d in dead):
+                prm.requires_grad_(False)
+        # conditional modules (image prefix, target cross-attention) are skipped by batches without
+        # those inputs; DDP must then tolerate parameters without gradients in a step
+        net = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[dev], find_unused_parameters=bool(cfg.image or cfg.target))
+        print(f"DDP: {world} processes, per-GPU batch {args.batch} x accum {args.accum} "
+              f"= global batch {args.batch * args.accum * world}")
+    fwd = torch.compile(net) if args.compile else net
 
-    train_it, val_it = loader(train_ds, args), loader(val_ds, args, shuffle=False)
-    log = open(args.out / "log.jsonl", "a")
+    train_it = loader(train_ds, args, rank=rank, world=world)
+    val_it = loader(val_ds, args, shuffle=False)
+    log = open(args.out / "log.jsonl", "a") if is_main else open(os.devnull, "w")
     t0, seen = time.perf_counter(), 0
     while step < args.steps:
         model.train()
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args) * g.get("lr_mult", 1.0)
         totals = {}
-        for _ in range(args.accum):
+        for micro in range(args.accum):
             batch = to_gpu(next(train_it), encoder, codec, cfg)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                losses = fwd(batch)
-            (losses["loss"] / args.accum).backward()
+            sync = not ddp or micro == args.accum - 1      # all-reduce gradients once per optimiser step
+            with (contextlib.nullcontext() if sync else net.no_sync()):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    losses = fwd(batch)
+                (losses["loss"] / args.accum).backward()
             for k, v in losses.items():
                 totals[k] = totals.get(k, 0.0) + v.item() / args.accum
             seen += int(batch["valid"].sum())
@@ -281,6 +325,10 @@ def main() -> None:
         step += 1
 
         if step % 50 == 0:
+            if ddp:                                    # records/s of the whole job, not one rank
+                t = torch.tensor([seen], device="cuda", dtype=torch.float64)
+                torch.distributed.all_reduce(t)
+                seen = int(t.item())
             dt = time.perf_counter() - t0
             gates = ([round(float(torch.tanh(c.gate.detach())), 4) for c in model.cross.values()]
                      if model.cfg.canvas else None)
@@ -291,7 +339,7 @@ def main() -> None:
             log.flush()
             t0, seen = time.perf_counter(), 0
 
-        if step % args.eval_every == 0 or step == args.steps:
+        if is_main and (step % args.eval_every == 0 or step == args.steps):
             model.eval()
             vals = {}
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -308,12 +356,21 @@ def main() -> None:
             log.write(json.dumps(rec) + "\n")
             log.flush()
 
-        if step % args.save_every == 0 or step == args.steps:
+        if is_main and (step % args.save_every == 0 or step == args.steps):
             tmp = ckpt.with_suffix(".tmp")
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "new_params": sorted(new_params),
                         "config": cfg.to_dict(), "protocol": proto.raw,
                         "args": vars(args) | {"out": str(args.out)}}, tmp)
             tmp.replace(ckpt)
+    if ddp:
+        # DDP keeps replicas identical by construction; check it (cheap: one checksum per tensor)
+        sums = torch.stack([p.detach().float().sum() for p in model.parameters()])
+        ref = sums.clone()
+        torch.distributed.broadcast(ref, 0)
+        drift = (sums - ref).abs().max().item()
+        sys.__stdout__.write(f"rank {rank}: max parameter-checksum drift vs rank 0 = {drift:.3g}\n")
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
