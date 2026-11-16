@@ -71,6 +71,34 @@ def specs(m: Painter, B: int, T: int, P: int, Lt: int) -> dict:
     return out
 
 
+def codec_tables(codec: Codec) -> dict:
+    """Everything the C++ runtime needs to turn tokens into pixels, as plain lookup tables.
+
+    Every attribute has a small discrete vocabulary, so decoding = indexing these tables; the
+    values are the library's own dequantized float32 numbers (exact in JSON), colours already in
+    sRGB, so the runtime reproduces Codec.decode bit for bit without porting Oklab or the bins."""
+    from lpp.sequence import KIND_BOS, KIND_CONTROL, KIND_PRIMITIVE, NO_ATTR
+    proto = codec.proto
+    tables = {}
+    with torch.no_grad():
+        for name, n in proto.attr_vocab_sizes.items():
+            idx = torch.arange(n)
+            if name == "color":
+                tok = {k: torch.zeros(1, n, dtype=torch.long) for k in proto.attr_names}
+                tok["color"] = idx[None]
+                tables[name] = codec.decode(tok).rgb[0].tolist()
+            else:
+                tables[name] = [float(v) for v in proto.attr(name).dequantize(idx).float()]
+    return {"attributes": list(proto.attr_names), "tables": tables,
+            "canvas_size": proto.canvas_size, "base_color": list(proto.base_color),
+            "max_alpha": proto.max_alpha, "cutoff_sigma": proto.cutoff_sigma,
+            "sigma_min": proto.sigma_min, "sigma_max": proto.sigma_max,
+            "events": list(proto.events), "layers": [{"name": ly.name, "max_primitives": ly.max_primitives}
+                                                     for ly in proto.layers],
+            "max_text_positions": proto.max_text_positions,
+            "kinds": {"BOS": KIND_BOS, "CONTROL": KIND_CONTROL, "PRIMITIVE": KIND_PRIMITIVE}, "no_attr": NO_ATTR}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", type=Path, required=True)
@@ -111,6 +139,7 @@ def main() -> None:
                                     "dynamic_axes": {k: {str(a): v for a, v in ax.items()} for k, ax in sp["axes"].items()}}
         print(f"{name:13s} max|ort - torch| = {max(diffs):.2e}  ({path.stat().st_size / 1e6:.1f} MB)", flush=True)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    (args.out / "codec.json").write_text(json.dumps(codec_tables(codec), indent=None))
     (args.out / "parity.json").write_text(json.dumps(report, indent=1))
 
 
