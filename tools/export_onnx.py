@@ -55,6 +55,21 @@ def specs(m: Painter, B: int, T: int, P: int, Lt: int) -> dict:
                   "past_v": {1: "B", 3: "P"}, "past_mask": {0: "B", 1: "P"}, "start_pos": {0: "B"},
                   "canvas_tokens": {0: "B"}, "draw": {0: "B", 1: "T"}, "h": {0: "B", 1: "T"},
                   "k_new": {1: "B", 3: "T"}, "v_new": {1: "B", 3: "T"}}),
+        "chunk_cached": dict(
+            inputs=(torch.randn(B, T, c.d_model, generator=g), torch.rand(B, T, generator=g) > 0.1,
+                    torch.randn(c.n_layers, B, c.n_kv_heads, P + T + 2, hd, generator=g),
+                    torch.randn(c.n_layers, B, c.n_kv_heads, P + T + 2, hd, generator=g),
+                    torch.rand(B, P + T + 2, generator=g) > 0.3, torch.tensor(P, dtype=torch.long),
+                    torch.randint(0, 50, (B,), generator=g),
+                    torch.randn(B, (c.canvas_size // 8) ** 2, c.d_model, generator=g),
+                    torch.rand(B, T, generator=g) > 0.5),
+            names=["x", "valid", "cache_k", "cache_v", "cache_mask", "write_pos", "start_pos", "canvas_tokens", "draw"],
+            outputs=["h", "cache_k_out", "cache_v_out", "cache_mask_out"],
+            axes={"x": {0: "B", 1: "T"}, "valid": {0: "B", 1: "T"}, "cache_k": {1: "B", 3: "Tmax"},
+                  "cache_v": {1: "B", 3: "Tmax"}, "cache_mask": {0: "B", 1: "Tmax"}, "start_pos": {0: "B"},
+                  "canvas_tokens": {0: "B"}, "draw": {0: "B", 1: "T"}, "h": {0: "B", 1: "T"},
+                  "cache_k_out": {1: "B", 3: "Tmax"}, "cache_v_out": {1: "B", 3: "Tmax"},
+                  "cache_mask_out": {0: "B", 1: "Tmax"}}),
         "decode_heads": dict(
             inputs=(torch.randn(B, c.d_model, generator=g), torch.randint(0, m.n_events, (B,), generator=g),
                     attrs[:, 0]),
@@ -132,7 +147,8 @@ def main() -> None:
                 ref = mod(*ins)
             ref = ref if isinstance(ref, tuple) else (ref,)
             got = sess.run(None, {n: t.numpy() for n, t in zip(sp["names"], ins)})
-            diffs.append(max(float(np.abs(g - r.numpy()).max()) for g, r in zip(got, ref)))
+            diffs.append(max(float(np.abs(g.astype(np.float64) - r.numpy().astype(np.float64)).max())
+                             for g, r in zip(got, ref)))
         report[name] = {"max_abs_diff": max(diffs), "bytes": path.stat().st_size,
                         "export_s": round(time.perf_counter() - t0, 2)}
         manifest["graphs"][name] = {"file": path.name, "inputs": sp["names"], "outputs": sp["outputs"],

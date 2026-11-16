@@ -112,6 +112,27 @@ class Chunk(nn.Module):
         return p.norm(x), torch.stack(ks), torch.stack(vs)
 
 
+class ChunkCached(nn.Module):
+    """Chunk with the cache update inside the graph (runtime v1: the cache never leaves the GPU).
+
+    cache_k/cache_v [L,B,kv,Tmax,hd] and cache_mask [B,Tmax] are the whole static cache; write_pos
+    (0-d int64) is where the T new positions go. Outputs h and the updated cache; the runtime binds
+    two device buffers and swaps them each call (ping-pong), so no host copy is involved."""
+
+    def __init__(self, painter: Painter):
+        super().__init__()
+        self.chunk = Chunk(painter)
+
+    def forward(self, x, valid, cache_k, cache_v, cache_mask, write_pos, start_pos, canvas_tokens, draw):
+        T = x.shape[1]
+        h, k_new, v_new = self.chunk(x, valid, cache_k, cache_v, cache_mask, start_pos, canvas_tokens, draw)
+        end = write_pos + T
+        ck = torch.cat([cache_k[:, :, :, :write_pos], k_new, cache_k[:, :, :, end:]], 3)
+        cv = torch.cat([cache_v[:, :, :, :write_pos], v_new, cache_v[:, :, :, end:]], 3)
+        cm = torch.cat([cache_mask[:, :write_pos], valid, cache_mask[:, end:]], 1)
+        return h, ck, cv, cm
+
+
 class DecodeHeads(nn.Module):
     """Full-length attribute decoder pass -> logits for the event and every attribute."""
 
@@ -172,10 +193,11 @@ def exportable(painter: Painter) -> Painter:
 def graphs(painter: Painter) -> dict[str, nn.Module]:
     painter = exportable(painter)
     g = {"embed_record": EmbedRecord(painter), "embed_text": EmbedText(painter), "chunk": Chunk(painter),
+         "chunk_cached": ChunkCached(painter),
          "decode_heads": DecodeHeads(painter)}
     if painter.cfg.canvas:
         g["canvas_enc"] = CanvasEnc(painter)
     return g
 
 
-__all__ = ["Chunk", "DecodeHeads", "EmbedRecord", "EmbedText", "CanvasEnc", "graphs"]
+__all__ = ["Chunk", "ChunkCached", "DecodeHeads", "EmbedRecord", "EmbedText", "CanvasEnc", "graphs"]

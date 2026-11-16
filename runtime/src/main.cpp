@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
                                                << a["--provider"] << "\"}\n";
     std::printf("%d sequences, %zu records in %.2fs (%.0f records/s, %s)\n", B, total, secs, total / secs,
                 a["--provider"].c_str());
+    Profile::report();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;

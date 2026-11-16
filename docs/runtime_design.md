@@ -103,3 +103,31 @@ C++ 逐个图元地绘制画布，参考实现则按层在对数空间里累加�
 2. 在 v0 的设计下，CUDA EP 反而比 CPU 还慢（148 对 288 records/s）。每一步都要把完整的 KV cache
    从主机内存拷到显存，约 30MB，计算本身占比很小。v1 的目标就是用 IOBinding 让 KV cache 一直留在显存里。
    另外，这次测速时本机 GPU 同时在跑动漫数据的分解。
+
+## v1：KV cache 常驻显存（2026-11-16）
+
+新加的 `chunk_cached` 图：输入整块 cache（`[L,B,kv,Tmax,hd]`）和写入位置 `write_pos`，在图内拼好新的 K/V，
+输出更新后的整块 cache。C++ 端用 IOBinding 在显存里开两组缓冲（K、V、mask），每一步一组读、一组写，交替使用；
+第一次调用（前缀）从主机端的全零张量读。cache 从此不再经过 PCIe，每步只是一次约 30MB 的显存内拷贝。
+与 PyTorch 的误差 1.0e-6；`tests/test_export.py` 检查了它等于 `Chunk` 加手动写入。
+
+**一致性：** v1 的 CPU 和 CUDA（关 TF32）都与 v0 CPU 完全一致，6/6 条序列、全部 300 条 record 相同。
+
+**单图耗时**（`LPP_PROFILE=1`，B=6，CFG 下实际是 12 行；本机 GPU 同时在跑动漫分解，CUDA 这一列被争用拖慢）：
+
+| 图 | CPU EP | CUDA EP（GPU 被占用） |
+|---|---:|---:|
+| chunk / chunk_cached | 11.1 ms/次 | 15.2 ms/次 |
+| decode_heads（每步 9 次） | 0.76 ms/次 | 1.60 ms/次 |
+| canvas_enc | 0.51 ms/次 | 10.2 ms/次 |
+| 合计 | 302 records/s | 173 records/s |
+
+**解读：** 20M 的模型在 batch 12、每次只算一个位置时，耗时主要来自 kernel 启动延迟：每次调用都是几百个很小的 kernel。
+GPU 被另一个进程占满的时候，这些 kernel 还要排队等。所以 v1 解决的是数据搬运的问题，
+CUDA 这一列的速度要等 GPU 空闲后重新测。之后的优化方向：
+
+1. CUDA Graph：ORT 的 `enable_cuda_graph`，要求输入形状固定、绑定的缓冲区地址固定。
+   v1 的静态 cache 加 ping-pong 缓冲已经很接近这个要求了。
+2. TensorRT EP：把小算子融合起来，再试 FP16。
+3. 把 9 次属性解码合并：每一步一次性算出全部属性的 logits，只能用于不需要按属性逐个采样的近似；
+   或者把采样本身也放进图里。

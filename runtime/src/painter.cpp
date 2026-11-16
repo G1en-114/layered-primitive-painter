@@ -1,6 +1,7 @@
 #include "painter.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -44,7 +45,86 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
   Tensor next_pos = Tensor::I({R});
   int length = 0;
 
+  // v1 (CUDA): the cache lives in two device buffer sets; chunk_cached reads one and writes the
+  // other (ping-pong), so it never crosses PCIe. The first call reads the zeroed host tensors.
+  const bool on_device = g_.provider().rfind("cuda", 0) == 0 && g_.has("chunk_cached");
+  struct DevBuf {
+    Ort::MemoryInfo mem{"Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault};
+    std::unique_ptr<Ort::Allocator> alloc;
+    void* ptr[2][3] = {};
+    std::vector<Ort::Value> val[2];
+    ~DevBuf() {
+      if (alloc)
+        for (auto& set : ptr)
+          for (void* p : set)
+            if (p) alloc->Free(p);
+    }
+  } dev;
+  int cur = -1;                                     // device set holding the cache (-1: host zeros)
+  if (on_device) {
+    Graph& gc = g_["chunk_cached"];
+    dev.alloc = std::make_unique<Ort::Allocator>(gc.session(), dev.mem);
+    const std::vector<int64_t> kv_shape{L, R, KV, Tmax, HD}, m_shape{R, Tmax};
+    const size_t kv_bytes = K.f.size() * sizeof(float), m_bytes = kmask.b.size();
+    for (int s = 0; s < 2; ++s) {
+      dev.ptr[s][0] = dev.alloc->Alloc(kv_bytes);
+      dev.ptr[s][1] = dev.alloc->Alloc(kv_bytes);
+      dev.ptr[s][2] = dev.alloc->Alloc(m_bytes);
+      dev.val[s].push_back(Ort::Value::CreateTensor(dev.mem, dev.ptr[s][0], kv_bytes, kv_shape.data(), 5, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+      dev.val[s].push_back(Ort::Value::CreateTensor(dev.mem, dev.ptr[s][1], kv_bytes, kv_shape.data(), 5, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+      dev.val[s].push_back(Ort::Value::CreateTensor(dev.mem, dev.ptr[s][2], m_bytes, m_shape.data(), 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL));
+    }
+  }
+  auto chunk_device = [&](const Tensor& x, const Tensor& valid, const Tensor& tokens, const Tensor& draw) {
+    Graph& gc = g_["chunk_cached"];
+    const int T = static_cast<int>(x.shape[1]);
+    Tensor wp = Tensor::I({}, length);
+    Ort::IoBinding io(gc.session());
+    Ort::MemoryInfo cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::vector<Ort::Value> host;                   // keep host-backed values alive until Run
+    auto bind_host = [&](const char* name, const Tensor& t) {
+      host.push_back(gc.value(t));
+      io.BindInput(name, host.back());
+    };
+    host.reserve(9);
+    bind_host("x", x);
+    bind_host("valid", valid);
+    if (cur < 0) {
+      bind_host("cache_k", K);
+      bind_host("cache_v", V);
+      bind_host("cache_mask", kmask);
+    } else {
+      io.BindInput("cache_k", dev.val[cur][0]);
+      io.BindInput("cache_v", dev.val[cur][1]);
+      io.BindInput("cache_mask", dev.val[cur][2]);
+    }
+    bind_host("write_pos", wp);
+    bind_host("start_pos", next_pos);
+    bind_host("canvas_tokens", tokens);
+    bind_host("draw", draw);
+    const int nxt = cur < 0 ? 0 : 1 - cur;
+    io.BindOutput("h", cpu);
+    io.BindOutput("cache_k_out", dev.val[nxt][0]);
+    io.BindOutput("cache_v_out", dev.val[nxt][1]);
+    io.BindOutput("cache_mask_out", dev.val[nxt][2]);
+    const auto t0 = std::chrono::steady_clock::now();
+    gc.session().Run(Ort::RunOptions{nullptr}, io);
+    io.SynchronizeOutputs();
+    Profile::add("chunk_cached", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    cur = nxt;
+    for (int r = 0; r < R; ++r)
+      for (int t = 0; t < T; ++t) next_pos.i[r] += valid.b[size_t(r) * T + t];
+    length += T;
+    auto outs = io.GetOutputValues();
+    auto shape = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+    Tensor h = Tensor::F(shape);
+    const float* p = outs[0].GetTensorData<float>();
+    std::copy(p, p + h.f.size(), h.f.begin());
+    return h;                                        // h [R, T, D]
+  };
+
   auto chunk = [&](const Tensor& x, const Tensor& valid, const Tensor& tokens, const Tensor& draw) {
+    if (on_device) return chunk_device(x, valid, tokens, draw);
     const int T = static_cast<int>(x.shape[1]);
     auto out = g_["chunk"].run({&x, &valid, &K, &V, &kmask, &next_pos, &tokens, &draw});
     const Tensor &kn = out[1], &vn = out[2];       // [L, R, KV, T, HD]

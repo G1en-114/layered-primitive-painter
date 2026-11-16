@@ -1,11 +1,33 @@
 #include "session.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 
 #include "json.hpp"
 
 namespace lpp {
+
+std::map<std::string, std::pair<double, long>>& Profile::table() {
+  static std::map<std::string, std::pair<double, long>> t;
+  return t;
+}
+void Profile::add(const std::string& name, double seconds) {
+  auto& e = table()[name];
+  e.first += seconds;
+  e.second += 1;
+}
+void Profile::report() {
+  const char* on = std::getenv("LPP_PROFILE");
+  if (!on || std::string(on) != "1") return;
+  double total = 0;
+  for (auto& [n, e] : table()) total += e.first;
+  for (auto& [n, e] : table())
+    std::fprintf(stderr, "  %-14s %8.3f s  %7ld calls  %7.3f ms/call  %5.1f%%\n", n.c_str(), e.first, e.second,
+                 1e3 * e.first / e.second, 100 * e.first / total);
+}
 
 Tensor Tensor::F(std::vector<int64_t> s, float fill) {
   Tensor t;
@@ -35,28 +57,33 @@ int64_t Tensor::numel() const {
 }
 
 Graph::Graph(Ort::Env& env, const std::string& path, const Ort::SessionOptions& so, std::vector<std::string> inputs,
-             std::vector<std::string> outputs)
+             std::vector<std::string> outputs, std::string name)
     : session_(env, path.c_str(), so), in_names_(std::move(inputs)), out_names_(std::move(outputs)),
-      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {}
+      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)), name_(std::move(name)) {}
+
+Ort::Value Graph::value(const Tensor& t) {
+  void* data = nullptr;
+  size_t bytes = 0;
+  switch (t.dtype) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: data = const_cast<float*>(t.f.data()); bytes = t.f.size() * 4; break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: data = const_cast<int64_t*>(t.i.data()); bytes = t.i.size() * 8; break;
+    default: data = const_cast<uint8_t*>(t.b.data()); bytes = t.b.size(); break;
+  }
+  return Ort::Value::CreateTensor(mem_, data, bytes, t.shape.data(), t.shape.size(), t.dtype);
+}
 
 std::vector<Tensor> Graph::run(const std::vector<const Tensor*>& inputs) {
   if (inputs.size() != in_names_.size()) throw std::runtime_error("graph input count mismatch");
   std::vector<Ort::Value> vals;
   std::vector<const char*> in_c, out_c;
   for (size_t k = 0; k < inputs.size(); ++k) {
-    const Tensor* t = inputs[k];
-    void* data = nullptr;
-    size_t bytes = 0;
-    switch (t->dtype) {
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: data = const_cast<float*>(t->f.data()); bytes = t->f.size() * 4; break;
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: data = const_cast<int64_t*>(t->i.data()); bytes = t->i.size() * 8; break;
-      default: data = const_cast<uint8_t*>(t->b.data()); bytes = t->b.size(); break;
-    }
-    vals.push_back(Ort::Value::CreateTensor(mem_, data, bytes, t->shape.data(), t->shape.size(), t->dtype));
+    vals.push_back(value(*inputs[k]));
     in_c.push_back(in_names_[k].c_str());
   }
   for (auto& n : out_names_) out_c.push_back(n.c_str());
+  const auto t0 = std::chrono::steady_clock::now();
   auto outs = session_.Run(Ort::RunOptions{nullptr}, in_c.data(), vals.data(), vals.size(), out_c.data(), out_c.size());
+  Profile::add(name_, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   std::vector<Tensor> res;
   for (auto& o : outs) {
     auto info = o.GetTensorTypeAndShapeInfo();
@@ -68,7 +95,8 @@ std::vector<Tensor> Graph::run(const std::vector<const Tensor*>& inputs) {
   return res;
 }
 
-Graphs::Graphs(const std::string& dir, const std::string& provider) : env_(ORT_LOGGING_LEVEL_WARNING, "lpp") {
+Graphs::Graphs(const std::string& dir, const std::string& provider)
+    : env_(ORT_LOGGING_LEVEL_WARNING, "lpp"), provider_(provider) {
   std::ifstream f(dir + "/manifest.json");
   if (!f) throw std::runtime_error("cannot open " + dir + "/manifest.json");
   const auto m = nlohmann::json::parse(f);
@@ -93,7 +121,7 @@ Graphs::Graphs(const std::string& dir, const std::string& provider) : env_(ORT_L
   for (auto& [name, g] : m["graphs"].items())
     graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(), so,
                                             g["inputs"].get<std::vector<std::string>>(),
-                                            g["outputs"].get<std::vector<std::string>>());
+                                            g["outputs"].get<std::vector<std::string>>(), name);
 }
 
 }  // namespace lpp

@@ -79,3 +79,27 @@ def test_exportable_copy_is_numerically_identical(model):
     a = torch.zeros(4, len(model.attr_names), dtype=torch.long, device=DEV)
     for x, y in zip(DecodeHeads(model)(h, e, a), DecodeHeads(m2)(h, e, a)):
         assert torch.allclose(x, y, atol=1e-6)
+
+
+@torch.no_grad()
+def test_chunk_cached_equals_chunk_plus_write(model):
+    from lpp.export import ChunkCached
+    m, B, T, P = model, 3, 2, 10
+    c = m.cfg
+    torch.manual_seed(3)
+    shape = (c.n_layers, B, c.n_kv_heads, P, c.d_model // c.n_heads)
+    ck, cv = torch.randn(shape, device=DEV), torch.randn(shape, device=DEV)
+    cm = torch.zeros(B, P, dtype=torch.bool, device=DEV)
+    cm[:, :4] = True
+    x = torch.randn(B, T, c.d_model, device=DEV)
+    valid = torch.tensor([[True, True], [True, False], [True, True]], device=DEV)
+    start = torch.tensor([4, 4, 3], device=DEV)
+    tok = torch.randn(B, m.canvas_enc.n_tokens, c.d_model, device=DEV)
+    draw = torch.ones(B, T, dtype=torch.bool, device=DEV)
+    wp = torch.tensor(4, device=DEV)
+    h, k2, v2, m2 = ChunkCached(m)(x, valid, ck, cv, cm, wp, start, tok, draw)
+    h_ref, kn, vn = Chunk(m)(x, valid, ck, cv, cm, start, tok, draw)
+    assert torch.allclose(h, h_ref, atol=1e-6)
+    ck_ref, cv_ref, cm_ref = ck.clone(), cv.clone(), cm.clone()
+    ck_ref[:, :, :, 4:6], cv_ref[:, :, :, 4:6], cm_ref[:, 4:6] = kn, vn, valid
+    assert torch.equal(k2, ck_ref) and torch.equal(v2, cv_ref) and torch.equal(m2, cm_ref)
