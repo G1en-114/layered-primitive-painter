@@ -99,6 +99,9 @@ def main() -> None:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-grid", type=int, default=16, help="samples (with their real images) in the grid")
+    ap.add_argument("--judge-encoder", type=Path, default=None,
+                    help="second, independent Chinese-CLIP (e.g. ViT-L/14) to re-score: guards against reward hacking "
+                         "when the RL reward uses the conditioning encoder")
     ap.add_argument("--image-tokens", type=Path, default=None,
                     help="image-conditioned models: condition each sample on its validation image's CLIP tokens")
     ap.add_argument("--no-text", action="store_true", help="with --image-tokens: image only, no prompt")
@@ -186,6 +189,18 @@ def main() -> None:
         "real_reference": {"clip_score": round(100 * float((ri * t).sum(1).mean()), 3), **retrieval(ri, t),
                            "real_split_fd": round(frechet(r_np[:half], r_np[half:]), 4)},
     }
+    if args.judge_encoder is not None:
+        del clip
+        torch.cuda.empty_cache()
+        judge = ClipScorer(args.judge_encoder, dev)
+        jt, jg, jr = judge.texts(prompts), judge.images(gen), judge.images(real)
+        jg_np, jr_np = jg.cpu().double().numpy(), jr.cpu().double().numpy()
+        result["judge"] = {"encoder": str(args.judge_encoder),
+                           "generated": {"clip_score": round(100 * float((jg * jt).sum(1).mean()), 3),
+                                         **retrieval(jg, jt), "clip_fd": round(frechet(jg_np, jr_np), 4)},
+                           "real_reference": {"clip_score": round(100 * float((jr * jt).sum(1).mean()), 3),
+                                              **retrieval(jr, jt),
+                                              "real_split_fd": round(frechet(jr_np[:half], jr_np[half:]), 4)}}
     if store is not None:      # image -> painting: how faithful is the result to its input image
         g_img, r_img = np.stack(gen).astype(np.float64), np.stack(real).astype(np.float64)
         mse = ((g_img - r_img) ** 2).mean((1, 2, 3))
