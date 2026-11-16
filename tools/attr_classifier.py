@@ -25,11 +25,52 @@ MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
+class _Block(torch.nn.Module):
+    def __init__(self, cin: int, cout: int, stride: int):
+        super().__init__()
+        nn = torch.nn
+        self.conv1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(cout)
+        self.downsample = (nn.Sequential(nn.Conv2d(cin, cout, 1, stride, bias=False), nn.BatchNorm2d(cout))
+                           if stride != 1 or cin != cout else None)
+
+    def forward(self, x):
+        y = F.relu(self.bn1(self.conv1(x)))
+        y = self.bn2(self.conv2(y))
+        return F.relu(y + (x if self.downsample is None else self.downsample(x)))
+
+
+class ResNet18(torch.nn.Module):
+    """torchvision's resnet18 layout with the same parameter names, in plain PyTorch:
+    the DCU's DTK PyTorch ships without torchvision, inference must not need it."""
+
+    def __init__(self, n: int):
+        super().__init__()
+        nn = torch.nn
+        self.conv1 = nn.Conv2d(3, 64, 7, 2, 3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        chans, cin = (64, 128, 256, 512), 64
+        for i, c in enumerate(chans):
+            setattr(self, f"layer{i + 1}", nn.Sequential(_Block(cin, c, 1 if i == 0 else 2), _Block(c, c, 1)))
+            cin = c
+        self.fc = nn.Linear(512, n)
+
+    def forward(self, x):
+        x = F.max_pool2d(F.relu(self.bn1(self.conv1(x))), 3, 2, 1)
+        x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
+        return self.fc(x.mean((2, 3)))
+
+
 def build_model(n: int, pretrained: bool = True) -> torch.nn.Module:
-    import torchvision
-    w = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-    m = torchvision.models.resnet18(weights=w)
-    m.fc = torch.nn.Linear(m.fc.in_features, n)
+    m = ResNet18(n)
+    if pretrained:                              # training only: ImageNet weights via torchvision
+        import torchvision
+        tv = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+        state = {k: v for k, v in tv.state_dict().items() if not k.startswith("fc.")}
+        missing, unexpected = m.load_state_dict(state, strict=False)
+        assert not unexpected and set(missing) == {"fc.weight", "fc.bias"}, (missing, unexpected)
     return m
 
 
