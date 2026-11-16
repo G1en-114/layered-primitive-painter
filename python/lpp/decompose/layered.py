@@ -40,6 +40,41 @@ from .fill import dilate, morton_code, push_pull_fill
 PARAM_NAMES = ("xy", "log_sigma", "theta", "log2_beta", "rgb", "alpha")
 
 
+def _fit_loss(P, T, Pb, Tb, base, img, pseudo, region, near, far, behind, region_n, near_n, far_n, behind_n,
+              w_near: float, w_far: float, w_behind: float, w_opaque: float):
+    """Composite the layer group (P, T) over the layers below (Pb, Tb) and the canvas base, and score
+    it. Pure image-sized elementwise work + reductions: one function so torch.compile can fuse it
+    (eagerly it is ~20 separate full-image kernels per optimisation step)."""
+    comp = P + T * Pb + (T * Tb) * base
+    cover = 1 - T
+    loss = (
+        (((comp - img) ** 2).sum(1, keepdim=True) * region).sum((1, 2, 3)) / region_n
+        + w_near * (((comp - pseudo) ** 2).sum(1, keepdim=True) * near).sum((1, 2, 3)) / near_n
+        + w_far * (cover * far).sum((1, 2, 3)) / far_n
+        + w_behind * (cover * behind).sum((1, 2, 3)) / behind_n
+        + w_opaque * T.mean((1, 2, 3))
+    )
+    return loss.sum()
+
+
+_compiled_fit_loss = None
+
+
+def fit_loss_fn():
+    """LPP_DECOMP_COMPILE=1 (default when Triton is usable): the fused, compiled loss; else eager."""
+    global _compiled_fit_loss
+    import os
+    flag = os.environ.get("LPP_DECOMP_COMPILE")
+    if flag is None:
+        from ..render.dispatch import triton_available
+        flag = "1" if triton_available() else "0"
+    if flag != "1":
+        return _fit_loss
+    if _compiled_fit_loss is None:
+        _compiled_fit_loss = torch.compile(_fit_loss, dynamic=False)
+    return _compiled_fit_loss
+
+
 @dataclass
 class DecomposeConfig:
     size: int | None = None                       # working resolution; None = canvas size
@@ -224,6 +259,11 @@ class LayeredDecomposer:
             P, T = render_group(prims_, S, proto)
             return flatten_on_base(over(before, (P, T)), proto), T
 
+        loss_fn = fit_loss_fn()
+        base = torch.tensor(proto.base_color, device=dev, dtype=img.dtype).view(1, 3, 1, 1)
+        region_f, near_f, far_f, behind_f = (m.float() for m in (region, near, far, behind))
+        region_n, near_n, far_n, behind_n = (n.float() for n in (region_n, near_n, far_n, behind_n))
+
         for r, sigma0 in enumerate(cfg.round_sigmas):
             n_new = n_per_round[r] * (~done)
             n_max = int(n_new.max())
@@ -273,21 +313,18 @@ class LayeredDecomposer:
             # --- fit every primitive of this layer
             leaves = {n: t.detach().requires_grad_(True) for n, t in p.items()}
             leaves["box"] = box
-            opt = torch.optim.Adam([{"params": [leaves[n]], "lr": cfg.lr[n]} for n in PARAM_NAMES])
+            # fused Adam: one kernel per parameter group instead of a dozen elementwise ops each
+            opt = torch.optim.Adam([{"params": [leaves[n]], "lr": cfg.lr[n]} for n in PARAM_NAMES],
+                                   fused=dev.type == "cuda")
             snap_from = int(cfg.steps_per_round * (1 - cfg.snap_frac))
             for step in range(cfg.steps_per_round):
                 prims = self._to_prims(leaves, active)
                 if cfg.quantize and step >= snap_from:
                     prims = self._snapped(prims, active, straight_through=True)
-                comp, T = composite(prims)
-                cover = 1 - T
-                loss = (
-                    (((comp - img) ** 2).sum(1, keepdim=True) * region).sum((1, 2, 3)) / region_n
-                    + cfg.w_front_near * (((comp - pseudo) ** 2).sum(1, keepdim=True) * near).sum((1, 2, 3)) / near_n
-                    + cfg.w_front_far * (cover * far).sum((1, 2, 3)) / far_n
-                    + cfg.w_behind * (cover * behind).sum((1, 2, 3)) / behind_n
-                    + (cfg.w_base_opaque * T.mean((1, 2, 3)) if opaque else 0.0)
-                ).sum()
+                P, T = render_group(prims, S, proto)
+                loss = loss_fn(P, T, before[0], before[1], base, img, pseudo, region_f, near_f, far_f, behind_f,
+                               region_n, near_n, far_n, behind_n, cfg.w_front_near, cfg.w_front_far, cfg.w_behind,
+                               cfg.w_base_opaque if opaque else 0.0)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
