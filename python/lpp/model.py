@@ -383,23 +383,7 @@ class Painter(nn.Module):
     # ---- training ---------------------------------------------------------
     def forward(self, batch: dict) -> dict:
         """Teacher-forced losses. batch from data.collate()."""
-        x = self.embed_records(batch["kind"], batch["event"], batch["layer"], batch["attrs"])
-        valid = batch["valid"]
-        Lt = 0
-        if batch.get("text") is not None and batch["text"].shape[1] > 0:
-            Lt = batch["text"].shape[1]
-            x = torch.cat([self.embed_text(batch["text"]), x], 1)
-            valid = torch.cat([batch["text_valid"], valid], 1)
-        canvas_ctx = None
-        if self.cfg.canvas and batch.get("canvas") is not None:
-            B, S = batch["canvas"].shape[:2]
-            tokens = self.canvas_enc(batch["canvas"].flatten(0, 1)).view(B, S, -1, self.cfg.d_model)
-            seg = batch["seg"]
-            if Lt:
-                seg = torch.cat([torch.full((B, Lt), -1, dtype=seg.dtype, device=seg.device), seg], 1)
-            canvas_ctx = ("segments", tokens, seg)
-        h = self.backbone(x, valid, canvas_ctx=canvas_ctx)[:, Lt:]
-
+        h = self._hidden(batch)
         tgt_event, tgt_attrs = batch["tgt_event"], batch["tgt_attrs"]
         sel = tgt_event >= 0
         hs, ev, at = h[sel], tgt_event[sel], tgt_attrs[sel]
@@ -417,6 +401,51 @@ class Painter(nn.Module):
                                        periodic=isinstance(attr, PeriodicAttr))
         losses["loss"] = sum(losses.values())
         return losses
+
+    def record_logprobs(self, batch: dict, event_allowed: torch.Tensor | None = None) -> torch.Tensor:
+        """Exact log-probability of each target record under the model: [B, T] float32.
+
+        log p(event) (+ sum of log p(attribute) for primitives) at every position with a
+        target, 0 elsewhere. event_allowed [B, T, n_events] masks event logits to the
+        grammar's choices, as the sampler does, so the values are the true sampling
+        log-probabilities at temperature 1 without truncation or guidance (RL rollouts).
+        """
+        h = self._hidden(batch)
+        tgt_event, tgt_attrs = batch["tgt_event"], batch["tgt_attrs"]
+        sel = tgt_event >= 0
+        hs, ev, at = h[sel], tgt_event[sel], tgt_attrs[sel]
+        out = self.decoder(hs, ev, at)
+        ev_logits = self.heads["event"](out[:, 0]).float()
+        if event_allowed is not None:
+            ev_logits = ev_logits.masked_fill(~event_allowed[sel], float("-inf"))
+        lp = F.log_softmax(ev_logits, -1).gather(1, ev[:, None])[:, 0]
+        prim = ev == self.proto.event_id("PRIMITIVE")
+        attr_lp = torch.zeros_like(lp)
+        for i, name in enumerate(self.attr_names):
+            logits = self.heads[name](out[prim, 1 + i]).float()
+            attr_lp[prim] += F.log_softmax(logits, -1).gather(1, at[prim, i][:, None])[:, 0]
+        res = torch.zeros(tgt_event.shape, dtype=torch.float32, device=h.device)
+        res[sel] = lp + attr_lp
+        return res
+
+    def _hidden(self, batch: dict) -> torch.Tensor:
+        """Backbone states at the record positions [B, T, d] (text prefix and canvas included)."""
+        x = self.embed_records(batch["kind"], batch["event"], batch["layer"], batch["attrs"])
+        valid = batch["valid"]
+        Lt = 0
+        if batch.get("text") is not None and batch["text"].shape[1] > 0:
+            Lt = batch["text"].shape[1]
+            x = torch.cat([self.embed_text(batch["text"]), x], 1)
+            valid = torch.cat([batch["text_valid"], valid], 1)
+        canvas_ctx = None
+        if self.cfg.canvas and batch.get("canvas") is not None:
+            B, S = batch["canvas"].shape[:2]
+            tokens = self.canvas_enc(batch["canvas"].flatten(0, 1)).view(B, S, -1, self.cfg.d_model)
+            seg = batch["seg"]
+            if Lt:
+                seg = torch.cat([torch.full((B, Lt), -1, dtype=seg.dtype, device=seg.device), seg], 1)
+            canvas_ctx = ("segments", tokens, seg)
+        return self.backbone(x, valid, canvas_ctx=canvas_ctx)[:, Lt:]
 
 
 def soft_ce(logits, target, sigma: float, periodic: bool = False):

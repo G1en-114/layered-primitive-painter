@@ -116,47 +116,55 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
 
     out = {k: [v[:, 0]] for k, v in (("kind", rec_kind), ("event", rec_event), ("layer", rec_layer),
                                       ("attrs", rec_attrs))}
-    done = torch.zeros(B, dtype=torch.bool, device=dev)
+    done_cpu = [False] * B
+    n_events, eos = len(proto.events), proto.event_id("EOS")
     for step in range(1, max_records):
         # event, masked by each sequence's grammar
         dh = model.decoder(h, torch.zeros(R, dtype=torch.long, device=dev),
                            torch.zeros(R, A, dtype=torch.long, device=dev), steps=1)
         logits = guide(model.heads["event"](dh[:, 0]))
-        allowed = torch.stack([g.allowed_mask(dev) if not g.done else
-                               torch.nn.functional.one_hot(torch.tensor(proto.event_id("EOS")),
-                                                           len(proto.events)).bool().to(dev)
-                               for g in grammars])
+        # grammar masks are built on the CPU and copied once: per-sample GPU masks cost a
+        # host<->device round trip each (38% of decoding time at batch 8)
+        allowed_cpu = torch.zeros(B, n_events, dtype=torch.bool)
         if step == max_records - 1:      # out of room: force the end (even if constraints are unmet)
-            allowed = (torch.arange(len(proto.events), device=dev) == proto.event_id("EOS")).expand_as(allowed)
+            allowed_cpu[:, eos] = True
+        else:
+            for b, g in enumerate(grammars):
+                allowed_cpu[b, [eos] if g.done else g.allowed_events()] = True
+        allowed = allowed_cpu.to(dev, non_blocking=True)
         event = _sample(logits.masked_fill(~allowed, float("-inf")), cfg, rand(step, "event"), "event")
+        ev = event.tolist()              # the one device->host sync for this record
 
         attrs = torch.full((B, A), NO_ATTR, dtype=torch.long, device=dev)
         is_prim = event == prim_ev
-        if is_prim.any():
+        if prim_ev in ev:
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
                 attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name), name)
             attrs[~is_prim] = NO_ATTR
 
-        layer = torch.empty(B, dtype=torch.long, device=dev)
+        layer_cpu = []
         for b, g in enumerate(grammars):
             if g.done:
-                layer[b] = -1
+                layer_cpu.append(-1)
                 continue
-            g.step(int(event[b]))
-            layer[b] = g.current if not g.done else -1
+            g.step(ev[b])
+            layer_cpu.append(g.current if not g.done else -1)
+        layer = torch.tensor(layer_cpu, device=dev)
+        kind_cpu = [KIND_PRIMITIVE if e == prim_ev else KIND_CONTROL for e in ev]
         kind = torch.where(is_prim, KIND_PRIMITIVE, KIND_CONTROL)
 
-        live = ~done
+        live_cpu = [not d for d in done_cpu]
+        live = torch.tensor(live_cpu, device=dev)
         for k, v in (("kind", kind), ("event", event), ("layer", layer), ("attrs", attrs)):
             out[k].append(v)
-        done = done | (event == proto.event_id("EOS"))
-        if bool(done.all()):
+        done_cpu = [d or e == eos for d, e in zip(done_cpu, ev)]
+        if all(done_cpu):
             break
         x = model.embed_records(rows(kind)[:, None], rows(event)[:, None], rows(layer)[:, None],
                                 rows(attrs)[:, None])
         if tracker is not None:
-            tracker.update(kind, attrs, layer, live)
+            tracker.update(kind, attrs, layer, live, kind_cpu=kind_cpu, layer_cpu=layer_cpu, live_cpu=live_cpu)
             ctx = ("current", rows(tracker.tokens), torch.ones(R, 1, dtype=torch.bool, device=dev))
         h = model.backbone(x, rows(live)[:, None], cache, canvas_ctx=ctx)[:, -1]
 

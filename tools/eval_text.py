@@ -30,6 +30,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
+from lpp.clip_score import ClipScorer  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
 from lpp.metrics import orphan_stats  # noqa: E402
 from lpp.model import ModelConfig, Painter  # noqa: E402
@@ -39,9 +40,6 @@ from lpp.render.reference import flatten_on_base  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
 from lpp.sequence import paint_order  # noqa: E402
 from lpp.text import TextEncoder  # noqa: E402
-
-CLIP_CONTEXT = 52   # Chinese-CLIP was trained with 52 text tokens; score with the same context
-
 
 def frechet(a: np.ndarray, b: np.ndarray) -> float:
     """Frechet distance between Gaussians fitted to two feature sets (float64, eigen sqrtm)."""
@@ -53,36 +51,6 @@ def frechet(a: np.ndarray, b: np.ndarray) -> float:
     m = sa @ cb @ sa
     tr_sqrt = np.sqrt(np.clip(np.linalg.eigvalsh((m + m.T) / 2), 0, None)).sum()
     return float(((mu_a - mu_b) ** 2).sum() + np.trace(ca) + np.trace(cb) - 2 * tr_sqrt)
-
-
-class ClipScorer:
-    def __init__(self, model_dir: Path, device: str):
-        from transformers import BertTokenizer, ChineseCLIPImageProcessor, ChineseCLIPModel
-        self.model = ChineseCLIPModel.from_pretrained(str(model_dir)).to(device).eval()
-        self.tok = BertTokenizer.from_pretrained(str(model_dir))
-        self.proc = ChineseCLIPImageProcessor.from_pretrained(str(model_dir))
-        self.device = device
-
-    @torch.no_grad()
-    def images(self, arrays: list[np.ndarray], batch: int = 64) -> torch.Tensor:
-        out = []
-        for i in range(0, len(arrays), batch):
-            px = self.proc(images=[Image.fromarray(a) for a in arrays[i:i + batch]], return_tensors="pt")
-            vis = self.model.vision_model(pixel_values=px["pixel_values"].to(self.device))
-            out.append(self.model.visual_projection(vis.pooler_output).float())
-        return torch.nn.functional.normalize(torch.cat(out), dim=-1)
-
-    @torch.no_grad()
-    def texts(self, captions: list[str], batch: int = 64) -> torch.Tensor:
-        # Explicit [CLS] pooling + projection, as in Chinese-CLIP: some transformers releases
-        # build the text tower without a pooler, and get_text_features then fails on None
-        out = []
-        for i in range(0, len(captions), batch):
-            enc = self.tok(captions[i:i + batch], padding=True, truncation=True, max_length=CLIP_CONTEXT,
-                           return_tensors="pt").to(self.device)
-            hidden = self.model.text_model(**enc).last_hidden_state
-            out.append(self.model.text_projection(hidden[:, 0]).float())
-        return torch.nn.functional.normalize(torch.cat(out), dim=-1)
 
 
 def retrieval(img: torch.Tensor, txt: torch.Tensor) -> dict[str, float]:

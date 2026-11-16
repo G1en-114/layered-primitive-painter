@@ -162,14 +162,21 @@ class CanvasTracker:
         self.history = [[c] for c in canvas] if record else None
 
     @torch.no_grad()
-    def update(self, kind: torch.Tensor, attrs: torch.Tensor, layer: torch.Tensor, live: torch.Tensor) -> None:
+    def update(self, kind: torch.Tensor, attrs: torch.Tensor, layer: torch.Tensor, live: torch.Tensor,
+               kind_cpu: list[int] | None = None, layer_cpu: list[int] | None = None,
+               live_cpu: list[bool] | None = None) -> None:
+        """The *_cpu lists, when given, are host copies of kind/layer/live (avoids a device sync
+        per sample); the tensors stay the source of truth for attrs."""
+        kind_cpu = kind.tolist() if kind_cpu is None else kind_cpu
+        layer_cpu = layer.tolist() if layer_cpu is None else layer_cpu
+        live_cpu = live.tolist() if live_cpu is None else live_cpu
         hit = []
-        for b in range(kind.shape[0]):
-            if not bool(live[b]):
+        for b in range(len(kind_cpu)):
+            if not live_cpu[b]:
                 continue
-            kb = int(kind[b])
+            kb = kind_cpu[b]
             if kb == KIND_PRIMITIVE:
-                self.pending[b].append((attrs[b], int(layer[b])))
+                self.pending[b].append((attrs[b], layer_cpu[b]))
                 self.since[b] += 1
             if is_checkpoint(kb, self.since[b], self.k):
                 hit.append(b)
@@ -181,10 +188,13 @@ class CanvasTracker:
             A = attrs.shape[1]
             dev = attrs.device
             tok = torch.zeros(len(hit), n, A, dtype=torch.long, device=dev)
-            lay = torch.full((len(hit), n), -1, dtype=torch.long, device=dev)
-            for i, b in enumerate(hit):
-                for j, (a, layer_id) in enumerate(self.pending[b]):
-                    tok[i, j], lay[i, j] = a.clamp(min=0), layer_id
+            lay_cpu = torch.full((len(hit), n), -1, dtype=torch.long)
+            for i, b in enumerate(hit):               # one stack per sample, not one write per record
+                if self.pending[b]:
+                    m = len(self.pending[b])
+                    tok[i, :m] = torch.stack([a for a, _ in self.pending[b]]).clamp(min=0)
+                    lay_cpu[i, :m] = torch.tensor([layer_id for _, layer_id in self.pending[b]])
+            lay = lay_cpu.to(dev, non_blocking=True)
             prims = self.codec.decode({nm: tok[..., i] for i, nm in enumerate(self.proto.attr_names)})
             prims = prims.with_alpha(prims.alpha * (lay >= 0))
             idx = torch.tensor(hit, device=dev)
