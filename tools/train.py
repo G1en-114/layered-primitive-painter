@@ -145,6 +145,10 @@ def main() -> None:
     ap.add_argument("--target-images", type=Path, default=None,
                     help="pixel target store (tools/build_target_store.py): enables target-image cross-attention")
     ap.add_argument("--p-target", type=float, default=0.5, help="share of sequences given their pixel target")
+    ap.add_argument("--target-gate-init", type=float, default=0.5,
+                    help="raw value of the target cross-attention gates at init (0 = exact no-op, but it stalls)")
+    ap.add_argument("--new-lr-mult", type=float, default=1.0,
+                    help="learning-rate multiplier for tensors missing from --init-weights (new modules)")
     ap.add_argument("--init-weights", type=Path, default=None,
                     help="start a NEW run from these weights (fresh optimizer and step; missing modules such "
                          "as canvas layers start at their init). Not the same as --resume.")
@@ -217,27 +221,37 @@ def main() -> None:
         # so a larger context still loads checkpoints trained without images)
         cfg.image, cfg.max_positions = True, max(cfg.max_positions, proto.worst_case_positions() + n_img)
     if targets is not None:
-        cfg.target = True
+        cfg.target, cfg.target_gate_init = True, args.target_gate_init
         cfg.target_size = int(json.loads((args.target_images / "meta.json").read_text())["size"])
     if encoder is not None and cfg.text_dim != encoder.dim:
         raise SystemExit(f"model text_dim {cfg.text_dim} != text encoder width {encoder.dim}")
     model = Painter(cfg, proto, codec).cuda()
-    decay = [p for n, p in model.named_parameters() if p.dim() >= 2 and "emb" not in n]
-    no_decay = [p for n, p in model.named_parameters() if not (p.dim() >= 2 and "emb" not in n)]
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd},
-                             {"params": no_decay, "weight_decay": 0.0}],
-                            lr=args.lr, betas=(0.9, 0.95), fused=True)
-    if args.init_weights and not (args.resume and (args.out / "last.pt").exists()):
+    step = 0
+    ckpt = args.out / "last.pt"
+    state = torch.load(ckpt, map_location="cuda", weights_only=False) if args.resume and ckpt.exists() else None
+    new_params: set[str] = set(state.get("new_params", [])) if state else set()
+    if args.init_weights and state is None:
         src = torch.load(args.init_weights, map_location="cuda", weights_only=False)
         missing, unexpected = model.load_state_dict(src["model"], strict=False)
         if unexpected:
             raise SystemExit(f"--init-weights has parameters this model lacks: {unexpected[:5]}")
+        new_params = set(missing)
         print(f"initialised from {args.init_weights} (step {src.get('step')}); "
               f"{len(missing)} new tensors start fresh: {sorted({k.split('.')[0] for k in missing})}")
-    step = 0
-    ckpt = args.out / "last.pt"
-    if args.resume and ckpt.exists():
-        state = torch.load(ckpt, map_location="cuda", weights_only=False)
+    # parameter groups: weight decay or not, and new (fresh) tensors at lr * --new-lr-mult, so modules
+    # added to a trained model are not starved by the small fine-tuning learning rate
+    groups = []
+    for is_new in (False, True):
+        for wd in (True, False):
+            ps = [p for n, p in model.named_parameters()
+                  if (n in new_params) == is_new and (p.dim() >= 2 and "emb" not in n) == wd]
+            if ps:
+                groups.append({"params": ps, "weight_decay": args.wd if wd else 0.0,
+                               "lr_mult": args.new_lr_mult if is_new else 1.0})
+    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
+    if new_params:
+        print(f"{len(new_params)} new tensors train at lr x {args.new_lr_mult}")
+    if state is not None:
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         step = state["step"]
@@ -251,7 +265,7 @@ def main() -> None:
     while step < args.steps:
         model.train()
         for g in opt.param_groups:
-            g["lr"] = lr_at(step, args)
+            g["lr"] = lr_at(step, args) * g.get("lr_mult", 1.0)
         totals = {}
         for _ in range(args.accum):
             batch = to_gpu(next(train_it), encoder, codec, cfg)
@@ -296,7 +310,7 @@ def main() -> None:
 
         if step % args.save_every == 0 or step == args.steps:
             tmp = ckpt.with_suffix(".tmp")
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "new_params": sorted(new_params),
                         "config": cfg.to_dict(), "protocol": proto.raw,
                         "args": vars(args) | {"out": str(args.out)}}, tmp)
             tmp.replace(ckpt)

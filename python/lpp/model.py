@@ -57,6 +57,10 @@ class ModelConfig:
     # pixel-level target image read by cross-attention (see Painter.target_enc)
     target: bool = False
     target_size: int = 128
+    # raw (pre-tanh) value of the target cross-attention gates at init. 0 makes the module an exact
+    # no-op but stalls: encoder/cross gradients scale with tanh(gate) and the gate's own gradient
+    # with an untrained cross output (measured: tanh(gate) < 1e-3 after 4000 steps)
+    target_gate_init: float = 0.5
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -326,6 +330,10 @@ class Painter(nn.Module):
         self.heads = nn.ModuleDict({"event": nn.Linear(dd, self.n_events)} |
                                    {n: nn.Linear(dd, self.vocab[n]) for n in self.attr_names})
         self.apply(self._init)
+        if cfg.target:
+            with torch.no_grad():
+                for c in self.target_cross.values():
+                    c.gate.fill_(cfg.target_gate_init)
 
     @staticmethod
     def _init(m):

@@ -64,7 +64,7 @@ def test_generate_with_image_prefix_runs_and_guards():
 def _target_model(codec):
     torch.manual_seed(0)
     cfg = ModelConfig.tiny()
-    cfg.target, cfg.target_size = True, 32
+    cfg.target, cfg.target_size, cfg.target_gate_init = True, 32, 0.0   # exact no-op at init for this test
     cfg.canvas_every = 1                       # tiny has 2 layers: cross-attention at every layer
     m = Painter(cfg, codec.proto, codec).to(DEV)
     assert len(m.target_cross) == cfg.n_layers
