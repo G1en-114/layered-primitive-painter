@@ -61,6 +61,12 @@ class ModelConfig:
     # no-op but stalls: encoder/cross gradients scale with tanh(gate) and the gate's own gradient
     # with an untrained cross output (measured: tanh(gate) < 1e-3 after 4000 steps)
     target_gate_init: float = 0.5
+    # ControlNet-style alternative: gates fixed open (tanh(3) ~ 0.995, not trained) and the cross
+    # output projection zero-initialised. Exact no-op at init, yet the projection's gradient
+    # (upstream grad x attention output) is non-zero from step one, so nothing can stall, and
+    # there is no gate the optimiser can shut. Measured with trainable gates: init 0 stalls,
+    # init 0.5 is closed again (tanh < 0.03) within 1000 steps.
+    target_zero_out: bool = True
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -333,7 +339,12 @@ class Painter(nn.Module):
         if cfg.target:
             with torch.no_grad():
                 for c in self.target_cross.values():
-                    c.gate.fill_(cfg.target_gate_init)
+                    if cfg.target_zero_out:
+                        c.gate.fill_(3.0)
+                        c.gate.requires_grad_(False)
+                        c.o.weight.zero_()
+                    else:
+                        c.gate.fill_(cfg.target_gate_init)
 
     @staticmethod
     def _init(m):

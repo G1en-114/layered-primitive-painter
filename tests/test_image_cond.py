@@ -64,7 +64,7 @@ def test_generate_with_image_prefix_runs_and_guards():
 def _target_model(codec):
     torch.manual_seed(0)
     cfg = ModelConfig.tiny()
-    cfg.target, cfg.target_size, cfg.target_gate_init = True, 32, 0.0   # exact no-op at init for this test
+    cfg.target, cfg.target_size = True, 32                  # default zero-init output projection: no-op at init
     cfg.canvas_every = 1                       # tiny has 2 layers: cross-attention at every layer
     m = Painter(cfg, codec.proto, codec).to(DEV)
     assert len(m.target_cross) == cfg.n_layers
@@ -88,9 +88,9 @@ def test_target_cross_starts_as_noop_then_conditions_and_trains():
     b = {k: v.to(DEV) for k, v in collate([(seq, None, None, tg[0]), (seq, None, None, tg[1])]).items()}
     plain = {k: v for k, v in b.items() if not k.startswith("target")}
     with torch.no_grad():
-        assert torch.allclose(m.record_logprobs(b), m.record_logprobs(plain), atol=1e-6)   # gates at 0
+        assert torch.allclose(m.record_logprobs(b), m.record_logprobs(plain), atol=1e-6)   # zero output proj
         for c in m.target_cross.values():
-            c.gate.fill_(0.5)
+            c.o.weight.normal_(0, 0.02)
         lp = m.record_logprobs(b)
     assert (lp[0] - lp[1]).abs().max() > 1e-4                       # same records, different targets
     m(b)["loss"].backward()
@@ -103,3 +103,15 @@ def test_generate_with_target_runs():
     seqs = generate(m, batch=2, cfg=SampleConfig(max_records=20), target=torch.rand(2, 3, 32, 32, device=DEV),
                     generator=torch.Generator(device=DEV).manual_seed(0), codec=codec)
     assert len(seqs) == 2
+
+
+def test_zero_out_projection_gets_gradient_at_init():
+    """The ControlNet-style init must not stall: the zero output projection receives gradient."""
+    codec = Codec.load(device=DEV)
+    m = _target_model(codec)
+    assert all(not c.gate.requires_grad for c in m.target_cross.values())
+    seq = build(*fake_decomposition(2))
+    t = np.random.default_rng(1).integers(0, 255, (32, 32, 3), dtype=np.uint8)
+    b = {k: v.to(DEV) for k, v in collate([(seq, None, None, t)]).items()}
+    m(b)["loss"].backward()
+    assert all(c.o.weight.grad is not None and c.o.weight.grad.abs().sum() > 0 for c in m.target_cross.values())
