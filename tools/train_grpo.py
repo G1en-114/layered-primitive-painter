@@ -34,21 +34,23 @@ from lpp.model import ModelConfig, Painter  # noqa: E402
 from lpp.protocol import _parse  # noqa: E402
 from lpp.rl import RewardConfig, group_advantages, grpo_loss, render, rewards, rollout_batch  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
-from lpp.text import TextEncoder  # noqa: E402
+from lpp.text import TextEncoder, with_domain  # noqa: E402
 from train import render_samples, to_gpu  # noqa: E402
 
 REQUIRE = (0, 2)       # background and skin before EOS, in rollouts and in the replayed grammar
 
 
 def prompt_pool(captions: Path, split_manifest: Path) -> list[tuple[str, int]]:
-    """(caption, source image id) for every long/short caption of a training-split image."""
+    """(caption, source image id) for every long/short caption of a training-split image.
+
+    Captions with a "domain" field (v3: 真人照片 / 动漫) get the same prefix as in supervised training."""
     splits = load_split_manifest(split_manifest)
     pool = []
     for line in captions.read_text(encoding="utf-8").splitlines():
         if line.strip():
             r = json.loads(line)
             if splits.get(int(r["id"])) == "train":
-                pool += [(c, int(r["id"])) for c in (r.get("long"), r.get("short")) if c]
+                pool += [(with_domain(c, r.get("domain")), int(r["id"])) for c in (r.get("long"), r.get("short")) if c]
     return pool
 
 
@@ -85,6 +87,8 @@ def main() -> None:
     ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for the periodic sample grid only")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--keep-snapshots", action="store_true",
+                    help="also write weights-only model_stepNNN.pt at every save (for evaluation off the run)")
     ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto")
     args = ap.parse_args()
     if args.group < 2:
@@ -213,6 +217,11 @@ def main() -> None:
                         "config": cfg.to_dict(), "protocol": proto.raw, "rng": rng.getstate(),
                         "args": vars(args) | {"out": str(args.out), "init": str(args.init)}}, tmp)
             tmp.replace(ckpt)
+            if args.keep_snapshots:
+                snap = args.out / f"model_step{step:03d}.pt"
+                torch.save({"model": policy.state_dict(), "step": step, "config": cfg.to_dict(),
+                            "protocol": proto.raw}, snap.with_suffix(".tmp"))
+                snap.with_suffix(".tmp").replace(snap)
 
 
 if __name__ == "__main__":
