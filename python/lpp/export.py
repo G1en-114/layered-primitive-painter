@@ -194,6 +194,50 @@ class ChunkStep(nn.Module):
         return h, ck, cv, cm
 
 
+class ChunkStepV2(nn.Module):
+    """One-step backbone rewritten for few kernels (CUDA Graph target), same function as ChunkStep:
+    - write first, then attend: each layer's new k/v goes into its cache slot with a one-hot select and
+      attention runs over the whole updated cache, so there is no per-layer Concat and the updated
+      caches are the outputs. The new slot is always attended (the original `eye`), while the stored
+      mask records `valid`.
+    - T = 1: [B,1,H,hd] -> [B,H,1,hd] is a pure view, so no Transpose kernels around RoPE / attention.
+    - RoPE and attention as single fused nodes (export with opset 23 + com.microsoft)."""
+
+    def __init__(self, painter: Painter):
+        super().__init__()
+        self.p = painter
+
+    def forward(self, x, valid, cache_k, cache_v, cache_mask, write_pos, start_pos, canvas_tokens, draw):
+        p = self.p
+        B = x.shape[0]
+        pos = start_pos[:, None]                                                       # T = 1
+        hot = torch.arange(cache_mask.shape[1], device=x.device) == write_pos          # [Tmax]
+        att_mask = (cache_mask | hot[None, :])[:, None, None, :]                       # [B,1,1,Tmax]
+        cm = (hot[None, :] & valid) | (~hot[None, :] & cache_mask)
+        sel = hot[None, None, :, None]
+        ks, vs = [], []
+        for li, blk in enumerate(p.blocks):
+            a = blk.attn
+            q, k, v = a.qkv(blk.n1(x)).split([a.h * a.hd, a.kv * a.hd, a.kv * a.hd], dim=-1)
+            q = _OrtRotary.apply(q.reshape(B, a.h, 1, a.hd), pos, a.rope.cos, a.rope.sin)
+            k = _OrtRotary.apply(k.reshape(B, a.kv, 1, a.hd), pos, a.rope.cos, a.rope.sin)
+            ck = torch.where(sel, k, cache_k[li])                                      # [B,kv,Tmax,hd]
+            cv = torch.where(sel, v.reshape(B, a.kv, 1, a.hd), cache_v[li])
+            ks.append(ck)
+            vs.append(cv)
+            out = _OnnxAttention.apply(q, ck, cv, att_mask)                            # [B,H,1,hd]
+            x = x + a.o(out.reshape(B, 1, a.h * a.hd))
+            x = x + blk.ff(blk.n2(x))
+            if p.cfg.canvas and str(li) in p.cross:
+                c = p.cross[str(li)]
+                qc = c.q(c.norm_q(x)).reshape(B, c.h, 1, c.hd)
+                kc, vc = c.kv(c.norm_kv(canvas_tokens)).view(B, -1, 2, c.h, c.hd).permute(2, 0, 3, 1, 4)
+                full = torch.ones(B, 1, 1, kc.shape[2], dtype=torch.bool, device=x.device)
+                oc = c.o(_OnnxAttention.apply(qc, kc, vc, full).reshape(B, 1, c.h * c.hd))
+                x = x + torch.tanh(c.gate) * oc * draw.unsqueeze(-1).to(x.dtype)
+        return p.norm(x), torch.stack(ks), torch.stack(vs), cm
+
+
 class DecodeHeads(nn.Module):
     """Full-length attribute decoder pass -> logits for the event and every attribute."""
 

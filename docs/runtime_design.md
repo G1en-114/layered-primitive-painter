@@ -206,3 +206,15 @@ Tile 全部消失，原始节点数从 1045 降到 710。
 剩下的大头是排布变换：Transpose 40 个、Reshape 38 个、Split 20 个、Concat 19 个。下一步：
 1. RoPE 和 Attention 改用 3D 输入（`[B, S, H·hd]`，头数作为属性传入），消掉大部分 Transpose/Reshape；
 2. 先把新的 k/v 写进 cache，再对整个 cache 做注意力。这样每层的 Concat 就没有了（mask 本来就覆盖新位置，两种写法等价）。
+
+### ChunkStepV2：先写入再注意力，T=1 时用 view 代替 Transpose
+
+| 主干单步（R=2） | 每次调用 | 最大差 |
+|---|---:|---:|
+| 融合 RoPE 和注意力（ChunkStep） | 0.833 ms | 9.5e-7 |
+| ChunkStepV2 | 0.801 ms | 7.2e-7 |
+| ChunkStepV2 + CUDA Graph | **0.768 ms**（比原来的动态版快 42%） | 7.2e-7 |
+
+收益开始变小。下一步把它接进 C++ 运行时：前缀那一步（T>1）仍然用动态的 chunk_cached，
+每个解码步用定形的 ChunkStepV2（每个常用的 R 导一个图），然后接 CUDA Graph。
+这需要把所有输入放到固定的显存地址，每步用 cudaMemcpyAsync 写入小输入，所以运行时要链接 cudart。
