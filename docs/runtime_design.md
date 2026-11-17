@@ -131,3 +131,20 @@ CUDA 这一列的速度要等 GPU 空闲后重新测。之后的优化方向：
 2. TensorRT EP：把小算子融合起来，再试 FP16。
 3. 把 9 次属性解码合并：每一步一次性算出全部属性的 logits，只能用于不需要按属性逐个采样的近似；
    或者把采样本身也放进图里。
+
+## 2026-11-17：按图放置，以及 CUDA Graph 的前提条件
+
+- **按图放置**（`--provider cuda-auto`）：B≤2 时只把主干放到 GPU（`cuda-hybrid`），否则主干和输出头放 GPU，嵌入和画布编码器放 CPU。
+  B=1 时从 163 提高到 265 records/s，B=32 时 1117，和全部放 GPU 持平。详见 `docs/quant_report.md`。
+- **canvas_enc 在 CUDA 上很慢的原因**：这个 ORT 1.32 的 CUDA EP 加载不了 pip 装的 cuDNN（它找的是无版本号的 `libcudnn.so`，
+  补软链接后又报找不到 `cudnnCreate` 符号）。含 Conv 的图现在放在 CPU 上。
+- **为什么现在还不能用 CUDA Graph**：主干 `chunk_cached` 的 857 个节点里有 241 个被 ORT 放到了 CPU 上
+  （Gather 95、Div 57、Add 50、Concat 37、Slice 32、Mul 24……）。这些都是动态维度（batch、chunk 长度、cache 位置）带来的形状计算。
+  ORT 的 CUDA Graph 要求所有节点都在 CUDA EP 上；这些 CPU 节点也是每次调用都要同步和拷贝内存的原因，一次主干调用要 1.3 ms，它们是主要成本之一。
+- **计划**：
+  1. 导出“定形”的单步主干：batch 固定为 R、T=1、cache 长度固定为 Tmax，让形状在导出时成为常量，由常量折叠消掉形状计算。
+     每个常用的 R 导一个图。
+  2. 检查导出的图里 CPU 节点数为 0。
+  3. 运行时用 IOBinding 把所有输入放到固定的显存地址（位置、mask 这类小张量每步用 cudaMemcpyAsync 写进去）。
+     KV cache 的 ping-pong 两组缓冲各捕获一张图（RunOptions 的 `gpu_graph_id` 设为 0 或 1）。
+  4. 验收：生成的 token 与当前实现一致（同样的随机数），再测 B=1/8/32 的吞吐。
