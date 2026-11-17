@@ -1,104 +1,230 @@
-# Layered Primitive Painter
+<div align="center">
 
-一个**用可编辑图元一笔一笔画画、并且天然分图层**的自回归图像模型，以及配套的**部署、量化与算子工具链**。
+<img src="assets/banner.svg" alt="Strata — Layered Gaussian Painter" width="100%">
 
-> 思路受 [Primitive Operation Painter 2](https://github.com/wonderfulearth/primitive-operation-painter)（MIT）启发：
-> 图像不是像素，而是一串可以查看、修改、继续生成的绘画操作。本项目从头实现，
-> 图元换成广义 2D 高斯，加入语义图层，模型结构、数据流水线和推理运行时均为独立设计。
+<h3>一个用可编辑的高斯笔触、按语义图层逐笔作画的自回归图像模型<br>以及从数据、训练到 C++ 推理和量化的整套部署工具链</h3>
 
-## 与 POP 2 的主要区别
+<p>
+<a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square"></a>
+<img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=flat-square&logo=pytorch&logoColor=white">
+<img alt="Triton" src="https://img.shields.io/badge/Triton-kernels-6E40C9?style=flat-square">
+<img alt="CUDA" src="https://img.shields.io/badge/CUDA-HIP%20%2F%20DCU-76B900?style=flat-square&logo=nvidia&logoColor=white">
+<img alt="ONNX Runtime" src="https://img.shields.io/badge/ONNX%20Runtime-1.32-005CED?style=flat-square&logo=onnx&logoColor=white">
+<img alt="C++17" src="https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square&logo=cplusplus&logoColor=white">
+<img alt="Tests" src="https://img.shields.io/badge/tests-171%20passing-brightgreen?style=flat-square&logo=pytest&logoColor=white">
+</p>
 
-| | POP 2 | 本项目 |
+<p>
+<a href="#-亮点">亮点</a> •
+<a href="#-架构">架构</a> •
+<a href="#-关键结果">关键结果</a> •
+<a href="#-快速开始">快速开始</a> •
+<a href="#-路线图">路线图</a> •
+<a href="docs/architecture.md">架构文档</a>
+</p>
+
+</div>
+
+<p align="center">
+<img src="docs/img_trace_frog_decompose.jpg" alt="分解器逐笔临摹一张训练范围之外的图片" width="100%">
+<br>
+<sub>分解器把一张训练范围外的 3D 卡通图拆成 2 个图层、864 笔广义高斯笔触（29.3 dB，8.1 s）：最左是原图，往右依次是笔触逐步叠加的过程</sub>
+</p>
+
+---
+
+## ✨ 亮点
+
+模型不直接输出像素，而是一笔一笔地输出**广义高斯笔触**（位置、大小、角度、边缘硬度、颜色、透明度），
+并按 **背景 → 身体 → 皮肤 → 五官 → 头发 → 配饰** 的图层顺序作画。生成结果天然就是分层的，可以继续编辑，也可以只重画其中一层。
+
+|  | |
+|---|---|
+| 🎨 **语义分层协议** | `LAYER_k` / `REDRAW_k` / `REFINE_k` 事件。可以只重画头发、只给背景补细节，导出分层 ORA / SVG |
+| 🔷 **广义高斯 + 量化感知分解** | 边缘硬度 β 让同一种图元既能做柔边喷枪、也能做硬边色块；分解器训练时直接看量化后的结果，训练目标 24.9 → **30.2 dB** |
+| 🧠 **两级 Transformer + 画布反馈** | 每一笔在主干里只占一个位置，序列短了 9 倍；每 32 笔渲染一次画布，通过门控交叉注意力送回主干 |
+| ⚡ **自研算子** | Triton tile 光栅化（前向 + 反向）让分解器快 **64×**；同一份 CUDA 源码经 hipify 跑在海光 DCU 上，算子比 PyTorch 稠密实现快 **9–38×** |
+| 🛡️ **防作弊的 GRPO** | 奖励分项各自归一化，用独立评委 CLIP 和留出属性验收，抓到了奖励作弊并提前停止 |
+| 🚀 **C++ 运行时 + 量化** | ORT 1.32 + CUDA Graph + 原地 KV cache，吞吐 735 → **1010** records/s，输出与优化前逐条相同；FP16 / INT8 / INT4 用两层方法验收 |
+| 🌐 **异构多机流水线** | RTX 5070 笔记本 + RTX 4090 + 海光 DCU 分工；每次传输都核对 SHA；本机关机时 autopilot 也能自己推进 |
+
+## 🧭 架构
+
+```mermaid
+flowchart LR
+  subgraph D[数据]
+    A[原图 + 6 层语义 mask] --> B[分解器<br/>可微渲染拟合] --> C[笔触序列<br/>每图多条轨迹]
+  end
+  subgraph T[训练]
+    E[监督训练<br/>两级 Transformer] --> F[GRPO 后训练<br/>多项奖励]
+  end
+  subgraph R[部署]
+    H[ONNX 导出] --> I[C++ 运行时<br/>ORT + CUDA Graph]
+    H --> J[量化<br/>FP16 / INT8 / INT4]
+  end
+  D --> T --> R
+```
+
+| 模型 | 主干（宽 / 层 / 头） | 属性解码器 | 可训练参数 | 文字编码器 |
+|---|---|---|---:|---|
+| small | 384 / 8 / 6 (GQA 2) | 2 层 | 20.4M | Chinese-CLIP，冻结 |
+| base | 768 / 16 / 12 (GQA 4) | 2 层 | **126.4M** | Chinese-CLIP，冻结 |
+
+完整的设计说明、逐模块参数表和创新点见 **[docs/architecture.md](docs/architecture.md)**（另有 [PDF 版](docs/architecture.pdf)）。
+
+## 📊 关键结果
+
+<table>
+<tr><td valign="top" width="50%">
+
+**多轨迹数据**（独立评委 CLIP）
+
+| 轨迹 / 图 | 评委 R@5 | 训练-验证损失差 |
+|---|---:|---:|
+| 1 | 18.8% | 0.10 |
+| 4 | **30.2%** | 0.02 |
+
+4 → 12 条：R@1 3.6% → **9.4%**，验证损失却完全一样，
+说明只看损失看不出这部分收益。
+
+</td><td valign="top" width="50%">
+
+**量化**（逐步保真度 + 分布指标两层验收）
+
+| 精度 | KL | 备注 |
+|---|---:|---|
+| FP16 | 2e-5 | 几乎无损 |
+| 动态 INT8 | 1.8e-3 | CPU 单图快 **63%** |
+| 仅权重 INT8/4 | — | 这个规模下不划算 |
+
+</td></tr>
+<tr><td valign="top">
+
+**C++ 运行时优化**（B=8，输出逐条相同）
+
+| 改动 | records/s |
+|---|---:|
+| 起点 | 735 |
+| 定形单步图 + CUDA Graph | 743 |
+| 原地更新 KV cache | 822 |
+| 属性头接 CUDA Graph | 877 |
+| 只拷回需要的 logits | **1010** |
+
+B=32：1118 → **1472**（+32%）
+
+</td><td valign="top">
+
+**GRPO 后训练**
+
+| 指标 | SFT | GRPO @100 |
+|---|---:|---:|
+| 评委 R@1 | 7.8% | **13.0%** |
+| 留出属性 | — | +1.9 pt |
+| 孤儿笔触率 | — | −31% |
+
+到 step 175 时，计入奖励的指标还在涨，评委指标却开始变差（奖励作弊），
+所以在 step 100 提前停止。
+
+</td></tr>
+</table>
+
+## 🆚 与 POP 2 的区别
+
+> 思路受 [Primitive Operation Painter 2](https://github.com/wonderfulearth/primitive-operation-painter)（MIT）启发：图像不是像素，而是一串可以查看、修改、继续生成的绘画操作。
+> 本项目从头实现，模型结构、数据流水线和推理运行时均为独立设计。
+
+| | POP 2 | Strata |
 |---|---|---|
 | 图元 | 矩形 / 椭圆 | 广义 2D 高斯：边缘硬度 β 统一软高斯和实心椭圆 |
-| 组织方式 | 全局 → 4×4 → 8×8 区域 | **语义图层**（背景 / 身体 / 皮肤 / 五官 / 头发 / 饰品），每层内由粗到细 |
-| 属性编码 | 9 个独立属性 | v2 每图元 9 步（含事件）：位置、独立尺度/角度/硬度、Oklab 颜色码本、不透明度；保留 v1 读取 |
+| 组织方式 | 全局 → 4×4 → 8×8 区域 | **语义图层**，每层内由粗到细 |
+| 属性编码 | 9 个独立属性 | 每图元 9 步：事件、位置、独立尺度/角度/硬度、Oklab 颜色码本、不透明度 |
 | 图元内属性依赖 | 多分支 FlexAttention | 两级 Transformer：主干每图元一位置 + 小型属性解码器 |
-| 图层编辑 | — | `REDRAW_k` 单独重画一层、`REFINE_k` 给一层补细节，分层导出 ORA / SVG |
+| 图层编辑 | — | `REDRAW_k` / `REFINE_k`，分层导出 ORA / SVG |
 | 数据分解 | GPU 随机搜索 | 可微渲染 + 梯度优化，量化感知拟合 |
-| 推理 | libtorch 原生引擎 | ONNX → ONNX Runtime / TensorRT / CPU，自研 C++ 运行时、量化工具与算子库 |
+| 推理 | libtorch 原生引擎 | ONNX → 自研 C++ 运行时（ORT + CUDA Graph）、量化工具与算子库 |
 
-## 当前状态
-
-- [x] 序列协议 `protocol.json`（Python 与 C++ 共用的唯一定义）
-- [x] 颜色（Oklab）、形状（log 协方差）参数化与 k-means 码本
-- [x] PyTorch 参考光栅化器：可微、分图层渲染、精确分层导出
-- [x] 编解码与量化感知 snap（直通估计器）
-- [x] 分层分解器（图片 + 分割 → 分层图元序列）：量化感知拟合、amodal 补全、图层越界约束
-- [x] 协议支持文本前缀与 `REDRAW_k` / `REFINE_k`
-- [x] Triton tile 光栅化算子（前向 + 反向，确定性梯度）：分解器单步快 64×，端到端 19.8 s → 0.8 s/图，见 [bench/REPORT_raster.md](bench/REPORT_raster.md)
-- [x] 原生 CUDA/HIP C++ tile 光栅化（前向/反向）：同一源码适配 NVIDIA 与海光 DCU，DCU 算子基准快 9–38×，见 [移植学习记录](docs/hip_port_log.md)
-- [ ] CPU SIMD 光栅化（部署用）
-- [x] CelebAMask-HQ 数据处理：18 类合并为 6 个按深度排序的图层，3 万张 256px 分片
-- [x] 语法状态机、full / redraw / refine 序列、批量分解流水线（3 万张，本机 5070 约 4 小时）
-- [x] 两级模型（tiny / small / base）、带 KV cache 的参考采样器、训练循环；实际参数量随协议和画布模块配置变化
-- [x] 海光 DCU（BW，DTK 26.04）上训练：测试 46 通过（无 Triton 的 14 个跳过），small 模型 3.6 分钟/轮
-- [x] 3万张中文标注完成并校验，17条异常描述另存修复；Chinese-CLIP 文本条件与 CFG 已接入，v2 small已开始正式训练
-- [x] 协议 v2 独立形状分档与版本化颜色码本，图元教师约26→30dB，见 [实验记录](docs/protocol_v2.md)
-- [x] 可选画布反馈与前缀扰动，已通过测试及冒烟训练，见 [设计](docs/canvas_feedback_design.md)
-- [ ] v2 四轨迹数据正在分解；t0已完成3万张清理和校验，首阶段8000步训练已启动，其余轨迹继续生成
-- [ ] small / base 在全量数据上训练，规模对比
-- [ ] ONNX 导出、C++ 运行时、量化工具、基准测试
-- [ ] 二次元风格后训练（见下）
-
-二次元数据已完成首批 1000 张头像裁剪、原图关联与角色/背景伪标签，953 张通过自动检查；
-8 张已做图元分解试验，尚未启动风格训练。见 [数据处理记录](docs/anime_data_log.md)。
-
-接手请先读 [Claude 最新交接](docs/CLAUDE_HANDOFF.md)；完整的标注、轨迹、训练启动与验证过程见 [续接记录](docs/continuation_2026-11-15.md)。
-
-## 计划：二次元风格后训练
-
-主模型在 CelebAMask-HQ（真人、精确分层标注）上预训练，再用动漫人脸微调出二次元风格，
-对比同一模型微调前后的变化。
-
-- 图像与描述：[huanngzh/anime_face_control_60k](https://huggingface.co/datasets/huanngzh/anime_face_control_60k)
-  （6 万张动漫人脸，含文字描述与面部关键点，5.4 GB）；分辨率与关键点质量待确认。
-- 分层伪标签（无现成的动漫人脸逐像素分层标注）：角色 / 背景用
-  [skytnt/anime-segmentation](https://github.com/SkyTNT/anime-segmentation) 的分割模型；
-  脸部轮廓关键点 → 皮肤层，眼睛 / 嘴巴关键点 → 五官层，角色其余部分按位置分为头发与身体。
-- 精确的角色 / 背景两层数据：[skytnt/anime-segmentation 数据集](https://huggingface.co/datasets/skytnt/anime-segmentation)
-  的透明背景角色 PNG 合成到背景图上（被遮挡的背景也是真实的）。
-- 版权：上述图片多抓取自 getchu / danbooru，仅作非商业研究用途；仓库不分发图片，
-  发布权重时注明数据来源与限制。
-
-## 目录
-
-```
-protocol.json          序列协议：画布、图元公式、属性词表、事件、图层
-python/lpp/
-  protocol.py          协议加载与校验
-  color.py  shape.py   Oklab 颜色空间；形状的 log 协方差参数化
-  codebook.py codec.py k-means 码本；连续参数 <-> token
-  render/reference.py  稠密参考光栅化器（正确性基准）
-  render/triton_raster.py  tile 光栅化：前向/反向 Triton kernel
-  render/native_raster.py  原生 CUDA/HIP 包装器（首次调用即时编译）
-  render/tiles.py      Triton 与 CUDA/HIP 共用的参数打包、tile 分箱
-  render/dispatch.py   后端选择（GPU float32 优先 Triton，再尝试 CUDA/HIP；LPP_RASTER 可强制）
-  decompose/           分层分解器：图片 + 图层标签 -> 有序、量化后的图元
-  synthetic.py         已知真值的合成分层场景（测试与 demo 用）
-assets/codebooks/      版本化码本（v1 先验、v2 数据驱动；旧版本保留）
-tests/                 性质测试：结合律、唯一性、幂等性、梯度
-tools/                 码本构建、渲染与分解 demo
-bench/                 算子基准测试与优化报告
-```
-
-## 运行
+## 🚀 快速开始
 
 ```sh
+# 测试与 demo（需要 PyTorch，CUDA 可选；numpy、pillow、pytest）
 python -m pytest
 python tools/build_prior_codebooks.py
-python tools/render_demo.py --out out/demo
+python tools/render_demo.py    --out out/demo
 python tools/decompose_demo.py --out out/decompose   # 合成场景分解报告
+
+# 训练
+python tools/train.py --data "data/.../decomp_*.npz" --config small --out runs/small
+
+# 导出 ONNX 并构建 C++ 运行时
+python tools/export_onnx.py --ckpt runs/small/last.pt --out out/onnx
+cmake -S runtime -B runtime/build && cmake --build runtime/build -j
+runtime/run.sh --help
 ```
 
-需要 PyTorch（CUDA 可选）、numpy、pillow、pytest。
+<details>
+<summary><b>更多：海光 DCU、训练启动、续接</b></summary>
 
-部分DTK构建会尝试加载未提供的FlashAttention库；训练可显式使用
-`--sdpa-backend math` 选择PyTorch内置注意力，默认仍为自动选择。
-单条完整轨迹的清理、覆盖检查、远程SHA校验和训练启动可用
-`python tools/start_ready_training.py --plan <launch-plan.json>` 串接；
-具体路径与本轮配置见[续接记录](docs/continuation_2026-11-15.md#8-t0-完成提前清理并排入正式训练1707之后)。
+- 部分 DTK 构建会尝试加载未提供的 FlashAttention 库；训练可加 `--sdpa-backend math` 改用 PyTorch 内置注意力。
+- 一条完整轨迹的清理、覆盖检查、远程 SHA 校验和训练启动，可用
+  `python tools/start_ready_training.py --plan <launch-plan.json>` 串起来，
+  见[续接记录](docs/continuation_2026-11-15.md)。
+- 接手请先读 [Claude 最新交接](docs/CLAUDE_HANDOFF.md)。
 
-## 许可
+</details>
 
-代码采用 MIT 许可。训练数据（CelebAMask-HQ）仅限非商业研究用途，不随仓库分发。
+## 📁 目录结构
+
+```
+protocol.json            序列协议：画布、图元公式、属性词表、事件、图层（Python 与 C++ 共用）
+python/lpp/
+  model.py  canvas.py    两级 Transformer、画布编码与反馈
+  sequence.py sample.py  语法状态机、序列构造、带 KV cache 的采样器
+  color.py shape.py      Oklab 颜色空间；形状的 log 协方差参数化
+  codebook.py codec.py   k-means 码本；连续参数 <-> token
+  render/                参考光栅化器、Triton / CUDA / HIP tile 光栅化、后端选择
+  decompose/             分层分解器：图片 + 图层标签 -> 有序、量化后的图元
+csrc/raster/             原生 CUDA/HIP 光栅化算子
+runtime/                 C++ 推理运行时（语法、采样、光栅化、ORT 会话）
+tools/                   数据处理、训练、GRPO、ONNX 导出、量化、评估
+ops/plan_v3/             多机流水线与 autopilot
+bench/                   算子基准测试与优化报告
+docs/                    设计文档与实验记录
+```
+
+## 🗺️ 路线图
+
+- [x] 序列协议、Oklab 颜色码本、log 协方差形状参数化
+- [x] 可微参考光栅化器 + Triton tile 算子（前向/反向，[分解器快 64×](bench/REPORT_raster.md)）
+- [x] 原生 CUDA/HIP 算子，同一份源码跑在 NVIDIA 和海光 DCU 上（[移植记录](docs/hip_port_log.md)）
+- [x] 分层分解器：量化感知拟合、amodal 补全、图层越界约束
+- [x] CelebAMask-HQ 3 万张 × 12 条轨迹；动漫 5 万张 × 4 条轨迹，约 56 万条序列
+- [x] 两级模型（tiny / small / base）、Chinese-CLIP 文字条件 + CFG、画布反馈
+- [x] [协议 v2](docs/protocol_v2.md)：独立形状分档、版本化颜色码本
+- [x] GRPO 后训练与独立评委评估（[记录](docs/rl_log.md)）
+- [x] ONNX 导出、C++ 运行时、CUDA Graph、FP16/INT8/INT4 量化（[运行时](docs/runtime_design.md) · [量化报告](docs/quant_report.md)）
+- [ ] base 模型按 [训练计划 v3](docs/plan_v3_training.md) 训练（进行中）
+- [ ] 通用题材：COCO + 8 槽位协议 v3（[设计](docs/protocol_v3_design.md)）
+- [ ] 属性采样移进计算图；TensorRT 后端；CPU SIMD 光栅化
+- [ ] 多卡 DDP 扩展效率实测
+
+## 📚 文档
+
+| 主题 | 文档 |
+|---|---|
+| 系统架构与创新点 | [architecture.md](docs/architecture.md) |
+| 协议设计 | [protocol_v2.md](docs/protocol_v2.md) · [protocol_v3_design.md](docs/protocol_v3_design.md) |
+| 画布反馈 | [canvas_feedback_design.md](docs/canvas_feedback_design.md) |
+| 训练与强化学习 | [training_pipeline.md](docs/training_pipeline.md) · [rl_log.md](docs/rl_log.md) · [plan_v3_training.md](docs/plan_v3_training.md) |
+| 部署与性能 | [runtime_design.md](docs/runtime_design.md) · [quant_report.md](docs/quant_report.md) · [perf_log.md](docs/perf_log.md) |
+| 数据 | [anime_data_log.md](docs/anime_data_log.md) · [data_lessons.md](docs/data_lessons.md) · [image_cond_log.md](docs/image_cond_log.md) |
+
+## 📜 许可
+
+代码采用 [Apache License 2.0](LICENSE) 发布，第三方组件的说明见 [NOTICE](NOTICE)。
+
+训练数据（CelebAMask-HQ、动漫数据集）仅限非商业研究用途，不随仓库分发；发布权重时会注明数据来源和使用限制。
+
+<div align="center">
+<sub>Built from scratch by <a href="https://github.com/G1en-114">@G1en-114</a></sub>
+</div>

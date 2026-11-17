@@ -3,6 +3,7 @@ name = "lpp"
 version = "0.1.0"
 description = "Layered Primitive Painter: autoregressive layered 2D-Gaussian painting, with a deployment and kernel toolchain"
 requires-python = ">=3.10"
+license = "Apache-2.0"
 
 [tool.pytest.ini_options]
 pythonpath = ["python"]

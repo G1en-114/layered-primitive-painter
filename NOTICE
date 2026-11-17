@@ -1,0 +1,13 @@
+Layered Primitive Painter
+Copyright 2026 G1en-114
+
+This product includes software developed by G1en-114
+(https://github.com/G1en-114/strata).
+
+Third-party components keep their own licenses:
+  - third_party/onnxruntime-1.32.0/  ONNX Runtime headers (MIT, Microsoft)
+  - runtime/src/json.hpp             nlohmann/json (MIT)
+  - runtime/src/stb_image_write.h    stb (MIT / public domain)
+
+Training data (CelebAMask-HQ, anime datasets) is not distributed with this
+repository and is subject to its own non-commercial research terms.
