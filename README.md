@@ -16,11 +16,11 @@
 </p>
 
 <p>
-<a href="#-亮点">亮点</a> •
-<a href="#-架构">架构</a> •
-<a href="#-关键结果">关键结果</a> •
-<a href="#-快速开始">快速开始</a> •
-<a href="#-路线图">路线图</a> •
+<a href="#亮点">亮点</a> •
+<a href="#架构">架构</a> •
+<a href="#关键结果">关键结果</a> •
+<a href="#快速开始">快速开始</a> •
+<a href="#路线图">路线图</a> •
 <a href="docs/architecture.md">架构文档</a>
 </p>
 
@@ -34,22 +34,22 @@
 
 ---
 
-## ✨ 亮点
+## 亮点
 
 模型不直接输出像素，而是一笔一笔地输出**广义高斯笔触**（位置、大小、角度、边缘硬度、颜色、透明度），
 并按 **背景 → 身体 → 皮肤 → 五官 → 头发 → 配饰** 的图层顺序作画。生成结果天然就是分层的，可以继续编辑，也可以只重画其中一层。
 
-|  | |
+| 方向 | 内容 |
 |---|---|
-| 🎨 **语义分层协议** | `LAYER_k` / `REDRAW_k` / `REFINE_k` 事件。可以只重画头发、只给背景补细节，导出分层 ORA / SVG |
-| 🔷 **广义高斯 + 量化感知分解** | 边缘硬度 β 让同一种图元既能做柔边喷枪、也能做硬边色块；分解器训练时直接看量化后的结果，训练目标 24.9 → **30.2 dB** |
-| 🧠 **两级 Transformer + 画布反馈** | 每一笔在主干里只占一个位置，序列短了 9 倍；每 32 笔渲染一次画布，通过门控交叉注意力送回主干 |
-| ⚡ **自研算子** | Triton tile 光栅化（前向 + 反向）让分解器快 **64×**；同一份 CUDA 源码经 hipify 跑在海光 DCU 上，算子比 PyTorch 稠密实现快 **9–38×** |
-| 🛡️ **防作弊的 GRPO** | 奖励分项各自归一化，用独立评委 CLIP 和留出属性验收，抓到了奖励作弊并提前停止 |
-| 🚀 **C++ 运行时 + 量化** | ORT 1.32 + CUDA Graph + 原地 KV cache，吞吐 735 → **1010** records/s，输出与优化前逐条相同；FP16 / INT8 / INT4 用两层方法验收 |
-| 🌐 **异构多机流水线** | RTX 5070 笔记本 + RTX 4090 + 海光 DCU 分工；每次传输都核对 SHA；本机关机时 autopilot 也能自己推进 |
+| **语义分层协议** | `LAYER_k` / `REDRAW_k` / `REFINE_k` 事件。可以只重画头发、只给背景补细节，导出分层 ORA / SVG |
+| **广义高斯 + 量化感知分解** | 边缘硬度 β 让同一种图元既能做柔边喷枪、也能做硬边色块；分解器训练时直接看量化后的结果，训练目标 24.9 → **30.2 dB** |
+| **两级 Transformer + 画布反馈** | 每一笔在主干里只占一个位置，序列短了 9 倍；每 32 笔渲染一次画布，通过门控交叉注意力送回主干 |
+| **自研算子** | Triton tile 光栅化（前向 + 反向）让分解器快 **64×**；同一份 CUDA 源码经 hipify 跑在海光 DCU 上，算子比 PyTorch 稠密实现快 **9–38×** |
+| **防作弊的 GRPO** | 奖励分项各自归一化，用独立评委 CLIP 和留出属性验收，抓到了奖励作弊并提前停止 |
+| **C++ 运行时 + 量化** | ORT 1.32 + CUDA Graph + 原地 KV cache，吞吐 735 → **1010** records/s，输出与优化前逐条相同；FP16 / INT8 / INT4 用两层方法验收 |
+| **异构多机流水线** | RTX 5070 笔记本 + RTX 4090 + 海光 DCU 分工；每次传输都核对 SHA；本机关机时 autopilot 也能自己推进 |
 
-## 🧭 架构
+## 架构
 
 ```mermaid
 flowchart LR
@@ -73,7 +73,7 @@ flowchart LR
 
 完整的设计说明、逐模块参数表和创新点见 **[docs/architecture.md](docs/architecture.md)**（另有 [PDF 版](docs/architecture.pdf)）。
 
-## 📊 关键结果
+## 关键结果
 
 <table>
 <tr><td valign="top" width="50%">
@@ -129,7 +129,7 @@ B=32：1118 → **1472**（+32%）
 </td></tr>
 </table>
 
-## 🚀 快速开始
+## 快速开始
 
 ```sh
 # 测试与 demo（需要 PyTorch，CUDA 可选；numpy、pillow、pytest）
@@ -158,7 +158,7 @@ runtime/run.sh --help
 
 </details>
 
-## 📁 目录结构
+## 目录结构
 
 ```
 protocol.json            序列协议：画布、图元公式、属性词表、事件、图层（Python 与 C++ 共用）
@@ -177,7 +177,7 @@ bench/                   算子基准测试与优化报告
 docs/                    设计文档与实验记录
 ```
 
-## 🗺️ 路线图
+## 路线图
 
 - [x] 序列协议、Oklab 颜色码本、log 协方差形状参数化
 - [x] 可微参考光栅化器 + Triton tile 算子（前向/反向，[分解器快 64×](bench/REPORT_raster.md)）
@@ -193,7 +193,7 @@ docs/                    设计文档与实验记录
 - [ ] 属性采样移进计算图；TensorRT 后端；CPU SIMD 光栅化
 - [ ] 多卡 DDP 扩展效率实测
 
-## 📚 文档
+## 文档
 
 | 主题 | 文档 |
 |---|---|
@@ -204,7 +204,7 @@ docs/                    设计文档与实验记录
 | 部署与性能 | [runtime_design.md](docs/runtime_design.md) · [quant_report.md](docs/quant_report.md) · [perf_log.md](docs/perf_log.md) |
 | 数据 | [anime_data_log.md](docs/anime_data_log.md) · [data_lessons.md](docs/data_lessons.md) · [image_cond_log.md](docs/image_cond_log.md) |
 
-## 📜 许可与致谢
+## 许可与致谢
 
 思路受 [Primitive Operation Painter 2](https://github.com/wonderfulearth/primitive-operation-painter) 启发，本项目的代码从头实现。
 
