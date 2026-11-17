@@ -14,25 +14,22 @@
 ## 1. 总体架构
 
 ```mermaid
-flowchart LR
-  subgraph 数据
-    A[原图 + 6 层语义 mask] --> B[分解器<br/>可微渲染拟合]
-    B --> C[笔触序列<br/>每张图多条轨迹]
-    C --> D[清理与校验<br/>SHA / 协议哈希 / 划分]
+flowchart TB
+  subgraph S1[数据]
+    direction LR
+    A[原图 + 6 层语义 mask] --> B[分解器<br/>可微渲染拟合] --> C[笔触序列<br/>每张图多条轨迹] --> D[清理与校验<br/>SHA / 协议哈希 / 划分]
   end
-  subgraph 训练
-    D --> E[监督训练<br/>两级 Transformer]
-    T[中文描述<br/>VLM + 标签模板] --> E
-    E --> F[GRPO 后训练<br/>多项奖励]
+  subgraph S2[训练]
+    direction LR
+    T[中文描述<br/>VLM + 标签模板] --> E[监督训练<br/>两级 Transformer] --> F[GRPO 后训练<br/>多项奖励]
   end
-  subgraph 评估
-    F --> G[独立评委 CLIP<br/>属性分类器 / 孤儿率]
-  end
-  subgraph 部署
-    F --> H[ONNX 导出<br/>动态图 + 定形单步图]
-    H --> I[C++ 运行时<br/>ORT + CUDA Graph]
+  subgraph S3[评估与部署]
+    direction LR
+    G[独立评委 CLIP<br/>属性分类器 / 孤儿率]
+    H[ONNX 导出<br/>动态图 + 定形单步图] --> I[C++ 运行时<br/>ORT + CUDA Graph]
     H --> J[量化<br/>FP16 / INT8 / INT4]
   end
+  S1 --> S2 --> S3
 ```
 
 ### 1.1 画面表示：带图层的广义高斯笔触
