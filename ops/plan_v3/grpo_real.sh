@@ -15,10 +15,11 @@ export OMP_NUM_THREADS=3 MKL_NUM_THREADS=3 LPP_RASTER=native LPP_EXT_BUILD=$R/ex
 until [ -f $R/eval/grpo_v3_step100/metrics.json ] || ! pgrep -f grpo_v3.sh > /dev/null; do sleep 120; done
 p=$(pgrep -f "out $R/runs/grpo_v3 --text-encoder")
 [ -n "$p" ] && { kill $p; say "GRPO v1 stopped after its step-100 evaluation (pid $p)"; }
+# source embeddings (source_emb.sh) need the memory GRPO v1 held: compute them now, then start v2
+[ -f $R/source_emb_b16.npz.complete ] || { say "computing source embeddings"; bash -l $R/source_emb.sh; }
+[ -f $R/source_emb_b16.npz.complete ] && say "source embeddings ready" || say "source embeddings FAILED (see source_emb.log)"
 [ -e $G ] && { say "$G exists; abort"; exit 1; }
 mkdir -p $G
-# the source embeddings are computed on the local machine and uploaded; without them v2 still runs
-# (mixed domains, anime-safe attributes) and the log says so
 SRC=(); [ -f $R/source_emb_b16.npz.complete ] && SRC=(--source-emb $R/source_emb_b16.npz --w-src 1) || say "no source embeddings: running without the source-likeness reward"
 python -u tools/train_grpo.py --init $B/model_final.pt --out $G \
   --text-encoder $R/models/chinese-clip-vit-base-patch16 --captions $R/captions_v3.jsonl \

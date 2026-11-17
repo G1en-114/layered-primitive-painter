@@ -161,8 +161,9 @@ def main() -> None:
         src_row = {int(i): r for r, i in enumerate(z["ids"])}
         src_emb = torch.from_numpy(z["emb"].astype(np.float32))
         missing = sum(i not in src_row for _, i in pool)
-        if missing:
-            raise SystemExit(f"--source-emb lacks {missing} of the {len(pool)} prompt images")
+        if missing:                       # e.g. images dropped by pruning: their prompts are left out
+            print(f"--source-emb lacks {missing} of the {len(pool)} prompts; dropping them", flush=True)
+            pool = [p for p in pool if p[1] in src_row]
     anime_pool = [p for p in pool if p[0].startswith("动漫")]
     face_pool = [p for p in pool if not p[0].startswith("动漫")]
     if args.anime_frac is not None and not (anime_pool and face_pool):
