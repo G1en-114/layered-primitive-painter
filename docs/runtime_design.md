@@ -186,3 +186,23 @@ cos/sin 表的形状是 `[max_pos, hd/2]`），代替原来约 8 个节点组成
 ORT 的 GroupQueryAttention 只支持“每行连续的有效前缀”，表达不了 cache mask 里由文字前缀 padding 造成的空洞，
 所以准备改用 ONNX 标准的 `Attention` 算子（opset 23）。它原生支持 GQA 和任意的布尔 mask，
 能把每层的 Tile（重复 KV 头）、matmul、mask、softmax 合并成一个节点。
+
+### 融合注意力（ONNX `Attention`，opset 23）
+
+先用一个只含 `Attention` 的小模型验证：ORT 1.32 在 CPU 和 CUDA 上都实现了它，支持 GQA（6 个 q 头、2 个 kv 头）
+和带空洞的布尔 mask，与 NumPy 参照的误差不超过 1.5e-7。
+接着 `Chunk(fused_attention=True)` 把 `_attend` 导出成一个 `Attention` 节点：共 10 个（8 层自注意力加 2 处画布交叉注意力），
+Tile 全部消失，原始节点数从 1045 降到 710。
+
+| 主干单步（R=2） | 每次调用 | 最大差 |
+|---|---:|---:|
+| chunk_cached（动态形状） | 1.332 ms | — |
+| + 定形 | 1.078 ms | 0 |
+| + 融合 RoPE | 0.967 ms | 9.5e-7 |
+| + 融合注意力 | 0.833 ms | 9.5e-7 |
+| + CUDA Graph | **0.817 ms（−39%）** | 9.5e-7 |
+
+所有节点都在 CUDA 上，ORT 优化后每步 295 个算子（原来是 489 个）。
+剩下的大头是排布变换：Transpose 40 个、Reshape 38 个、Split 20 个、Concat 19 个。下一步：
+1. RoPE 和 Attention 改用 3D 输入（`[B, S, H·hd]`，头数作为属性传入），消掉大部分 Transpose/Reshape；
+2. 先把新的 k/v 写进 cache，再对整个 cache 做注意力。这样每层的 Concat 就没有了（mask 本来就覆盖新位置，两种写法等价）。

@@ -70,6 +70,22 @@ class CanvasEnc(nn.Module):
         return self.p.canvas_enc(canvas)
 
 
+class _OnnxAttention(torch.autograd.Function):
+    """_attend exported as one ONNX Attention node (opset 23): GQA (kv heads shared by consecutive query
+    heads, as repeat_interleave), boolean mask with holes, default 1/sqrt(hd) scale. Replaces each
+    layer's Tile (KV-head repeat) + MatMul + mask + Softmax + MatMul chain."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, mask):
+        return _attend(q, k, v, mask)
+
+    @staticmethod
+    def symbolic(g, q, k, v, mask):
+        out = g.op("Attention", q, k, v, mask)
+        out.setType(q.type())
+        return out
+
+
 class _OrtRotary(torch.autograd.Function):
     """Half-split rotary embedding; exported as one com.microsoft::RotaryEmbedding node (interleaved=0)
     instead of the ~8-node gather / split / mul / sub / concat chain per application (132 of 497 nodes
@@ -92,10 +108,11 @@ class Chunk(nn.Module):
     """Backbone over T new positions given an explicit past cache (see module docstring).
     fused_rope: rotary embedding as ORT's contrib op (export needs custom_opsets={"com.microsoft": 1})."""
 
-    def __init__(self, painter: Painter, fused_rope: bool = False):
+    def __init__(self, painter: Painter, fused_rope: bool = False, fused_attention: bool = False):
         super().__init__()
         self.p = painter
         self.fused_rope = fused_rope
+        self.attend = _OnnxAttention.apply if fused_attention else _attend   # fused: export with opset 23
 
     def _rope(self, a, t, pos):
         return _OrtRotary.apply(t, pos, a.rope.cos, a.rope.sin) if self.fused_rope else a.rope(t, pos)
@@ -121,7 +138,7 @@ class Chunk(nn.Module):
             vs.append(v)
             kk = torch.cat([past_k[li], k], 2)
             vv = torch.cat([past_v[li], v], 2)
-            out = _attend(q, kk, vv, mask)
+            out = self.attend(q, kk, vv, mask)
             x = x + a.o(out.transpose(1, 2).reshape(B, T, a.h * a.hd))
             x = x + blk.ff(blk.n2(x))
             if p.cfg.canvas and str(li) in p.cross:
@@ -130,7 +147,7 @@ class Chunk(nn.Module):
                 qc = c.q(c.norm_q(x)).view(N, Lq, c.h, c.hd).transpose(1, 2)
                 kc, vc = c.kv(c.norm_kv(canvas_tokens)).view(N, -1, 2, c.h, c.hd).permute(2, 0, 3, 1, 4)
                 full = torch.ones(N, 1, Lq, kc.shape[2], dtype=torch.bool, device=x.device)
-                oc = c.o(_attend(qc, kc, vc, full).transpose(1, 2).reshape(N, Lq, d))
+                oc = c.o(self.attend(qc, kc, vc, full).transpose(1, 2).reshape(N, Lq, d))
                 x = x + torch.tanh(c.gate) * oc * draw.unsqueeze(-1).to(x.dtype)
         return p.norm(x), torch.stack(ks), torch.stack(vs)
 
@@ -164,9 +181,9 @@ class ChunkStep(nn.Module):
     more; any CPU node rules out CUDA Graph. Here the shapes are constants of the export and the new
     position is written with a one-hot select instead of slicing, so the whole graph can stay on the GPU."""
 
-    def __init__(self, painter: Painter, fused_rope: bool = False):
+    def __init__(self, painter: Painter, fused_rope: bool = False, fused_attention: bool = False):
         super().__init__()
-        self.chunk = Chunk(painter, fused_rope=fused_rope)
+        self.chunk = Chunk(painter, fused_rope=fused_rope, fused_attention=fused_attention)
 
     def forward(self, x, valid, cache_k, cache_v, cache_mask, write_pos, start_pos, canvas_tokens, draw):
         h, k_new, v_new = self.chunk(x, valid, cache_k, cache_v, cache_mask, start_pos, canvas_tokens, draw)
