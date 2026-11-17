@@ -72,7 +72,15 @@ def main() -> None:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-strips", type=int, default=6)
+    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default=None,
+                    help="default: math on ROCm/HIP (the DCU, as every eval there), auto elsewhere")
     args = ap.parse_args()
+    if args.sdpa_backend is None:
+        args.sdpa_backend = "math" if torch.version.hip else "auto"
+    if args.sdpa_backend == "math":                      # as eval_text.py (DCU)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     args.out.mkdir(parents=True, exist_ok=True)
     dev = "cuda"
     state = torch.load(args.ckpt, map_location=dev, weights_only=False)

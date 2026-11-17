@@ -98,6 +98,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--cfg-scale", type=float, default=2.0)
     ap.add_argument("--top-p", type=float, default=0.9)
+    ap.add_argument("--renyi-alpha", type=float, default=None,
+                    help="Renyi-entropy adaptive truncation with uniform choice inside it (replaces top-p)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-grid", type=int, default=16, help="samples (with their real images) in the grid")
     ap.add_argument("--judge-encoder", type=Path, default=None,
@@ -146,7 +148,7 @@ def main() -> None:
         raise SystemExit("--no-text only makes sense with --image-tokens or --target-images")
     print(f"checkpoint step {state['step']}, {model.num_params() / 1e6:.1f}M; {len(ids)} prompts", flush=True)
 
-    sc = SampleConfig(temperature=1.0, top_p=args.top_p, cfg_scale=args.cfg_scale)
+    sc = SampleConfig(temperature=1.0, top_p=args.top_p, cfg_scale=args.cfg_scale, renyi_alpha=args.renyi_alpha)
     gen, orphan, lengths, early = [], [], [], 0
     cache = args.out / "generated.npz"
     if cache.exists():               # scoring can be rerun without regenerating
@@ -196,6 +198,7 @@ def main() -> None:
     half = len(r_np) // 2
     result = {
         "step": state["step"], "checkpoint": str(args.ckpt), "n": args.n, "cfg_scale": args.cfg_scale,
+        "renyi_alpha": args.renyi_alpha,
         "top_p": args.top_p, "seed": args.seed,
         "generated": {"clip_score": round(100 * float((gi * t).sum(1).mean()), 3), **retrieval(gi, t),
                       "clip_fd": round(frechet(g_np, r_np), 4),
