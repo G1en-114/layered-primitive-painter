@@ -148,3 +148,24 @@ CUDA 这一列的速度要等 GPU 空闲后重新测。之后的优化方向：
   3. 运行时用 IOBinding 把所有输入放到固定的显存地址（位置、mask 这类小张量每步用 cudaMemcpyAsync 写进去）。
      KV cache 的 ping-pong 两组缓冲各捕获一张图（RunOptions 的 `gpu_graph_id` 设为 0 或 1）。
   4. 验收：生成的 token 与当前实现一致（同样的随机数），再测 B=1/8/32 的吞吐。
+
+### 定形单步主干：实测（2026-11-17）
+
+`lpp.export.ChunkStep`：T=1、R 和 Tmax 都是导出时的常量，新位置用 one-hot 选择写入 cache，不再用切片。
+布尔型的 `Where` 在 ORT 里没有 kernel，所以 mask 用 `(hot & valid) | (~hot & mask)` 来写。
+输出与 `ChunkCached` 逐位相同（最大差 0）。
+
+| 主干单步（R=2，Tmax=1024，IOBinding，输入都在显存里） | 每次调用 |
+|---|---:|
+| chunk_cached（动态形状，241 个节点在 CPU 上） | 1.347 ms |
+| chunk_step（定形，**全部节点都在 CUDA 上**） | 1.081 ms |
+| chunk_step + CUDA Graph | 1.033 ms |
+
+CUDA Graph 只再省了 5%。剖析一下：一步要跑 **489 个算子**，没有哪个占大头
+（Mul 14%、MatMul 12%、Transpose / Split / Reshape / Concat / Unsqueeze 各约 8%）。
+它们来自手写的 RoPE、GQA 的重复 KV 头、手写的注意力和 RMSNorm。
+每个小 kernel 在 GPU 上也要约 2 µs，所以**瓶颈是 kernel 的个数**。CUDA Graph 只省掉了 CPU 端的启动开销。
+
+**下一步：算子融合。** 导出时把 RoPE、注意力、归一化写成 ORT 的融合算子
+（`com.microsoft` 的 `RotaryEmbedding`、`GroupQueryAttention`、`SkipSimplifiedLayerNormalization`），
+目标是把一步的 kernel 数降到几十个，然后再接 CUDA Graph。验收方式不变：token 与现在一致，再测吞吐。

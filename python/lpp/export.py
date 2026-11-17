@@ -133,6 +133,27 @@ class ChunkCached(nn.Module):
         return h, ck, cv, cm
 
 
+class ChunkStep(nn.Module):
+    """One decode step (T = 1) of ChunkCached, exported with static shapes for CUDA Graph capture.
+
+    With dynamic axes every x.shape / cache length becomes a Shape -> Gather chain that ORT runs on the
+    CPU (241 of 857 chunk_cached nodes), and the data-dependent cache slices (cache[..., :write_pos]) add
+    more; any CPU node rules out CUDA Graph. Here the shapes are constants of the export and the new
+    position is written with a one-hot select instead of slicing, so the whole graph can stay on the GPU."""
+
+    def __init__(self, painter: Painter):
+        super().__init__()
+        self.chunk = Chunk(painter)
+
+    def forward(self, x, valid, cache_k, cache_v, cache_mask, write_pos, start_pos, canvas_tokens, draw):
+        h, k_new, v_new = self.chunk(x, valid, cache_k, cache_v, cache_mask, start_pos, canvas_tokens, draw)
+        hot = torch.arange(cache_mask.shape[1], device=x.device) == write_pos          # [Tmax]
+        ck = torch.where(hot[None, None, None, :, None], k_new, cache_k)               # k_new [L,B,kv,1,hd]
+        cv = torch.where(hot[None, None, None, :, None], v_new, cache_v)
+        cm = (hot[None, :] & valid) | (~hot[None, :] & cache_mask)                     # bool Where has no ORT kernel
+        return h, ck, cv, cm
+
+
 class DecodeHeads(nn.Module):
     """Full-length attribute decoder pass -> logits for the event and every attribute."""
 
