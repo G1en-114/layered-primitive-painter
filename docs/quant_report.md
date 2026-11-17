@@ -88,7 +88,7 @@ C++ 运行时新增了几种放置方式（`--provider`）：
 
 单位 records/s，3 次的中位数。cuda-auto 在 B=1 时比原来全放 GPU 快 63%，比纯 CPU 快 43%。
 一致性：B=8、400 个记录内，cuda-hybrid 和 cuda-all 与纯 CPU 的 8 条序列完全相同；cuda 有 1 条在第 254 个记录处分叉（浮点误差的累积）。
-`canvas_enc` 和 `embed_text` 在 CUDA EP 上每次都要约 19 ms，把 cuDNN 卷积算法搜索改成 HEURISTIC 后也没有变化，原因还不清楚。现在这两个图放到 CPU 上，问题就绕过去了。
+`canvas_enc` 和 `embed_text` 在 CUDA EP 上每次都要约 19 ms。查下来的原因是：**这个 ORT 1.32 的 CUDA EP 加载不了 cuDNN**。它按无版本号的 `libcudnn.so` 去找，而 pip 装的 cuDNN（CUDA 13 版本）只有 `libcudnn.so.9`；补一个软链接之后又报 `Cannot load symbol cudnnCreate`，多半是 ABI 不匹配。所以 Conv 算子在 CUDA EP 上跑不了正常的 cuDNN 路径。现在含 Conv 的图都放在 CPU 上（0.4 ms），问题就绕过去了。以后要上 TensorRT，或者别的依赖 cuDNN 的路径，得先解决这个依赖：换一个与 cuDNN 匹配的 ORT 构建，或者装与 ORT 相匹配的 cuDNN 版本。
 
 ## 复现
 
