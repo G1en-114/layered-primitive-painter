@@ -238,6 +238,52 @@ class ChunkStepV2(nn.Module):
         return p.norm(x), torch.stack(ks), torch.stack(vs), cm
 
 
+class ChunkStepV3(nn.Module):
+    """One-step backbone with an in-place KV cache (runtime v3). The graph only *reads* the cache and
+    returns the new position's k / v; the runtime writes them into slot write_pos with one strided copy
+    each (cudaMemcpy2D), so no step copies the whole cache (ping-pong rewrote all L x R x kv x Tmax x hd
+    floats every step: ~1 GB of traffic per step at R = 64, Tmax = 1024).
+    Attention is split into the cached slots (masked) and the new token (always attended), joined in one
+    softmax. GQA without repeating K/V: q is viewed as [R, kv, rep, hd] against K [R, kv, Tmax, hd].
+    Inputs: x [R,1,D], valid [R,1], cache_k / cache_v [L,R,kv,Tmax,hd], cache_mask [R,Tmax], start_pos [R],
+    canvas_tokens, draw [R,1]. Outputs: h [R,1,D], k_new / v_new [L,R,kv,1,hd]."""
+
+    def __init__(self, painter: Painter):
+        super().__init__()
+        self.p = painter
+
+    def forward(self, x, cache_k, cache_v, cache_mask, start_pos, canvas_tokens, draw):
+        p = self.p
+        R = x.shape[0]
+        pos = start_pos[:, None]
+        neg = torch.where(cache_mask, 0.0, float("-inf"))[:, None, None, :]             # [R,1,1,Tmax]
+        ks, vs = [], []
+        for li, blk in enumerate(p.blocks):
+            a = blk.attn
+            rep = a.h // a.kv
+            q, k, v = a.qkv(blk.n1(x)).split([a.h * a.hd, a.kv * a.hd, a.kv * a.hd], dim=-1)
+            q = _OrtRotary.apply(q.reshape(R, a.h, 1, a.hd), pos, a.rope.cos, a.rope.sin)
+            k = _OrtRotary.apply(k.reshape(R, a.kv, 1, a.hd), pos, a.rope.cos, a.rope.sin)  # [R,kv,1,hd]
+            v = v.reshape(R, a.kv, 1, a.hd)
+            ks.append(k)
+            vs.append(v)
+            qg = q.reshape(R, a.kv, rep, a.hd) / math.sqrt(a.hd)                        # heads grouped by kv
+            s_c = torch.matmul(qg, cache_k[li].transpose(-1, -2)) + neg                 # [R,kv,rep,Tmax]
+            s_n = (qg * k).sum(-1, keepdim=True)                                        # [R,kv,rep,1]
+            w = torch.softmax(torch.cat([s_c, s_n], -1), dim=-1)
+            out = torch.matmul(w[..., :-1], cache_v[li]) + w[..., -1:] * v               # [R,kv,rep,hd]
+            x = x + a.o(out.reshape(R, 1, a.h * a.hd))
+            x = x + blk.ff(blk.n2(x))
+            if p.cfg.canvas and str(li) in p.cross:
+                c = p.cross[str(li)]
+                qc = c.q(c.norm_q(x)).reshape(R, c.h, 1, c.hd)
+                kc, vc = c.kv(c.norm_kv(canvas_tokens)).view(R, -1, 2, c.h, c.hd).permute(2, 0, 3, 1, 4)
+                full = torch.ones(R, 1, 1, kc.shape[2], dtype=torch.bool, device=x.device)
+                oc = c.o(_OnnxAttention.apply(qc, kc, vc, full).reshape(R, 1, c.h * c.hd))
+                x = x + torch.tanh(c.gate) * oc * draw.unsqueeze(-1).to(x.dtype)
+        return p.norm(x), torch.stack(ks), torch.stack(vs)
+
+
 class DecodeHeads(nn.Module):
     """Full-length attribute decoder pass -> logits for the event and every attribute."""
 

@@ -246,3 +246,24 @@ B=1 时主干每步从 1.66 ms 降到 0.91 ms。但 batch 大时反而变慢，�
 **下一步：原地更新的 KV cache。** 图只读 cache，只输出新位置的 k/v（`[L, R, kv, 1, hd]`）。
 注意力拆成“已有 cache”和“新 token”两部分来算（分数张量很小）。
 运行时用 `cudaMemcpy2DAsync` 按步长把新 k/v 写进 write_pos 那一格，这样每步就不用再拷整个 cache 了。
+
+### 原地更新的 KV cache（ChunkStepV3 / `chunk_inplace_r<R>`）
+
+图只**读** cache，只输出新位置的 `k_new` / `v_new`（`[L, R, kv, 1, hd]`）。注意力拆成两部分：
+已有 cache 的分数 `q·Kᵀ`（加上 mask）和新 token 的分数 `q·k_new`，拼在一起做一次 softmax，
+输出是 `P_cache·V_cache + p_new·v_new`。GQA 不再重复 K/V：q 看成 `[R, kv, rep, hd]`，直接和 `K [R, kv, Tmax, hd]` 做 matmul。
+运行时用两次 `cudaMemcpy2D`（设备到设备，步长 Tmax·hd）把 k/v 写进 `length` 那一格，
+再用一次 `cudaMemcpy2D`（主机到设备，步长 Tmax）写 mask。cur 不再交替，每组缓冲只捕获一张 CUDA Graph。
+
+一致性：与 ChunkCached 的最大差不超过 2.4e-6（导出时检查）。
+运行时 B=1 的记录与旧路径逐条相同；B=8 有 7/8 相同，剩下 1 条在第 254 个记录处分叉，
+和此前“cuda 对比纯 CPU”分叉的是同一条、同一个位置，属于浮点舍入影响到的边界样本。
+
+| 吞吐（records/s，3 次中位数，每个样本最多 400 个记录） | 旧路径 | ping-pong 单步图 | **原地 cache + CUDA Graph** |
+|---|---:|---:|---:|
+| B=1 | 247–279 | 314 | **311** |
+| B=8 | 779 | 743 | **822（+6%）** |
+| B=32 | 1123 | 1029 | **1271（+13%）** |
+
+batch 大时从慢 8% 变成快 13%，说明“每步整拷 cache”确实是瓶颈。
+这个对比还偏保守：旧路径在这里的 cache 只有 432 个位置，新路径固定是 1024 个；生成完整长度（平均约 735 个记录）时差距会更大。

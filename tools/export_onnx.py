@@ -192,6 +192,29 @@ def main() -> None:
             manifest["graphs"][name] = {"file": path.name, "inputs": names, "outputs": outs, "static_rows": R,
                                         "static_tmax": Tmax, "opset": 23}
             print(f"{name:13s} max|ort - chunk_cached| = {max(diffs):.2e}  ({path.stat().st_size / 1e6:.1f} MB)", flush=True)
+            # in-place variant (runtime v3): reads the cache, returns only the new k / v
+            from lpp.export import ChunkStepV3
+            name3, path3 = f"chunk_inplace_r{R}", args.out / f"chunk_inplace_r{R}.onnx"
+            names3 = ["x", "cache_k", "cache_v", "cache_mask", "start_pos", "canvas_tokens", "draw"]
+            pick = lambda t: (t[0], t[2], t[3], t[4], t[6], t[7], t[8])  # noqa: E731
+            torch.onnx.export(ChunkStepV3(mx).eval(), pick(example(R, 40)), str(path3), input_names=names3,
+                              output_names=["h", "k_new", "v_new"], opset_version=23, dynamo=False,
+                              custom_opsets={"com.microsoft": 1})
+            sess3 = ort.InferenceSession(str(path3), providers=["CPUExecutionProvider"])
+            diffs3 = []
+            for filled in (7, 300):
+                ins = example(R, filled)
+                with torch.no_grad():
+                    h_ref, ck_ref, cv_ref, _ = ChunkCached(mx)(*ins)
+                h3, kn, vn = sess3.run(None, {n: t.numpy() for n, t in zip(names3, pick(ins))})
+                wp = filled
+                diffs3.append(max(float(np.abs(h3 - h_ref.numpy()).max()),
+                                  float(np.abs(kn - ck_ref[:, :, :, wp:wp + 1].numpy()).max()),
+                                  float(np.abs(vn - cv_ref[:, :, :, wp:wp + 1].numpy()).max())))
+            report[name3] = {"max_abs_diff_vs_chunk_cached": max(diffs3), "bytes": path3.stat().st_size, "rows": R}
+            manifest["graphs"][name3] = {"file": path3.name, "inputs": names3, "outputs": ["h", "k_new", "v_new"],
+                                         "static_rows": R, "static_tmax": Tmax, "opset": 23, "cache": "in-place"}
+            print(f"{name3:13s} max|ort - chunk_cached| = {max(diffs3):.2e}  ({path3.stat().st_size / 1e6:.1f} MB)", flush=True)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (args.out / "codec.json").write_text(json.dumps(codec_tables(codec), indent=None))
     (args.out / "parity.json").write_text(json.dumps(report, indent=1))

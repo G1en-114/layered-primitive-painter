@@ -43,7 +43,9 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
   // static one-step graphs (export_onnx --step-batches) are exported for a cache of max_positions slots
   const bool step_graph =
 #ifdef LPP_HAVE_CUDART
-      g_.provider().rfind("cuda", 0) == 0 && g_.has("chunk_step_r" + std::to_string(R));
+      g_.provider().rfind("cuda", 0) == 0 &&
+      (g_.has("chunk_inplace_r" + std::to_string(R)) || g_.has("chunk_step_r" + std::to_string(R)));
+  const bool inplace = step_graph && g_.has("chunk_inplace_r" + std::to_string(R));
 #else
       false;
 #endif
@@ -148,10 +150,69 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
     length += 1;
     return h;
   };
+  // v3 (CUDA, T = 1): chunk_inplace_r<R> only reads the cache and returns the new position's k / v;
+  // they are written into slot `length` with one strided copy each, so no step copies the whole cache.
+  StepBuf ib;
+  auto chunk_inplace = [&](const Tensor& x, const Tensor& valid, const Tensor& tokens, const Tensor& draw) {
+    Graph& gs = g_["chunk_inplace_r" + std::to_string(R)];
+    const std::vector<int64_t> kv1{L, R, KV, 1, HD};
+    if (ib.val.empty()) {
+      ib.alloc = dev.alloc.get();
+      auto add = [&](size_t bytes, std::vector<int64_t> shape, ONNXTensorElementDataType t) {
+        void* q = ib.alloc->Alloc(bytes);
+        ib.ptr.push_back(q);
+        ib.val.push_back(Ort::Value::CreateTensor(dev.mem, q, bytes, shape.data(), shape.size(), t));
+      };
+      add(size_t(R) * D * 4, {R, 1, D}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);             // 0 x
+      add(size_t(R) * 8, {R}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);                        // 1 start_pos
+      add(tokens.f.size() * 4, tokens.shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);         // 2 canvas_tokens
+      add(size_t(R), {R, 1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL);                          // 3 draw
+      add(size_t(R) * D * 4, {R, 1, D}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);             // 4 h
+      const size_t kvb = size_t(L) * R * KV * HD * 4;
+      add(kvb, kv1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);                                  // 5 k_new
+      add(kvb, kv1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);                                  // 6 v_new
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto h2d = cudaMemcpyHostToDevice;
+    check(cudaMemcpy(ib.ptr[0], x.f.data(), x.f.size() * 4, h2d), "copy x");
+    check(cudaMemcpy(ib.ptr[1], next_pos.i.data(), size_t(R) * 8, h2d), "copy start_pos");
+    check(cudaMemcpy(ib.ptr[2], tokens.f.data(), tokens.f.size() * 4, h2d), "copy canvas_tokens");
+    check(cudaMemcpy(ib.ptr[3], draw.b.data(), draw.b.size(), h2d), "copy draw");
+    Ort::IoBinding io(gs.session());
+    io.BindInput("x", ib.val[0]);
+    io.BindInput("cache_k", dev.val[cur][0]);
+    io.BindInput("cache_v", dev.val[cur][1]);
+    io.BindInput("cache_mask", dev.val[cur][2]);
+    io.BindInput("start_pos", ib.val[1]);
+    io.BindInput("canvas_tokens", ib.val[2]);
+    io.BindInput("draw", ib.val[3]);
+    io.BindOutput("h", ib.val[4]);
+    io.BindOutput("k_new", ib.val[5]);
+    io.BindOutput("v_new", ib.val[6]);
+    Ort::RunOptions ro;
+    ro.AddConfigEntry("gpu_graph_id", std::to_string(cur).c_str());
+    gs.session().Run(ro, io);
+    io.SynchronizeOutputs();
+    // write slot `length`: L*R*KV rows of HD floats, stride Tmax*HD in the cache; mask row stride Tmax
+    const size_t row = size_t(HD) * 4, pitch = size_t(Tmax) * HD * 4;
+    auto* kc = static_cast<char*>(dev.ptr[cur][0]) + size_t(length) * row;
+    auto* vc = static_cast<char*>(dev.ptr[cur][1]) + size_t(length) * row;
+    check(cudaMemcpy2D(kc, pitch, ib.ptr[5], row, row, size_t(L) * R * KV, cudaMemcpyDeviceToDevice), "write k");
+    check(cudaMemcpy2D(vc, pitch, ib.ptr[6], row, row, size_t(L) * R * KV, cudaMemcpyDeviceToDevice), "write v");
+    check(cudaMemcpy2D(static_cast<char*>(dev.ptr[cur][2]) + length, size_t(Tmax), valid.b.data(), 1, 1, size_t(R), h2d),
+          "write mask");
+    Tensor h = Tensor::F({R, 1, D});
+    check(cudaMemcpy(h.f.data(), ib.ptr[4], h.f.size() * 4, cudaMemcpyDeviceToHost), "copy h");
+    Profile::add("chunk_inplace", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    for (int r = 0; r < R; ++r) next_pos.i[r] += valid.b[r];
+    length += 1;
+    return h;
+  };
 #endif
   auto chunk_device = [&](const Tensor& x, const Tensor& valid, const Tensor& tokens, const Tensor& draw) {
 #ifdef LPP_HAVE_CUDART
-    if (step_graph && cur >= 0 && x.shape[1] == 1) return chunk_step(x, valid, tokens, draw);
+    if (step_graph && cur >= 0 && x.shape[1] == 1)
+      return inplace ? chunk_inplace(x, valid, tokens, draw) : chunk_step(x, valid, tokens, draw);
 #endif
     Graph& gc = g_["chunk_cached"];
     const int T = static_cast<int>(x.shape[1]);

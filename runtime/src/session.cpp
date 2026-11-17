@@ -139,7 +139,7 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   for (auto& [name, g] : m["graphs"].items()) {
     const bool backbone = name == "chunk" || name == "chunk_cached";
     const bool on_gpu = cuda && (provider == "cuda-all" || backbone || (provider != "cuda-hybrid" && name == "decode_heads"));
-    const bool step = name.rfind("chunk_step_r", 0) == 0;
+    const bool step = name.rfind("chunk_step_r", 0) == 0 || name.rfind("chunk_inplace_r", 0) == 0;
     if (step && !cuda) continue;                   // the static step graphs are a CUDA-only path
     graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(),
                                             step ? so_step : on_gpu ? so_gpu : so_cpu,
