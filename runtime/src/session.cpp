@@ -100,28 +100,46 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   std::ifstream f(dir + "/manifest.json");
   if (!f) throw std::runtime_error("cannot open " + dir + "/manifest.json");
   const auto m = nlohmann::json::parse(f);
-  Ort::SessionOptions so;
-  so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-  so.SetIntraOpNumThreads(4);
-  if (provider == "cuda" || provider == "cuda-tf32") {
-    // V2 options: ORT's CUDA EP runs FP32 matmuls in TF32 by default (10-bit mantissa), which
-    // changes logits enough to fork sampled sequences within a few records. Parity runs keep
-    // full FP32; "cuda-tf32" opts into the faster mode.
-    const OrtApi& api = Ort::GetApi();
-    OrtCUDAProviderOptionsV2* opt = nullptr;
-    Ort::ThrowOnError(api.CreateCUDAProviderOptions(&opt));
-    const char* keys[] = {"device_id", "use_tf32"};
-    const char* vals[] = {"0", provider == "cuda-tf32" ? "1" : "0"};
-    Ort::ThrowOnError(api.UpdateCUDAProviderOptions(opt, keys, vals, 2));
-    so.AppendExecutionProvider_CUDA_V2(*opt);
-    api.ReleaseCUDAProviderOptions(opt);
-  } else if (provider != "cpu") {
-    throw std::runtime_error("provider must be cpu, cuda or cuda-tf32");
-  }
-  for (auto& [name, g] : m["graphs"].items())
-    graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(), so,
+  // Placement per graph. "cuda" puts every graph on the GPU; "cuda-hybrid" only the backbone
+  // (chunk / chunk_cached): at batch 1 the attribute heads, record embedding and canvas encoder are
+  // tiny and launch-bound, and run faster on the CPU (0.22 vs 0.40 ms per decode_heads call); the
+  // backbone's output h is copied to the host anyway, so the split adds no transfer.
+  //   cuda-all    : every graph on the GPU (parity reference)
+  //   cuda        : backbone + attribute heads on the GPU; record/text embedding and canvas encoder on the
+  //                 CPU (each costs ~19 ms per call on the CUDA EP here, < 0.5 ms on the CPU)
+  //   cuda-hybrid : only the backbone on the GPU (best at batch 1-2, where the heads are launch-bound)
+  //   cuda-tf32   : as cuda, with TF32 matmuls
+  const bool cuda = provider == "cuda" || provider == "cuda-tf32" || provider == "cuda-hybrid" || provider == "cuda-all";
+  if (!cuda && provider != "cpu")
+    throw std::runtime_error("provider must be cpu, cuda, cuda-all, cuda-hybrid or cuda-tf32");
+  auto make_options = [&](bool gpu) {
+    Ort::SessionOptions so;
+    so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    so.SetIntraOpNumThreads(4);
+    if (gpu) {
+      // V2 options: ORT's CUDA EP runs FP32 matmuls in TF32 by default (10-bit mantissa), which
+      // changes logits enough to fork sampled sequences within a few records. Parity runs keep
+      // full FP32; "cuda-tf32" opts into the faster mode. cuDNN's default EXHAUSTIVE algorithm
+      // search made every canvas_enc call take ~21 ms; HEURISTIC picks an algorithm without timing.
+      const OrtApi& api = Ort::GetApi();
+      OrtCUDAProviderOptionsV2* opt = nullptr;
+      Ort::ThrowOnError(api.CreateCUDAProviderOptions(&opt));
+      const char* keys[] = {"device_id", "use_tf32", "cudnn_conv_algo_search"};
+      const char* vals[] = {"0", provider == "cuda-tf32" ? "1" : "0", "HEURISTIC"};
+      Ort::ThrowOnError(api.UpdateCUDAProviderOptions(opt, keys, vals, 3));
+      so.AppendExecutionProvider_CUDA_V2(*opt);
+      api.ReleaseCUDAProviderOptions(opt);
+    }
+    return so;
+  };
+  Ort::SessionOptions so_gpu = make_options(cuda), so_cpu = make_options(false);
+  for (auto& [name, g] : m["graphs"].items()) {
+    const bool backbone = name == "chunk" || name == "chunk_cached";
+    const bool on_gpu = cuda && (provider == "cuda-all" || backbone || (provider != "cuda-hybrid" && name == "decode_heads"));
+    graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(), on_gpu ? so_gpu : so_cpu,
                                             g["inputs"].get<std::vector<std::string>>(),
                                             g["outputs"].get<std::vector<std::string>>(), name);
+  }
 }
 
 }  // namespace lpp

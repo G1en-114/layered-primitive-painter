@@ -1,7 +1,7 @@
 // lpp_paint: text features -> layered primitive sequences -> PNG, on the exported ONNX graphs.
 //
 //   lpp_paint --onnx out/onnx/small_t0 --text text.npy --text-valid text_valid.npy
-//             --uniforms uniforms.npy --out out/runtime_run [--provider cpu|cuda] [--cfg-scale 2]
+//             --uniforms uniforms.npy --out out/runtime_run [--provider cpu|cuda|cuda-auto|cuda-hybrid|cuda-all|cuda-tf32] [--cfg-scale 2]
 //             [--top-p 0.9] [--max-records 300] [--require 0,2]
 //
 // uniforms.npy: float32 [max_records, 1 + A, B]; field 0 = event, 1 + i = attribute i (the same
@@ -36,9 +36,13 @@ int main(int argc, char** argv) {
       return 2;
     }
   try {
-    Painter painter(a["--onnx"], a["--provider"]);
-    const Protocol& P = painter.protocol();
     NpyArray text = load_npy(a["--text"]), tv = load_npy(a["--text-valid"]), un = load_npy(a["--uniforms"]);
+    // cuda-auto: placement by batch size (measured on RTX 5070 Laptop: the CPU wins the small graphs
+    // at batch 1-2, the GPU wins them from batch 8 on)
+    std::string provider = a["--provider"];
+    if (provider == "cuda-auto") provider = (!text.shape.empty() && text.shape[0] <= 2) ? "cuda-hybrid" : "cuda";
+    Painter painter(a["--onnx"], provider);
+    const Protocol& P = painter.protocol();
     if (text.dtype != "<f4" || text.shape.size() != 3) throw std::runtime_error("text must be float32 [B, Lt, D]");
     const int B = static_cast<int>(text.shape[0]), Lt = static_cast<int>(text.shape[1]);
     const int fields = static_cast<int>(un.shape[1]), steps = static_cast<int>(un.shape[0]);
@@ -86,9 +90,9 @@ int main(int argc, char** argv) {
     save_npy(a["--out"] + "/lengths.npy", "<i8", {B}, lens.data(), lens.size() * 8);
     std::ofstream(a["--out"] + "/timing.json") << "{\"seconds\": " << secs << ", \"records\": " << total
                                                << ", \"records_per_s\": " << total / secs << ", \"provider\": \""
-                                               << a["--provider"] << "\"}\n";
+                                               << provider << "\"}\n";
     std::printf("%d sequences, %zu records in %.2fs (%.0f records/s, %s)\n", B, total, secs, total / secs,
-                a["--provider"].c_str());
+                provider.c_str());
     Profile::report();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
