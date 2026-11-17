@@ -169,3 +169,20 @@ CUDA Graph 只再省了 5%。剖析一下：一步要跑 **489 个算子**，没
 **下一步：算子融合。** 导出时把 RoPE、注意力、归一化写成 ORT 的融合算子
 （`com.microsoft` 的 `RotaryEmbedding`、`GroupQueryAttention`、`SkipSimplifiedLayerNormalization`），
 目标是把一步的 kernel 数降到几十个，然后再接 CUDA Graph。验收方式不变：token 与现在一致，再测吞吐。
+
+### 融合 RoPE（`com.microsoft::RotaryEmbedding`，2026-11-17）
+
+`Chunk(fused_rope=True)` 把每次旋转编码导出成一个 `RotaryEmbedding` 节点（半分布局，`interleaved=0`，
+cos/sin 表的形状是 `[max_pos, hd/2]`），代替原来约 8 个节点组成的链。这一步共 16 次旋转，原始节点数从 1373 降到 1045。
+
+| 主干单步（R=2） | 每次调用 | 与动态版的最大差 |
+|---|---:|---:|
+| chunk_cached（动态形状） | 1.339 ms | — |
+| chunk_step（定形） | 1.079 ms | 0 |
+| + 融合 RoPE | 0.969 ms | 9.5e-7 |
+| + 融合 RoPE + CUDA Graph | **0.935 ms** | 9.5e-7 |
+
+最大差 9.5e-7 是 FP32 运算顺序不同带来的舍入误差。下一步是注意力：
+ORT 的 GroupQueryAttention 只支持“每行连续的有效前缀”，表达不了 cache mask 里由文字前缀 padding 造成的空洞，
+所以准备改用 ONNX 标准的 `Attention` 算子（opset 23）。它原生支持 GQA 和任意的布尔 mask，
+能把每层的 Tile（重复 KV 头）、matmul、mask、softmax 合并成一个节点。

@@ -70,12 +70,35 @@ class CanvasEnc(nn.Module):
         return self.p.canvas_enc(canvas)
 
 
-class Chunk(nn.Module):
-    """Backbone over T new positions given an explicit past cache (see module docstring)."""
+class _OrtRotary(torch.autograd.Function):
+    """Half-split rotary embedding; exported as one com.microsoft::RotaryEmbedding node (interleaved=0)
+    instead of the ~8-node gather / split / mul / sub / concat chain per application (132 of 497 nodes
+    in the one-step graph). x [B, H, T, hd] (BNSH), pos [B, T], cos / sin caches [max_pos, hd / 2]."""
 
-    def __init__(self, painter: Painter):
+    @staticmethod
+    def forward(ctx, x, pos, cos, sin):
+        c, s = cos[pos].unsqueeze(1).to(x.dtype), sin[pos].unsqueeze(1).to(x.dtype)
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
+
+    @staticmethod
+    def symbolic(g, x, pos, cos, sin):
+        out = g.op("com.microsoft::RotaryEmbedding", x, pos, cos, sin, interleaved_i=0)
+        out.setType(x.type())                    # same shape / dtype as x (no exporter shape inference)
+        return out
+
+
+class Chunk(nn.Module):
+    """Backbone over T new positions given an explicit past cache (see module docstring).
+    fused_rope: rotary embedding as ORT's contrib op (export needs custom_opsets={"com.microsoft": 1})."""
+
+    def __init__(self, painter: Painter, fused_rope: bool = False):
         super().__init__()
         self.p = painter
+        self.fused_rope = fused_rope
+
+    def _rope(self, a, t, pos):
+        return _OrtRotary.apply(t, pos, a.rope.cos, a.rope.sin) if self.fused_rope else a.rope(t, pos)
 
     def forward(self, x, valid, past_k, past_v, past_mask, start_pos, canvas_tokens, draw):
         p = self.p
@@ -91,8 +114,8 @@ class Chunk(nn.Module):
             a = blk.attn
             hn = blk.n1(x)
             q, k, v = a.qkv(hn).split([a.h * a.hd, a.kv * a.hd, a.kv * a.hd], dim=-1)
-            q = a.rope(q.view(B, T, a.h, a.hd).transpose(1, 2), pos)
-            k = a.rope(k.view(B, T, a.kv, a.hd).transpose(1, 2), pos)
+            q = self._rope(a, q.view(B, T, a.h, a.hd).transpose(1, 2), pos)
+            k = self._rope(a, k.view(B, T, a.kv, a.hd).transpose(1, 2), pos)
             v = v.view(B, T, a.kv, a.hd).transpose(1, 2)
             ks.append(k)
             vs.append(v)
@@ -141,9 +164,9 @@ class ChunkStep(nn.Module):
     more; any CPU node rules out CUDA Graph. Here the shapes are constants of the export and the new
     position is written with a one-hot select instead of slicing, so the whole graph can stay on the GPU."""
 
-    def __init__(self, painter: Painter):
+    def __init__(self, painter: Painter, fused_rope: bool = False):
         super().__init__()
-        self.chunk = Chunk(painter)
+        self.chunk = Chunk(painter, fused_rope=fused_rope)
 
     def forward(self, x, valid, cache_k, cache_v, cache_mask, write_pos, start_pos, canvas_tokens, draw):
         h, k_new, v_new = self.chunk(x, valid, cache_k, cache_v, cache_mask, start_pos, canvas_tokens, draw)
