@@ -119,6 +119,9 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--step-batches", type=int, nargs="*", default=[],
+                    help="also export the static one-step backbone (lpp.export.ChunkStepV2) for these row counts R "
+                         "(R = 2 x images with CFG): graphs chunk_step_r<R>, opset 23 + com.microsoft, CUDA Graph capable")
     args = ap.parse_args()
     import onnxruntime as ort
     args.out.mkdir(parents=True, exist_ok=True)
@@ -154,6 +157,41 @@ def main() -> None:
         manifest["graphs"][name] = {"file": path.name, "inputs": sp["names"], "outputs": sp["outputs"],
                                     "dynamic_axes": {k: {str(a): v for a, v in ax.items()} for k, ax in sp["axes"].items()}}
         print(f"{name:13s} max|ort - torch| = {max(diffs):.2e}  ({path.stat().st_size / 1e6:.1f} MB)", flush=True)
+    if args.step_batches:
+        from lpp.export import ChunkCached, ChunkStepV2, exportable
+        mx = exportable(m)                       # nn.RMSNorm -> ManualRMSNorm (no aten::rms_norm in ONNX)
+        c = m.cfg
+        hd, Tmax, NT = c.d_model // c.n_heads, c.max_positions, (c.canvas_size // 8) ** 2
+        names = ["x", "valid", "cache_k", "cache_v", "cache_mask", "write_pos", "start_pos", "canvas_tokens", "draw"]
+        outs = ["h", "cache_k_out", "cache_v_out", "cache_mask_out"]
+        for R in args.step_batches:
+            g = torch.Generator().manual_seed(R)
+
+            def example(R, filled):
+                cm = torch.zeros(R, Tmax, dtype=torch.bool)
+                cm[:, :filled] = torch.rand(R, filled, generator=g) > 0.2     # holes, like padded text prefixes
+                return (torch.randn(R, 1, c.d_model, generator=g), torch.rand(R, 1, generator=g) > 0.1,
+                        torch.randn(c.n_layers, R, c.n_kv_heads, Tmax, hd, generator=g),
+                        torch.randn(c.n_layers, R, c.n_kv_heads, Tmax, hd, generator=g), cm,
+                        torch.tensor(filled, dtype=torch.long), torch.randint(0, filled, (R,), generator=g),
+                        torch.randn(R, NT, c.d_model, generator=g), torch.rand(R, 1, generator=g) > 0.5)
+            name, path = f"chunk_step_r{R}", args.out / f"chunk_step_r{R}.onnx"
+            step = ChunkStepV2(mx).eval()
+            torch.onnx.export(step, example(R, 40), str(path), input_names=names, output_names=outs,
+                              opset_version=23, dynamo=False, custom_opsets={"com.microsoft": 1})
+            sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            diffs = []
+            for filled in (7, 300):                    # parity against the dynamic graph's module
+                ins = example(R, filled)
+                with torch.no_grad():
+                    ref = ChunkCached(mx)(*ins)
+                got = sess.run(None, {n: t.numpy() for n, t in zip(names, ins)})
+                diffs.append(max(float(np.abs(a.astype(np.float64) - b.numpy().astype(np.float64)).max())
+                                 for a, b in zip(got, ref)))
+            report[name] = {"max_abs_diff_vs_chunk_cached": max(diffs), "bytes": path.stat().st_size, "rows": R}
+            manifest["graphs"][name] = {"file": path.name, "inputs": names, "outputs": outs, "static_rows": R,
+                                        "static_tmax": Tmax, "opset": 23}
+            print(f"{name:13s} max|ort - chunk_cached| = {max(diffs):.2e}  ({path.stat().st_size / 1e6:.1f} MB)", flush=True)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (args.out / "codec.json").write_text(json.dumps(codec_tables(codec), indent=None))
     (args.out / "parity.json").write_text(json.dumps(report, indent=1))
