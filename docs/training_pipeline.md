@@ -199,20 +199,51 @@ DDP 会一直等这些参数的梯度。修法是在包装 DDP 之前把它们�
 
 ---
 
-## 6. 部署（`docs/runtime_design.md`）
+## 6. 部署（`docs/runtime_design.md`、`docs/quant_report.md`）
 
-- 导出成 5 个 ONNX 图，外加一个“cache 在图内更新”的版本（`chunk_cached`）。
-  KV cache 改成由运行时管理的静态缓冲区；注意力手写（GQA 通过重复 KV 头实现），RMSNorm 也手写，以兼容 opset 18。
-  ORT 与 PyTorch 的误差在 1e-5 以内。
-- C++ 运行时：CMake 构建，链接 ORT 1.32。语法、采样、码本解码、光栅化都用 C++ 实现；
-  KV cache 用 IOBinding 在显存里开两组缓冲交替读写（ping-pong）。
-- 一致性：
-  1. 逆 CDF 按词表顺序累计之后，Python ORT 与 PyTorch 6/6 条序列完全一致。
-  2. C++ 与 Python ORT 4/6 条完全一致，剩下 2 条在第 100 条 record 之后才分叉，原因是画布光栅化的浮点差异。
-  3. ORT 的 CUDA EP 默认打开 TF32，**会在 2–8 条 record 内就让采样分叉**；关掉之后 CPU 与 CUDA 6/6 一致。
-- 速度：C++ CPU 版 288 records/s，Python 循环 40 records/s。在 batch 12、一次只算一个位置的情况下，
-  GPU 上的瓶颈是 kernel 启动开销。下一步是 CUDA Graph、TensorRT 和 FP16/INT8 量化。
-  量化之后不能再要求逐 token 一致，要用分布层面的指标来验收。
+### 6.1 导出和运行时（基础版）
+- 导出成 6 个 ONNX 图。KV cache 是由运行时管理的静态缓冲区，注意力和 RMSNorm 都是手写的。ORT 与 PyTorch 的误差在 1e-5 以内。
+- C++ 运行时：CMake 构建，链接 ORT 1.32。语法、采样、码本解码、光栅化都在 C++ 里实现；用 IOBinding 让 KV cache 一直留在显存里。
+- 一致性：逆 CDF 按词表顺序累计，Python ORT 与 PyTorch 的序列 6/6 完全一致。
+  ORT 的 CUDA EP 默认打开 TF32，这会让采样在第 2–8 个记录就分叉；关掉之后 CPU 与 CUDA 6/6 一致。
+
+### 6.2 量化（`docs/quant_report.md`）
+- 工具：`quantize_onnx.py`（FP16 / 动态 INT8 / 仅权重 INT8 和 INT4），`quant_eval.py`（两层验收）。
+- **验收方法**：量化后采样在第 2–3 步就会分叉，所以逐 token 对比没有意义。
+  - 第一层：记录 FP32 生成时每个图实际收到的输入，喂给量化后的图，比较单步输出（KL、top-1 一致率、相对误差）。
+  - 第二层：比较生成分布（48 条提示词，CLIP 分数、长度）。
+- 结果：
+  - FP16：KL 2e-5，top-1 一致率 99%，几乎无损；B=32 时快 15%。
+  - 动态 INT8：在 CPU 上 B=1 时快 63%（AVX-512 VNNI 指令）；单步 KL 1.8e-3，生成分布看不出差别。
+  - 仅权重量化在这个 20M 的小模型上不划算：解码受启动延迟限制，不受带宽限制。
+- 教训：在 Python 循环里测速，结论会反过来（INT8 测出来慢 10%，用 C++ 测是快 63%）；每个配置跑 3 次取中位数。
+
+### 6.3 运行时优化：B=8 从 735 到 1010 records/s（+37%，生成结果逐条相同）
+
+| 步骤 | 剖析出的瓶颈 | 改动 | B=8 records/s |
+|---|---|---|---:|
+| 0 | — | 全部放 GPU，动态形状，KV cache 用 ping-pong 两组缓冲 | 735 |
+| 1 | 小图在 GPU 上被启动延迟拖慢（输出头每次 0.40 ms，在 CPU 上 0.22 ms） | 按图放到 CPU 或 GPU，`cuda-auto` 按 batch 自动选 | 765 |
+| 2 | 主干 857 个节点里 241 个在 CPU 上（动态形状带来的形状计算），用不了 CUDA Graph | 定形的单步主干，融合 RoPE（`RotaryEmbedding`）和注意力（ONNX `Attention`-23），接 CUDA Graph | 743 |
+| 3 | 第 2 步单独看反而变慢：ping-pong 每步都要整拷 KV cache（R=64 时约 1 GB 流量） | 原地更新 cache：图只读 cache，用 `cudaMemcpy2D` 写入新的那一格 | 822 |
+| 4 | 输出头占了 62% | 输出头也定形，接 CUDA Graph | 877 |
+| 5 | 每次调用都把 9 个 logits 全拷回主机 | 只拷采样要用的那一个 | **1010** |
+
+B=32 时 1118 → 1472（+32%），B=1 时 271 → 303（+12%，配合 hybrid 放置）。
+主干单步从 1.33 ms 降到 0.77 ms（−42%），算子从 489 个降到约 300 个。
+**每一步的做法都一样：先剖析出瓶颈，再改，然后检查生成的记录是否逐条相同，最后测吞吐（3 次中位数）。**
+
+### 6.4 踩过的坑（面试时可以讲）
+- ORT 1.32 的 CUDA EP 加载不了 pip 装的 cuDNN（它找的是无版本号的 `libcudnn.so`，补软链接后又报找不到符号）。
+  Conv 在 CUDA 上走的是慢路径（每次 19 ms），所以把含 Conv 的图放到 CPU 上绕过去。
+- 布尔型的 `Where` 在 ORT 里没有 kernel，改用 `(hot & valid) | (~hot & mask)`。
+- 读结果之前要先 `SynchronizeOutputs`：ORT 用的是它自己的 CUDA stream，不同步就会读到没写完的数据。
+- pip 包里的 cudart 缺头文件 `crt/host_defines.h`：头文件用 /opt/cuda 的（同一个大版本），库用 pip 包里的，
+  这样进程里只有 ORT 加载的那一个 CUDA 运行时。
+
+### 6.5 下一步
+- 把属性采样（top-p、逆 CDF、CFG 合并）搬进图里，每个记录的调用次数从 9 次降到 2 次。
+- 解决 cuDNN 依赖后做 TensorRT 对比；CPU 上做静态 INT8（QDQ 加校准）。
 
 ---
 
@@ -230,7 +261,10 @@ DDP 会一直等这些参数的梯度。修法是在包装 DDP 之前把它们�
    ZeRO-1/2/3 依次再切分优化器状态、梯度、参数；FSDP 相当于 ZeRO-3。小模型用 DDP 最简单；
    1B 在 24GB 的卡上需要 FSDP 加激活重计算。这个项目里 DDP 已经实现，并验证了正确性（第 2 节），扩展效率待测。
 7. **为什么 GPU 上的推理比 CPU 还慢，怎么优化？** 自回归每次只算一个位置，batch 又小，kernel 启动开销占主导。
-   用 IOBinding 把 cache 留在显存；用 CUDA Graph 消除启动开销；用 TensorRT 做算子融合；做批量和连续批处理。
+   这个项目里实际做过并量化了的手段（见 6.3）：按图放置，小图放 CPU；定形导出，把形状计算消掉；
+   融合算子（RoPE、注意力）；CUDA Graph；原地更新 KV cache，避免每步整拷；只拷回需要的输出。
+   B=8 时吞吐提高 37%，生成结果逐条相同。
+   要讲清楚的一点是：CUDA Graph 只省掉 CPU 端的启动开销，kernel 数量太多时还得靠融合。
 8. **怎么验证导出和移植是正确的？** 先逐个图对比数值，再在同样的随机数下逐 token 对比序列；
    注意 TF32 这类隐藏的精度模式；记录第一次分叉的位置，并分析原因。
 9. **讲一次性能优化的过程。** 先测出瓶颈，再改，再证明结果没变，最后测速度（`docs/perf_log.md` 里的 4 个例子）。
