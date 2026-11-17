@@ -9,6 +9,12 @@ rendered and scored by the frozen Chinese-CLIP (image-text similarity) minus an 
 penalty and an early-stop penalty; advantages are normalised within each prompt's group;
 the policy takes the clipped surrogate step with a k3 KL penalty to the frozen initial model.
 Samples with guidance for the fixed prompts of train.py are rendered every --sample-every.
+
+v2 options (realism, 2026-11-17): --source-emb adds a reward for looking like the prompt's own
+source image (CLIP image-image cosine; an anime prompt is pulled towards its anime source, a photo
+prompt towards its photo, so "realistic" never means "photographic"); --anime-frac draws that share
+of prompts from anime captions when the pool holds both domains; the attribute reward only exists
+for CelebA images, so other groups get no attribute advantage.
 """
 from __future__ import annotations
 
@@ -87,6 +93,11 @@ def main() -> None:
     ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for the periodic sample grid only")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--source-emb", type=Path, default=None,
+                    help="npz (ids, emb) from tools/source_embeddings.py: reward likeness to the prompt's source image")
+    ap.add_argument("--w-src", type=float, default=1.0, help="per-component weight of the source-likeness advantage")
+    ap.add_argument("--anime-frac", type=float, default=None,
+                    help="share of prompts drawn from anime captions (default: as they come in the pool)")
     ap.add_argument("--keep-snapshots", action="store_true",
                     help="also write weights-only model_stepNNN.pt at every save (for evaluation off the run)")
     ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto")
@@ -135,10 +146,27 @@ def main() -> None:
         clf = AttrClassifier(args.attr_classifier, dev)
 
         def attr_fn(images, image_ids):
-            """mean probability the classifier gives the source image's true value, over REWARD_ATTRS"""
-            p = clf.probs(np.stack(images))[:, cols].cpu()
-            t = torch.stack([labels[i] for i in image_ids])
-            return (t * p + (1 - t) * (1 - p)).mean(1)
+            """mean probability the classifier gives the source image's true value, over REWARD_ATTRS;
+            NaN for images without CelebA labels (anime)"""
+            out = torch.full((len(image_ids),), float("nan"))
+            have = [k for k, i in enumerate(image_ids) if i in labels]
+            if have:
+                p = clf.probs(np.stack([images[k] for k in have]))[:, cols].cpu()
+                t = torch.stack([labels[image_ids[k]] for k in have])
+                out[have] = (t * p + (1 - t) * (1 - p)).mean(1)
+            return out
+    src_emb = None
+    if args.source_emb is not None:
+        z = np.load(args.source_emb)
+        src_row = {int(i): r for r, i in enumerate(z["ids"])}
+        src_emb = torch.from_numpy(z["emb"].astype(np.float32))
+        missing = sum(i not in src_row for _, i in pool)
+        if missing:
+            raise SystemExit(f"--source-emb lacks {missing} of the {len(pool)} prompt images")
+    anime_pool = [p for p in pool if p[0].startswith("动漫")]
+    face_pool = [p for p in pool if not p[0].startswith("动漫")]
+    if args.anime_frac is not None and not (anime_pool and face_pool):
+        ap.error("--anime-frac needs both anime and face prompts in the pool")
     sc = SampleConfig(temperature=1.0, top_p=1.0, cfg_scale=1.0, require_before_eos=REQUIRE,
                       max_records=args.max_records)
     (args.out / "config.json").write_text(json.dumps(vars(args) | {"init_step": src.get("step"),
@@ -150,7 +178,10 @@ def main() -> None:
 
     while step < args.steps:
         t0 = time.perf_counter()
-        picks = [rng.choice(pool) for _ in range(args.prompts)]
+        if args.anime_frac is None:
+            picks = [rng.choice(pool) for _ in range(args.prompts)]
+        else:
+            picks = [rng.choice(anime_pool if rng.random() < args.anime_frac else face_pool) for _ in range(args.prompts)]
         rep = [c for c, _ in picks for _ in range(args.group)]
         rep_ids = [i for _, i in picks for _ in range(args.group)]
         with torch.no_grad():
@@ -160,7 +191,8 @@ def main() -> None:
         t_gen = time.perf_counter()
         images, orphans, faces = render(seqs, codec)
         r = rewards(images, orphans, faces, rep, clip, rcfg,
-                    attr_agreement=attr_fn(images, rep_ids) if attr_fn is not None else None)
+                    attr_agreement=attr_fn(images, rep_ids) if attr_fn is not None else None,
+                    source=src_emb[[src_row[i] for i in rep_ids]] if src_emb is not None else None)
         if args.adv_mode == "sum":
             adv = group_advantages(r["reward"], args.group)
         else:
@@ -168,7 +200,11 @@ def main() -> None:
             adv = args.w_clip * group_advantages(clip_term, args.group)
             adv = adv + args.w_orphan * group_advantages(-r["orphan"], args.group)
             if "attr" in r:
-                adv = adv + args.w_attr * group_advantages(r["attr"], args.group)
+                has = ~torch.isnan(r["attr"])        # groups are one prompt, so one domain each
+                a_adv = group_advantages(torch.nan_to_num(r["attr"]), args.group)
+                adv = adv + args.w_attr * torch.where(has, a_adv, torch.zeros_like(a_adv))
+            if "src" in r:
+                adv = adv + args.w_src * group_advantages(r["src"], args.group)
         adv = adv.to(dev)
         # micro-batches with gradient accumulation: the loss is a mean over sequences, so
         # chunk losses weighted by chunk/total sum to the full-batch loss (same gradient)
@@ -200,7 +236,9 @@ def main() -> None:
         rec = {"step": step, "reward": round(float(r["reward"].mean()), 4),
                "reward_std_in_group": round(float(r["reward"].view(-1, args.group).std(1).mean()), 4),
                "clip": round(float(r["clip"].mean()), 4), "orphan": round(float(r["orphan"].mean()), 4),
-               **({"attr": round(float(r["attr"].mean()), 4)} if "attr" in r else {}),
+               **({"attr": round(float(r["attr"].nanmean()), 4)} if "attr" in r else {}),
+               **({"src": round(float(r["src"].mean()), 4)} if "src" in r else {}),
+               "anime_share": round(sum(c.startswith("动漫") for c in rep) / len(rep), 3),
                "face": round(float(r["face"].mean()), 4),
                "length": round(sum(len(s) for s in seqs) / len(seqs), 1), "gnorm": round(gnorm, 4),
                **{k: round(v, 5) for k, v in stats.items()},

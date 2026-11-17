@@ -34,6 +34,7 @@ class RewardConfig:
     orphan_weight: float = 0.2      # 100 * orphan rate * this: 5% orphans -> -1 point
     early_penalty: float = 5.0      # no skin layer: not a face
     attr_weight: float = 0.0        # points for full agreement with the prompt image's attributes
+    src_weight: float = 1.0         # x 100 * cosine to the source image (only with source embeddings)
     image_size: int = 256
 
 
@@ -91,9 +92,12 @@ def render(seqs: list[DrawSeq], codec: Codec, size: int = 256) -> tuple[list[np.
 
 @torch.no_grad()
 def rewards(images, orphans, faces, prompts: list[str], clip: ClipScorer, cfg: RewardConfig,
-            attr_agreement: torch.Tensor | None = None) -> dict:
+            attr_agreement: torch.Tensor | None = None, source: torch.Tensor | None = None) -> dict:
     """attr_agreement [B] in [0, 1]: optional, e.g. mean classifier probability of the prompt
-    image's true attribute values (computed by the caller, which knows the source labels)."""
+    image's true attribute values (computed by the caller, which knows the source labels); NaN
+    where an image has no labels (left out of the total).
+    source [B, D]: optional L2-normalised CLIP embeddings of each prompt's source image; "src" is
+    100 * cosine(generated image, source image) in the same CLIP space as "clip"."""
     img, txt = clip.images(images), clip.texts(prompts)
     clip_score = 100 * (img * txt).sum(1).cpu()
     orphan = torch.tensor(orphans)
@@ -102,8 +106,12 @@ def rewards(images, orphans, faces, prompts: list[str], clip: ClipScorer, cfg: R
     out = {"clip": clip_score, "orphan": orphan, "face": face}
     if attr_agreement is not None:
         agree = attr_agreement.float().cpu()
-        total = total + cfg.attr_weight * agree
+        total = total + cfg.attr_weight * torch.nan_to_num(agree)
         out["attr"] = agree
+    if source is not None:
+        src = 100 * (img.cpu() * source.float().cpu()).sum(1)
+        total = total + cfg.src_weight * src
+        out["src"] = src
     out["reward"] = total
     return out
 

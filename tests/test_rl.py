@@ -1,5 +1,6 @@
 """GRPO pieces: grammar replay, exact record log-probs, advantages and the surrogate loss."""
 import pytest
+import numpy as np
 import torch
 
 from lpp.codec import Codec
@@ -117,3 +118,27 @@ def test_generate_continues_forced_prefixes(setup):
     a = generate(model, batch=1, cfg=sc2, codec=codec, generator=g())
     b = generate(model, batch=1, cfg=sc2, codec=codec, generator=g(), forced=[cut(full, 1)])
     assert torch.equal(a[0].event, b[0].event) and torch.equal(a[0].attrs, b[0].attrs)
+
+
+class _FakeClip:
+    """Deterministic stand-in for ClipScorer: image embedding = normalised mean colour."""
+    def images(self, arrays):
+        e = torch.tensor(np.stack([a.reshape(-1, 3).mean(0) for a in arrays]), dtype=torch.float32) + 1.0
+        return torch.nn.functional.normalize(e, dim=-1)
+
+    def texts(self, captions):
+        return torch.nn.functional.normalize(torch.ones(len(captions), 3), dim=-1)
+
+
+def test_rewards_source_likeness_and_missing_attributes():
+    from lpp.rl import RewardConfig, rewards
+    imgs = [np.zeros((4, 4, 3), np.uint8), np.full((4, 4, 3), 255, np.uint8)]
+    clip = _FakeClip()
+    src = clip.images(imgs[::-1])                         # each image's "source" is the other one
+    attr = torch.tensor([0.8, float("nan")])              # second image has no CelebA labels
+    r = rewards(imgs, [0.0, 0.0], [True, True], ["a", "b"], clip, RewardConfig(attr_weight=5.0, src_weight=1.0),
+                attr_agreement=attr, source=src)
+    assert torch.allclose(r["src"], 100 * (clip.images(imgs) * src).sum(1))
+    assert torch.isfinite(r["reward"]).all()                              # NaN attributes stay out of the total
+    assert torch.isclose(r["reward"][0] - r["clip"][0] - r["src"][0], torch.tensor(5.0 * 0.8))
+    assert torch.isclose(r["reward"][1], r["clip"][1] + r["src"][1])
