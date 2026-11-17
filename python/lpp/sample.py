@@ -115,7 +115,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     if forced is not None and len(forced) != B:
         raise ValueError("one forced prefix per sample")
     allow_special = forced is not None and any(int(e) in special_ids for f in forced for e in f.event.tolist())
-    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=allow_special)
+    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=allow_special,
+                        draft=getattr(model.cfg, "order", "layer") == "draft")
                 for _ in range(B)]
     if forced is not None:
         f_len = torch.tensor([len(f) for f in forced], device=dev)

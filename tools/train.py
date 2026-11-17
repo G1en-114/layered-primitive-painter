@@ -195,6 +195,9 @@ def main() -> None:
                     help="run the frozen text encoder every step instead of memoizing caption features")
     ap.add_argument("--cfg-scale", type=float, default=2.0, help="guidance for text-conditioned samples")
     ap.add_argument("--canvas", action="store_true", help="canvas feedback (docs/canvas_feedback_design.md)")
+    ap.add_argument("--order", choices=["layer", "draft"], default="layer",
+                    help="painting order of full sequences: layer by layer, or draft (all layers' coarse rounds first)")
+    ap.add_argument("--draft-rounds", type=int, default=2, help="--order draft: rounds per layer in the sketch")
     ap.add_argument("--canvas-k", type=int, default=32)
     ap.add_argument("--canvas-size", type=int, default=64)
     ap.add_argument("--perturb", type=float, default=0.0, help="share of training sequences with a corrupted history")
@@ -278,15 +281,18 @@ def main() -> None:
         print(f"target-image conditioning: {len(targets.row)} images, p_target {args.p_target}")
     train_ds = SequenceDataset([e for e in examples if not is_val(e)], proto, seed=args.seed + 1000 * rank, captions=store,
                                p_text_drop=args.text_drop, p_perturb=args.perturb, image_tokens=image_tokens,
-                               p_image=args.p_image, targets=targets, p_target=args.p_target)
+                               p_image=args.p_image, targets=targets, p_target=args.p_target,
+                               order=args.order, draft_rounds=args.draft_rounds)
     val_ds = SequenceDataset([e for e in examples if is_val(e)], proto, seed=1234, p_redraw=0, p_refine=0,
                              captions=store, p_text_drop=0.0, image_tokens=image_tokens, p_image=args.p_image,
-                             targets=targets, p_target=args.p_target)
+                             targets=targets, p_target=args.p_target, order=args.order,
+                             draft_rounds=args.draft_rounds)
     print(f"{len(files)} shards, {len(train_ds)} train / {len(val_ds)} val sequences")
 
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
     if args.canvas:
         cfg.canvas, cfg.canvas_k, cfg.canvas_size = True, args.canvas_k, args.canvas_size
+    cfg.order, cfg.draft_rounds = args.order, args.draft_rounds
     if image_tokens is not None:
         n_img = json.loads((args.image_tokens / "meta.json").read_text())["tokens"]
         # the image prefix comes on top of the protocol's worst case (rotary tables are not saved,

@@ -72,6 +72,7 @@ Protocol Protocol::load(const std::string& dir) {
   P.n_layers = cfg["n_layers"], P.n_heads = cfg["n_heads"], P.n_kv_heads = cfg["n_kv_heads"];
   P.d_model = cfg["d_model"], P.text_dim = cfg["text_dim"], P.max_positions = cfg["max_positions"];
   P.canvas = cfg["canvas"], P.canvas_k = cfg["canvas_k"], P.canvas_cfg_size = cfg["canvas_size"];
+  P.draft = cfg.value("order", std::string("layer")) == "draft";   // older manifests: layer order
   return P;
 }
 

@@ -329,7 +329,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
   // ---- decode loop
   std::vector<Grammar> gram;
   for (int b = 0; b < B; ++b) {
-    gram.emplace_back(P, cfg.require_before_eos, false);
+    gram.emplace_back(P, cfg.require_before_eos, false, P.draft);
   }
   std::vector<std::vector<Record>> out(B);
   for (int b = 0; b < B; ++b) out[b].push_back({P.kind_bos, -1, -1, std::vector<int64_t>(A, P.no_attr)});

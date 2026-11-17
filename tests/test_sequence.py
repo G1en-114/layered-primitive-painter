@@ -130,3 +130,73 @@ def test_perturbed_records_are_not_targets(proto):
     assert bool(bad_next.any())
     assert (b["tgt_event"][0, : len(p) - 1][bad_next] == -1).all()
     assert (b["tgt_event"][0, : len(p) - 1][~bad_next] >= 0).all()
+
+
+# ---------------------------------------------------------------------------- draft order
+def _draft_examples():
+    for seed in range(5):
+        yield fake_decomposition(seed)
+    yield fake_decomposition(9, layers=(0, 1, 2, 3, 4, 5))
+
+
+def test_draft_is_grammatical_only_for_a_draft_grammar(proto):
+    for tokens, layer, rounds in _draft_examples():
+        seq = build(tokens, layer, rounds, "draft", split_round=2)
+        validate(seq, draft=True)
+        names = [proto.events[e] for e in seq.event.tolist()[1:]]
+        refines = [int(n.split("_")[1]) for n in names if n.startswith("REFINE")]
+        assert refines == sorted(set(refines))                 # each layer refined once, in order
+        if len(refines) > 1:
+            with pytest.raises(ValueError):
+                validate(seq)                                    # chained REFINE needs draft=True
+
+
+def test_draft_sketches_every_layer_first(proto):
+    tokens, layer, rounds = fake_decomposition(9, layers=(0, 1, 2, 3, 4, 5))
+    seq = build(tokens, layer, rounds, "draft", split_round=2)
+    names = [proto.events[e] for e in seq.event.tolist()[1:]]
+    first_refine = next(i for i, n in enumerate(names) if n.startswith("REFINE"))
+    opened = [n for n in names[:first_refine] if n.startswith("LAYER")]
+    assert opened == [f"LAYER_{k}" for k in torch.unique(layer).tolist()]
+    sketch = seq.kind[1:first_refine + 1] == 3
+    assert int(sketch.sum()) == int((rounds < 2).sum())       # exactly the coarse rounds before refining
+
+
+def test_draft_paints_identically(proto):
+    try:
+        codec = Codec.load()
+    except FileNotFoundError:
+        pytest.skip("codebooks missing")
+    for tokens, layer, rounds in _draft_examples():
+        imgs = []
+        for seq in (build(tokens, layer, rounds, "full"), build(tokens, layer, rounds, "draft", split_round=2)):
+            attrs, lay = paint_order(seq)
+            prims = codec.decode({n: attrs[:, i].unsqueeze(0) for i, n in enumerate(codec.attr_names)})
+            imgs.append(stack_layers(render_layers(prims, lay.unsqueeze(0), 64)))
+        assert torch.equal(imgs[0], imgs[1])
+
+
+def test_draft_decoding_refines_only_after_required_layers(proto):
+    """From BOS, a draft model may switch to refining, but not before background and skin exist."""
+    P = proto.event_id("PRIMITIVE")
+    g = Grammar(proto, require_before_eos=frozenset({0, 2}), allow_special=False, draft=True)
+    g.bos()
+    g.step(proto.layer_event(0)); g.step(P)
+    names = {proto.events[e] for e in g.allowed_events()}
+    assert not any(n.startswith(("REFINE", "REDRAW")) for n in names)    # skin still missing
+    g.step(proto.layer_event(2)); g.step(P)
+    g.step(proto.layer_event(4)); g.step(P)
+    names = {proto.events[e] for e in g.allowed_events()}
+    assert {"REFINE_0", "REFINE_2", "REFINE_4"} <= names and not any(n.startswith("REDRAW") for n in names)
+    g.step(proto.refine_event(2)); g.step(P)
+    names = {proto.events[e] for e in g.allowed_events()}
+    assert "REFINE_4" in names and "REFINE_0" not in names and not any(n.startswith("LAYER") for n in names)
+    assert "EOS" in names
+
+
+def test_layer_grammar_unchanged_without_draft(proto):
+    g = Grammar(proto, allow_special=False)
+    g.bos()
+    for k in (0, 2):
+        g.step(proto.layer_event(k)); g.step(proto.event_id("PRIMITIVE"))
+    assert not any(proto.events[e].startswith("REFINE") for e in g.allowed_events())

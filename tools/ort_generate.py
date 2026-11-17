@@ -89,7 +89,8 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
 
     rand = uniforms or (lambda step, field: torch.rand(B))
     prim_ev, eos = proto.event_id("PRIMITIVE"), proto.event_id("EOS")
-    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=False)
+    grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=False,
+                        draft=m.cfg.get("order", "layer") == "draft")
                 for _ in range(B)]
     for g in grammars:
         g.bos()

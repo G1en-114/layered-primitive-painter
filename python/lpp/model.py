@@ -67,6 +67,11 @@ class ModelConfig:
     # there is no gate the optimiser can shut. Measured with trainable gates: init 0 stalls,
     # init 0.5 is closed again (tanh < 0.03) within 1000 steps.
     target_zero_out: bool = True
+    # painting order of the training data (lpp.sequence modes): "layer" = layer by layer (full),
+    # "draft" = every layer's first `draft_rounds` rounds, then each layer refined in turn. Decoding
+    # needs it: a draft model's grammar allows chained REFINE markers.
+    order: str = "layer"
+    draft_rounds: int = 2
 
     @classmethod
     def tiny(cls) -> "ModelConfig":

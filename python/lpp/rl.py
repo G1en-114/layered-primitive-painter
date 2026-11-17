@@ -37,13 +37,13 @@ class RewardConfig:
     image_size: int = 256
 
 
-def grammar_masks(seqs: list[DrawSeq], proto: Protocol, require_before_eos=()) -> list[torch.Tensor]:
+def grammar_masks(seqs: list[DrawSeq], proto: Protocol, require_before_eos=(), draft: bool = False) -> list[torch.Tensor]:
     """Per sequence, the allowed-event mask before each target record: [len - 1, n_events].
 
     Replays the sampler's grammar (no REDRAW/REFINE from BOS, same EOS requirements)."""
     out = []
     for s in seqs:
-        g = Grammar(proto, require_before_eos=frozenset(require_before_eos), allow_special=False)
+        g = Grammar(proto, require_before_eos=frozenset(require_before_eos), allow_special=False, draft=draft)
         g.bos()
         masks = []
         for ev in s.event[1:].tolist():
@@ -58,12 +58,13 @@ def grammar_masks(seqs: list[DrawSeq], proto: Protocol, require_before_eos=()) -
     return out
 
 
-def rollout_batch(seqs: list[DrawSeq], captions: list[str], proto: Protocol, require_before_eos=()) -> dict:
+def rollout_batch(seqs: list[DrawSeq], captions: list[str], proto: Protocol, require_before_eos=(),
+                  draft: bool = False) -> dict:
     """Training batch (data.collate layout) for generated sequences, plus event_allowed [B, T, E]."""
     batch = collate([(s, c) for s, c in zip(seqs, captions)])
     B, T = batch["kind"].shape
     allowed = torch.ones(B, T, len(proto.events), dtype=torch.bool)
-    for b, m in enumerate(grammar_masks(seqs, proto, require_before_eos)):
+    for b, m in enumerate(grammar_masks(seqs, proto, require_before_eos, draft)):
         allowed[b, : m.shape[0]] = m
     batch["event_allowed"] = allowed
     return batch

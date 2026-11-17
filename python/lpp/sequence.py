@@ -5,17 +5,21 @@ A drawing sequence (the part after the text prefix) is a list of records:
     BOS                                    starts the drawing
     LAYER_k                                opens layer k (k strictly increasing)
     PRIMITIVE x y shape color alpha        paints into the open layer
-    REDRAW_k / REFINE_k                    the one "special" marker, see below
+    REDRAW_k / REFINE_k                    the "special" markers, see below
     EOS
 
 Modes (protocol.json "sequence_modes"):
     full     BOS (LAYER_k P+)+ EOS
     redraw   BOS (LAYER_j P+)* REDRAW_k P+ EOS          layer k absent from the prefix
     refine   BOS (LAYER_j P+)+ REFINE_k P+ EOS          layer k present, holding only its coarse rounds
+    draft    BOS (LAYER_k P+)+ (REFINE_k P+)* EOS       every layer's coarse rounds first (a sketch of
+                                                        the whole picture), then each layer refined in
+                                                        turn, REFINE k strictly increasing
 
 Compositing order never depends on the mode: primitives are painted by layer id,
-then in their order inside the layer. So the three modes of one decomposition
-render to the same image (tested).
+then in their order inside the layer. So all modes of one decomposition render to
+the same image (tested). Chained REFINE markers (draft) are legal only for a
+Grammar(draft=True), i.e. for models trained in the draft order.
 
 `Grammar` is the state machine that defines what may come next. Training data is
 validated with it, and decoding masks the event logits with `allowed_events()`;
@@ -61,6 +65,10 @@ class Grammar:
     # have primitives, so a sample cannot stop after the background alone
     require_before_eos: frozenset = frozenset()
     allow_special: bool = True     # False: no REDRAW/REFINE (they edit a given prefix; pointless from BOS)
+    # draft order: REFINE may follow REFINE (k strictly increasing), and a draft model may start
+    # refining from BOS-started decoding even when allow_special is False (once the required
+    # layers have primitives, so ending stays possible)
+    draft: bool = False
 
     # ---- what may come next ---------------------------------------------
     def _cap_left(self) -> int:
@@ -78,6 +86,7 @@ class Grammar:
             out.append(p.event_id("PRIMITIVE"))
         if self.current >= 0 and self.count == 0:
             return out                         # a marker must be followed by a primitive
+        required_done = all(self.seen.get(r, 0) > 0 for r in self.require_before_eos)
         if self.special is None:
             for k in range(p.num_layers):
                 # a required layer cannot be skipped: layers only go up, so jumping past it
@@ -85,13 +94,16 @@ class Grammar:
                 skips_required = any(r < k and self.seen.get(r, 0) == 0 for r in self.require_before_eos)
                 if k > self.current and k not in self.seen and not skips_required:
                     out.append(p.layer_event(k))
-                if not self.allow_special:
-                    continue
-                if k not in self.seen:
+                if self.allow_special and k not in self.seen:
                     out.append(p.redraw_event(k))
-                elif k <= self.current and p.layers[k].max_primitives - self.seen[k] > 0:
+                elif (self.allow_special or (self.draft and required_done)) and k in self.seen \
+                        and k <= self.current and p.layers[k].max_primitives - self.seen[k] > 0:
                     out.append(p.refine_event(k))
-        if self.current >= 0 and all(self.seen.get(k, 0) > 0 for k in self.require_before_eos):
+        elif self.special == "refine" and self.draft:
+            for k in range(self.current + 1, p.num_layers):
+                if self.seen.get(k, 0) > 0 and p.layers[k].max_primitives - self.seen[k] > 0:
+                    out.append(p.refine_event(k))
+        if self.current >= 0 and required_done:
             out.append(p.event_id("EOS"))
         if not out:   # decoding constraints can paint into a corner: ending must stay possible
             out.append(p.event_id("EOS"))
@@ -128,9 +140,9 @@ class Grammar:
             self.seen.setdefault(self.current, 0)
 
 
-def validate(seq: DrawSeq, proto: Protocol | None = None) -> None:
+def validate(seq: DrawSeq, proto: Protocol | None = None, draft: bool = False) -> None:
     """Raise ValueError if seq is not a complete, legal drawing sequence."""
-    g = Grammar(proto or load_protocol())
+    g = Grammar(proto or load_protocol(), draft=draft)
     if len(seq) == 0 or seq.kind[0] != KIND_BOS:
         raise ValueError("sequence must start with BOS")
     g.bos()
@@ -148,7 +160,9 @@ def build(tokens: torch.Tensor, layer: torch.Tensor, rounds: torch.Tensor, mode:
 
     tokens [N, A] attribute tokens in decomposer order (layer, then round, then Morton),
     layer [N], rounds [N]. mode 'redraw' moves layer `target` to the end; 'refine' keeps
-    layer `target`'s rounds < split_round in place and moves the rest to the end.
+    layer `target`'s rounds < split_round in place and moves the rest to the end; 'draft'
+    does that for every layer (rounds < split_round of all layers, then each layer's rest
+    after a REFINE marker, layers in order).
     """
     proto = proto or load_protocol()
     A = len(proto.attributes)
@@ -164,8 +178,26 @@ def build(tokens: torch.Tensor, layer: torch.Tensor, rounds: torch.Tensor, mode:
             lay.append(k)
 
     present = [int(k) for k in torch.unique(layer).tolist()]
-    if mode not in ("full", "redraw", "refine"):
+    if mode not in ("full", "redraw", "refine", "draft"):
         raise ValueError(mode)
+    if mode == "draft":
+        split = 2 if split_round is None else split_round
+        tails = []
+        for k in present:
+            idx = torch.nonzero(layer == k).flatten()
+            coarse, fine = idx[rounds[idx] < split], idx[rounds[idx] >= split]
+            if coarse.numel() == 0:          # nothing coarse to sketch: the whole layer is the sketch
+                coarse, fine = fine, fine[:0]
+            marker(proto.layer_event(k), k)
+            prims(coarse, k)
+            if fine.numel():
+                tails.append((k, fine))
+        for k, fine in tails:
+            marker(proto.refine_event(k), k)
+            prims(fine, k)
+        marker(proto.event_id("EOS"), -1)
+        return DrawSeq(torch.tensor(kind), torch.tensor(event), torch.tensor(attrs, dtype=torch.long),
+                       torch.tensor(lay))
     if mode != "full" and target not in present:
         raise ValueError(f"layer {target} has no primitives")
     tail = None

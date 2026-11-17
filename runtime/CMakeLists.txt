@@ -34,6 +34,11 @@ endforeach()
 set_target_properties(lpp_paint PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}/ortlib;${ORT_LIB_DIR}")
 target_compile_options(lpp_paint PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
 
+# grammar cross-check tool (tests/test_runtime_grammar.py): no ONNX Runtime needed
+add_executable(lpp_grammar_walk src/grammar_walk.cpp src/protocol.cpp src/grammar.cpp)
+target_include_directories(lpp_grammar_walk PRIVATE src)
+target_compile_options(lpp_grammar_walk PRIVATE -O2 -Wall -Wextra)
+
 # CUDA runtime (static one-step graphs + CUDA Graph path): headers and libcudart from the nvidia cu13 wheel
 if(NOT CUDART_ROOT)
   set(CUDART_ROOT "${ORT_LIB_DIR}/../../nvidia/cu13")

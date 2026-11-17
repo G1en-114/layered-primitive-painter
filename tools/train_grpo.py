@@ -175,7 +175,7 @@ def main() -> None:
         chunks = []
         for c0 in range(0, len(seqs), args.micro_batch):
             sl = slice(c0, c0 + args.micro_batch)
-            b = to_gpu(rollout_batch(seqs[sl], rep[sl], proto, REQUIRE), encoder, codec, cfg)
+            b = to_gpu(rollout_batch(seqs[sl], rep[sl], proto, REQUIRE, draft=cfg.order == "draft"), encoder, codec, cfg)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 old = policy.record_logprobs(b, b["event_allowed"])
                 refl = ref.record_logprobs(b, b["event_allowed"])

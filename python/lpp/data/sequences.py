@@ -92,7 +92,11 @@ class SequenceDataset(Dataset):
     def __init__(self, examples: list[Example], proto: Protocol | None = None, seed: int = 0,
                  p_redraw: float = 0.15, p_refine: float = 0.15, text_fn=None, captions=None,
                  p_text_drop: float = 0.1, p_perturb: float = 0.0, image_tokens: ImageTokenStore | None = None,
-                 p_image: float = 0.0, targets: TargetImageStore | None = None, p_target: float = 0.0):
+                 p_image: float = 0.0, targets: TargetImageStore | None = None, p_target: float = 0.0,
+                 order: str = "layer", draft_rounds: int = 2):
+        if order not in ("layer", "draft"):
+            raise ValueError(order)
+        self.order, self.draft_rounds = order, draft_rounds   # "draft": full sequences sketch first
         self.examples, self.proto = examples, proto or load_protocol()
         self.image_tokens, self.p_image = image_tokens, p_image   # image condition with probability p_image
         self.targets, self.p_target = targets, p_target           # pixel target with probability p_target
@@ -109,6 +113,8 @@ class SequenceDataset(Dataset):
     def __getitem__(self, i: int):
         ex = self.examples[i]
         mode = sample_mode(ex.layer, ex.round, self.rng, self.p_redraw, self.p_refine)
+        if self.order == "draft" and mode["mode"] == "full":
+            mode = {"mode": "draft", "split_round": self.draft_rounds}
         seq = build(ex.tokens, ex.layer, ex.round, proto=self.proto, **mode)
         if self.p_perturb > 0 and self.rng.random() < self.p_perturb:
             seq = perturb(seq, self.rng, self.proto)

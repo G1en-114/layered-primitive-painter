@@ -30,6 +30,7 @@ struct Protocol {
   int n_layers = 0, n_heads = 0, n_kv_heads = 0, d_model = 0, text_dim = 0, max_positions = 0;
   bool canvas = false;
   int canvas_k = 32, canvas_cfg_size = 64;
+  bool draft = false;   // model trained in the draft order (config "order": "draft"): chained REFINE allowed
 
   int event_id(const std::string& name) const;
   int num_layers() const { return static_cast<int>(layer_cap.size()); }
