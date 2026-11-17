@@ -33,3 +33,21 @@ foreach(ep providers_shared providers_cuda providers_tensorrt)
 endforeach()
 set_target_properties(lpp_paint PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}/ortlib;${ORT_LIB_DIR}")
 target_compile_options(lpp_paint PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+
+# CUDA runtime (static one-step graphs + CUDA Graph path): headers and libcudart from the nvidia cu13 wheel
+if(NOT CUDART_ROOT)
+  set(CUDART_ROOT "${ORT_LIB_DIR}/../../nvidia/cu13")
+endif()
+# the wheel's headers are incomplete (no crt/host_defines.h): use the toolkit's headers (same major
+# version, 13.x); the library stays the wheel's libcudart.so.13, the one ORT's CUDA EP loads, so the
+# process holds a single CUDA runtime
+find_path(CUDART_INCLUDE cuda_runtime_api.h PATHS /opt/cuda/include /usr/local/cuda/include ${CUDART_ROOT}/include NO_DEFAULT_PATH)
+find_file(CUDART_LIB NAMES libcudart.so.13 libcudart.so PATHS ${CUDART_ROOT}/lib NO_DEFAULT_PATH)
+if(CUDART_INCLUDE AND CUDART_LIB)
+  message(STATUS "cudart: ${CUDART_LIB}")
+  target_include_directories(lpp_paint PRIVATE ${CUDART_INCLUDE})
+  target_link_libraries(lpp_paint PRIVATE ${CUDART_LIB})
+  target_compile_definitions(lpp_paint PRIVATE LPP_HAVE_CUDART)
+else()
+  message(STATUS "cudart not found: static step graphs disabled")
+endif()

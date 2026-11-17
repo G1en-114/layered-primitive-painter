@@ -112,7 +112,7 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   const bool cuda = provider == "cuda" || provider == "cuda-tf32" || provider == "cuda-hybrid" || provider == "cuda-all";
   if (!cuda && provider != "cpu")
     throw std::runtime_error("provider must be cpu, cuda, cuda-all, cuda-hybrid or cuda-tf32");
-  auto make_options = [&](bool gpu) {
+  auto make_options = [&](bool gpu, bool cuda_graph = false) {
     Ort::SessionOptions so;
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     so.SetIntraOpNumThreads(4);
@@ -124,19 +124,25 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
       const OrtApi& api = Ort::GetApi();
       OrtCUDAProviderOptionsV2* opt = nullptr;
       Ort::ThrowOnError(api.CreateCUDAProviderOptions(&opt));
-      const char* keys[] = {"device_id", "use_tf32", "cudnn_conv_algo_search"};
-      const char* vals[] = {"0", provider == "cuda-tf32" ? "1" : "0", "HEURISTIC"};
-      Ort::ThrowOnError(api.UpdateCUDAProviderOptions(opt, keys, vals, 3));
+      const char* keys[] = {"device_id", "use_tf32", "cudnn_conv_algo_search", "enable_cuda_graph"};
+      const char* vals[] = {"0", provider == "cuda-tf32" ? "1" : "0", "HEURISTIC", cuda_graph ? "1" : "0"};
+      Ort::ThrowOnError(api.UpdateCUDAProviderOptions(opt, keys, vals, 4));
       so.AppendExecutionProvider_CUDA_V2(*opt);
       api.ReleaseCUDAProviderOptions(opt);
     }
     return so;
   };
   Ort::SessionOptions so_gpu = make_options(cuda), so_cpu = make_options(false);
+  // static one-step graphs: CUDA Graph capture unless LPP_CUDA_GRAPH=0 (A/B runs)
+  const char* cg = std::getenv("LPP_CUDA_GRAPH");
+  Ort::SessionOptions so_step = make_options(cuda, !(cg && std::string(cg) == "0"));
   for (auto& [name, g] : m["graphs"].items()) {
     const bool backbone = name == "chunk" || name == "chunk_cached";
     const bool on_gpu = cuda && (provider == "cuda-all" || backbone || (provider != "cuda-hybrid" && name == "decode_heads"));
-    graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(), on_gpu ? so_gpu : so_cpu,
+    const bool step = name.rfind("chunk_step_r", 0) == 0;
+    if (step && !cuda) continue;                   // the static step graphs are a CUDA-only path
+    graphs_[name] = std::make_unique<Graph>(env_, dir + "/" + g["file"].get<std::string>(),
+                                            step ? so_step : on_gpu ? so_gpu : so_cpu,
                                             g["inputs"].get<std::vector<std::string>>(),
                                             g["outputs"].get<std::vector<std::string>>(), name);
   }

@@ -218,3 +218,31 @@ Tile 全部消失，原始节点数从 1045 降到 710。
 收益开始变小。下一步把它接进 C++ 运行时：前缀那一步（T>1）仍然用动态的 chunk_cached，
 每个解码步用定形的 ChunkStepV2（每个常用的 R 导一个图），然后接 CUDA Graph。
 这需要把所有输入放到固定的显存地址，每步用 cudaMemcpyAsync 写入小输入，所以运行时要链接 cudart。
+
+### 接入 C++ 运行时：定形单步图 + CUDA Graph（2026-11-17）
+
+做法：export_onnx 加 `--step-batches 2 16 64`，每个 R 导一个 `chunk_step_r<R>` 图。
+运行时在 T=1、cache 已经在显存里、并且有对应 R 的单步图时走新路径：
+- 小输入（x、valid、write_pos、start_pos、canvas tokens、draw）用 cudaMemcpy 拷进一次性分配好的固定显存缓冲；
+- cache 放在原来的 ping-pong 两组缓冲里；
+- 用 `gpu_graph_id` 设成当前读的那一组（0 或 1），每组各捕获一张 CUDA Graph；
+- 读结果之前先 `SynchronizeOutputs`：ORT 用的是它自己的 stream，不同步就会读到没写完的数据。
+
+链接的是 pip 包里的 `libcudart.so.13`，和 ORT 加载的是同一个，进程里只有一个 CUDA 运行时。
+头文件用 /opt/cuda 的，因为 pip 包里缺了 `crt/host_defines.h`。
+
+一致性：B=1、400 个记录，新路径（开或关 CUDA Graph）与旧路径的记录逐条相同。
+
+| 吞吐（records/s，3 次中位数，cuda-auto，每个样本最多 400 个记录） | 旧路径 | 单步图 + CUDA Graph |
+|---|---:|---:|
+| B=1 | 279 | **314（+13%）** |
+| B=8 | 780 | 743（−5%） |
+| B=32 | 1122 | 1029（−8%） |
+
+B=1 时主干每步从 1.66 ms 降到 0.91 ms。但 batch 大时反而变慢，原因是 **ping-pong 设计每一步都要把整个 KV cache 拷到另一组缓冲**。
+单步图的 Tmax 固定是 1024，而旧路径在这次测试里只有 432 个位置。R=64 时 cache 的 K 加 V 约 537 MB，每步要读写约 1 GB，大约 2.8 ms。
+另外，第一次前缀调用是一次性的预热，要 218 ms。
+
+**下一步：原地更新的 KV cache。** 图只读 cache，只输出新位置的 k/v（`[L, R, kv, 1, hd]`）。
+注意力拆成“已有 cache”和“新 token”两部分来算（分数张量很小）。
+运行时用 `cudaMemcpy2DAsync` 按步长把新 k/v 写进 write_pos 那一格，这样每步就不用再拷整个 cache 了。
