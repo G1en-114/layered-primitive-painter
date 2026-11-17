@@ -346,9 +346,54 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
     return lg.data();
   };
 
+  // attribute heads: in the cuda placement, the static decode_heads_r<R> graph runs as a captured CUDA
+  // Graph (fixed device buffers, logits copied back); hybrid placement and other R keep the dynamic graph
+#ifdef LPP_HAVE_CUDART
+  const bool heads_static = on_device && g_.provider() != "cuda-hybrid" && g_.has("decode_heads_r" + std::to_string(R));
+  StepBuf hb;
+  std::vector<std::vector<int64_t>> head_shape;
+  // need: the one output the caller reads (0 = event logits, 1 + i = attribute i); only it is copied back
+  auto heads_run = [&](const Tensor& hh, const Tensor& e, const Tensor& at, int need) -> std::vector<Tensor> {
+    if (!heads_static) return g_["decode_heads"].run({&hh, &e, &at});
+    Graph& gh = g_["decode_heads_r" + std::to_string(R)];
+    if (hb.val.empty()) {
+      hb.alloc = dev.alloc.get();
+      auto add = [&](size_t bytes, std::vector<int64_t> shape, ONNXTensorElementDataType t) {
+        void* q = hb.alloc->Alloc(bytes);
+        hb.ptr.push_back(q);
+        hb.val.push_back(Ort::Value::CreateTensor(dev.mem, q, bytes, shape.data(), shape.size(), t));
+      };
+      add(size_t(R) * D * 4, {R, D}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+      add(size_t(R) * 8, {R}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+      add(size_t(R) * A * 8, {R, A}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+      head_shape.push_back({R, E});
+      for (int i = 0; i < A; ++i) head_shape.push_back({R, static_cast<int64_t>(P.vocab[i])});
+      for (auto& sh : head_shape) add(size_t(sh[0]) * sh[1] * 4, sh, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    check(cudaMemcpy(hb.ptr[0], hh.f.data(), hh.f.size() * 4, cudaMemcpyHostToDevice), "copy h");
+    check(cudaMemcpy(hb.ptr[1], e.i.data(), e.i.size() * 8, cudaMemcpyHostToDevice), "copy event");
+    check(cudaMemcpy(hb.ptr[2], at.i.data(), at.i.size() * 8, cudaMemcpyHostToDevice), "copy attrs");
+    Ort::IoBinding io(gh.session());
+    for (int k = 0; k < 3; ++k) io.BindInput(gh.input_names()[k].c_str(), hb.val[k]);
+    for (size_t k = 0; k < head_shape.size(); ++k) io.BindOutput(gh.output_names()[k].c_str(), hb.val[3 + k]);
+    Ort::RunOptions ro;
+    ro.AddConfigEntry("gpu_graph_id", "0");
+    gh.session().Run(ro, io);
+    io.SynchronizeOutputs();
+    std::vector<Tensor> out(head_shape.size());
+    out[need] = Tensor::F(head_shape[need]);
+    check(cudaMemcpy(out[need].f.data(), hb.ptr[3 + need], out[need].f.size() * 4, cudaMemcpyDeviceToHost), "copy logits");
+    Profile::add("decode_heads_r", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return out;
+  };
+#else
+  auto heads_run = [&](const Tensor& hh, const Tensor& e, const Tensor& at, int) { return g_["decode_heads"].run({&hh, &e, &at}); };
+#endif
+
   Tensor zeros_e = Tensor::I({R}), zeros_a = Tensor::I({R, A});
   for (int step = 1; step < max_records; ++step) {
-    auto heads0 = g_["decode_heads"].run({&h, &zeros_e, &zeros_a});
+    auto heads0 = heads_run(h, zeros_e, zeros_a, 0);
     std::vector<int64_t> ev(B);
     for (int b = 0; b < B; ++b) {
       float* l = guided_row(heads0[0], b, E);
@@ -365,7 +410,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
       for (int i = 0; i < A; ++i) {
         for (int r = 0; r < R; ++r)
           for (int j = 0; j < A; ++j) at.i[size_t(r) * A + j] = std::max<int64_t>(attrs[r % B][j], 0);
-        auto heads = g_["decode_heads"].run({&h, &evt, &at});
+        auto heads = heads_run(h, evt, at, 1 + i);
         const int n = static_cast<int>(P.vocab[i]);
         for (int b = 0; b < B; ++b) attrs[b][i] = sample_top_p(guided_row(heads[1 + i], b, n), n, cfg.sample, uni(step, 1 + i, b));
       }

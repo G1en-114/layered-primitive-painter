@@ -215,6 +215,20 @@ def main() -> None:
             manifest["graphs"][name3] = {"file": path3.name, "inputs": names3, "outputs": ["h", "k_new", "v_new"],
                                          "static_rows": R, "static_tmax": Tmax, "opset": 23, "cache": "in-place"}
             print(f"{name3:13s} max|ort - chunk_cached| = {max(diffs3):.2e}  ({path3.stat().st_size / 1e6:.1f} MB)", flush=True)
+            # static attribute heads (CUDA Graph capture in the runtime's cuda placement)
+            name4, path4 = f"decode_heads_r{R}", args.out / f"decode_heads_r{R}.onnx"
+            sp4 = specs(mx, B=R, T=1, P=1, Lt=1)["decode_heads"]
+            torch.onnx.export(mods["decode_heads"], sp4["inputs"], str(path4), input_names=sp4["names"],
+                              output_names=sp4["outputs"], opset_version=args.opset, dynamo=False)
+            sess4 = ort.InferenceSession(str(path4), providers=["CPUExecutionProvider"])
+            with torch.no_grad():
+                ref4 = mods["decode_heads"](*sp4["inputs"])
+            got4 = sess4.run(None, {n: t.numpy() for n, t in zip(sp4["names"], sp4["inputs"])})
+            d4 = max(float(np.abs(a_ - b_.numpy()).max()) for a_, b_ in zip(got4, ref4))
+            report[name4] = {"max_abs_diff": d4, "bytes": path4.stat().st_size, "rows": R}
+            manifest["graphs"][name4] = {"file": path4.name, "inputs": sp4["names"], "outputs": sp4["outputs"],
+                                         "static_rows": R}
+            print(f"{name4:13s} max|ort - torch| = {d4:.2e}  ({path4.stat().st_size / 1e6:.1f} MB)", flush=True)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (args.out / "codec.json").write_text(json.dumps(codec_tables(codec), indent=None))
     (args.out / "parity.json").write_text(json.dumps(report, indent=1))
