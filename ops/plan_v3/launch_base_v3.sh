@@ -3,6 +3,7 @@
 # Data: /root/private_data/seq/v3_mix (built by merge_v3.sh). Resume-safe: re-running continues from last.pt
 # and re-reads the data glob, so anime t2/t3 can join at a later restart.
 set -u
+ulimit -c 0
 cd /root/private_data/lpp_dev
 R=/root/private_data; B=$R/runs/base_v3
 mkdir -p $B

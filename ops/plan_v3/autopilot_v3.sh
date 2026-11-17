@@ -7,6 +7,7 @@
 #     next checkpoint, stop training, re-merge, resume (same run, re-read data)
 #  5. when training reaches its last step: evaluate the final checkpoint (192 face prompts, judge, attributes)
 set -u
+ulimit -c 0          # 2026-11-16: a 14 GB core dump filled the quota and truncated the checkpoint
 R=/root/private_data; SEQ=$R/seq; U=$SEQ/upload_v3; M=$SEQ/v3_mix; B=$R/runs/base_v3
 LOG=$R/autopilot_v3.log; TL=$R/traj_driver_v3.log
 PROTO=bb54b53748557229f1135f26ad5ed9a750ff7410170930c396e47e5787a9d58c
@@ -53,17 +54,7 @@ say "autopilot started"
 # 1+2: wait for the DCU's own trajectories (and the even halves) before training takes the GPU
 until [ "$(grep -c -E 't[4-7] pruned' $TL)" -ge 4 ]; do sleep 120; done
 say "DCU odd shards t4-t7 pruned"
-RAW=$U/raw/anime_v2_l6_t0
-if [ -f $U/anime_v2_l6_clean/t0/.complete ]; then :
-elif [ "$(nshards $RAW)" = 107 ]; then
-  say "pruning anime t0 on the DCU"
-  python -u tools/prune_sequences.py --src $RAW --out $U/anime_v2_l6_clean/t0 --min-visible 2 \
-    --protocol $R/lpp_next/protocol.json > $R/prune_anime_t0.log 2>&1 \
-    && [ "$(nshards $U/anime_v2_l6_clean/t0)" = 107 ] && touch $U/anime_v2_l6_clean/t0/.complete \
-    && say "anime t0 pruned" || say "anime t0 prune FAILED"
-else
-  say "raw anime t0 not complete ($(nshards $RAW)/107): training starts without it"
-fi
+RAW=$U/raw/anime_v2_l6_t0      # anime t0 is pruned inside the loop below (training starts first)
 for i in $(seq 1 60); do       # the even halves t9..t11 come from the 4090; wait up to 1 h for them
   [ "$(available | grep -c '^face_t\(8\|9\|10\|11\)')" -ge 4 ] && break; sleep 60
 done
@@ -81,7 +72,7 @@ while true; do
   fi
   if [ ! -f $U/anime_v2_l6_clean/t0/.complete ] && [ "$(nshards $RAW)" = 107 ] && [ ! -f $R/.anime_t0_prune_tried ]; then
     touch $R/.anime_t0_prune_tried; say "pruning late anime t0"
-    python -u tools/prune_sequences.py --src $RAW --out $U/anime_v2_l6_clean/t0 --min-visible 2       --protocol $R/lpp_next/protocol.json > $R/prune_anime_t0.log 2>&1       && [ "$(nshards $U/anime_v2_l6_clean/t0)" = 107 ] && touch $U/anime_v2_l6_clean/t0/.complete       && say "anime t0 pruned" || say "anime t0 prune FAILED"
+    python -u tools/prune_sequences.py --src $RAW --out $U/anime_v2_l6_clean/t0 --min-visible 2 --no-guard       --protocol $R/lpp_next/protocol.json > $R/prune_anime_t0.log 2>&1       && [ "$(nshards $U/anime_v2_l6_clean/t0)" = 107 ] && touch $U/anime_v2_l6_clean/t0/.complete       && say "anime t0 pruned" || say "anime t0 prune FAILED"
   fi
   items=$(available)
   [ "$items" = "$merged" ] && continue

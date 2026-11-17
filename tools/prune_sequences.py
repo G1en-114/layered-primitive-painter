@@ -77,6 +77,9 @@ def main() -> None:
     ap.add_argument("--max-psnr-loss", type=float, default=0.1, help="retain original above this dB loss")
     ap.add_argument("--protocol", type=Path, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no-guard", action="store_true",
+                    help="no RGB targets available (e.g. sequences moved to a machine without the images): drop "
+                         "invisible primitives without the PSNR loss guard; psnr fields keep the source values")
     args = ap.parse_args()
     if not np.isfinite([args.min_visible, args.max_psnr_loss]).all() or min(args.min_visible, args.max_psnr_loss) < 0:
         ap.error("visibility and PSNR loss limits must be finite and nonnegative")
@@ -89,18 +92,23 @@ def main() -> None:
     if (src_cfg.get("protocol_version", 1) != proto.version or
             src_cfg.get("protocol_sha256") != hashlib.sha256(proto_file.read_bytes()).hexdigest()):
         raise ValueError("source protocol version/hash does not match the selected protocol")
-    data_root = args.data or Path(src_cfg["data"])
-    if data_root.resolve() != Path(src_cfg["data"]).resolve():
-        raise ValueError("RGB targets must match the decomposition source data")
-    index_file = data_root / "index.json"
-    index = {s["shard"]: s for s in json.loads(index_file.read_text())["shards"]}
+    if not args.no_guard:
+        data_root = args.data or Path(src_cfg["data"])
+        if data_root.resolve() != Path(src_cfg["data"]).resolve():
+            raise ValueError("RGB targets must match the decomposition source data")
+        index_file = data_root / "index.json"
+        index = {s["shard"]: s for s in json.loads(index_file.read_text())["shards"]}
     args.out.mkdir(parents=True, exist_ok=True)
     lock = (args.out / ".prune.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    cfg = dict(src_cfg, pruned_from=str(args.src), min_visible_px=args.min_visible,
-               pruning_version=2, max_psnr_loss_db=args.max_psnr_loss,
-               psnr_metric="post_prune_rgb_mse", target_data=str(data_root),
-               target_index_sha256=hashlib.sha256(index_file.read_bytes()).hexdigest())
+    if args.no_guard:
+        cfg = dict(src_cfg, pruned_from=str(args.src), min_visible_px=args.min_visible, pruning_version=2,
+                   psnr_guard=False, psnr_metric="source_psnr_unguarded")
+    else:
+        cfg = dict(src_cfg, pruned_from=str(args.src), min_visible_px=args.min_visible,
+                   pruning_version=2, max_psnr_loss_db=args.max_psnr_loss,
+                   psnr_metric="post_prune_rgb_mse", target_data=str(data_root),
+                   target_index_sha256=hashlib.sha256(index_file.read_bytes()).hexdigest())
     write_config(args.out / "config.json", cfg)
     codec = Codec.load(proto=proto, device=args.device)
 
@@ -117,8 +125,9 @@ def main() -> None:
         with np.load(f) as z:
             data = {k: z[k] for k in z.files}
         shard = int(f.stem.split("_")[-1])
-        image_rows = {image_id: row for row, image_id in enumerate(index[shard]["ids"])}
-        images = np.load(data_root / f"images_{shard:03d}.npy", mmap_mode="r")
+        if not args.no_guard:
+            image_rows = {image_id: row for row, image_id in enumerate(index[shard]["ids"])}
+            images = np.load(data_root / f"images_{shard:03d}.npy", mmap_mode="r")
         off = data["offsets"]
         keep_rows, psnrs, original_psnrs, retained = [], [], [], 0
         for i, image_id in enumerate(data["ids"]):
@@ -127,6 +136,13 @@ def main() -> None:
             def decode(tokens):
                 return codec.decode({n: tokens[:, k].unsqueeze(0) for k, n in enumerate(proto.attr_names)})
 
+            if args.no_guard:
+                with torch.no_grad():
+                    rows = select_rows(visible_masses(decode(tok), proto)[0], args.min_visible)
+                keep_rows.append(int(off[i]) + rows.cpu().numpy())
+                psnrs.append(float(data["psnr"][i]))
+                original_psnrs.append(float(data["psnr"][i]))
+                continue
             target = torch.from_numpy(np.array(images[image_rows[int(image_id)]], copy=True)).to(args.device)
             target = target.permute(2, 0, 1).unsqueeze(0).float().div_(255)
             if src_cfg.get("flip", False):

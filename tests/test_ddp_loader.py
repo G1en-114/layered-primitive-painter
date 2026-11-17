@@ -40,3 +40,19 @@ def test_ranks_disjoint_and_cover_epoch():
 
 def test_single_process_unchanged():
     assert sorted(epoch(0, 1)) == list(range(40))
+
+
+def test_checkpoint_rotation_survives_a_truncated_last(tmp_path):
+    import io
+    torch.save({"step": 1}, tmp_path / "x")       # warm import paths
+    log = io.StringIO()
+    assert train.save_checkpoint(tmp_path, {"step": 500, "w": torch.zeros(1000)}, log)
+    assert train.save_checkpoint(tmp_path, {"step": 1000, "w": torch.zeros(1000)}, log)
+    assert (tmp_path / "prev.pt").exists()
+    (tmp_path / "last.pt").write_bytes(b"")          # a save interrupted by a full disk
+    orig = torch.load
+    train.torch.load = lambda f, **kw: orig(f, map_location="cpu", weights_only=False)
+    try:
+        assert train.load_checkpoint(tmp_path)["step"] == 500
+    finally:
+        train.torch.load = orig

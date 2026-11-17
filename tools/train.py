@@ -14,6 +14,7 @@ import glob
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -68,6 +69,52 @@ SAMPLE_PROMPTS = [
     "黑色长直发的女性，有刘海，白色上衣，绿色背景",
     "光头男性，微笑，穿深色西装",
 ]
+
+
+def _log_line(rec: dict, log) -> None:
+    print(json.dumps(rec), flush=True)
+    log.write(json.dumps(rec) + "\n")
+    log.flush()
+
+
+def save_checkpoint(out: Path, state: dict, log) -> bool:
+    """Write last.pt without ever destroying the only good checkpoint: write a temp file, verify its
+    size, then rotate last.pt -> prev.pt and move the temp file in. A full disk (2026-11-16: a core dump
+    filled the quota and a truncated last.pt made every resume fail) skips this save with a log line
+    instead of killing the run."""
+    ckpt, prev, tmp = out / "last.pt", out / "prev.pt", out / "last.tmp"
+    need = 2 * (ckpt.stat().st_size if ckpt.exists() else 0)
+    free = shutil.disk_usage(out).free
+    if need and free < need:
+        msg = {"step": state["step"], "checkpoint": "skipped", "free_bytes": free, "needed_bytes": need}
+        _log_line(msg, log)
+        return False
+    try:
+        torch.save(state, tmp)
+        if tmp.stat().st_size < 1024:
+            raise OSError(f"checkpoint {tmp} is only {tmp.stat().st_size} bytes")
+    except (OSError, RuntimeError) as e:
+        tmp.unlink(missing_ok=True)
+        msg = {"step": state["step"], "checkpoint": "failed", "error": str(e)[:200]}
+        _log_line(msg, log)
+        return False
+    if ckpt.exists():
+        ckpt.replace(prev)
+    tmp.replace(ckpt)
+    return True
+
+
+def load_checkpoint(out: Path) -> dict | None:
+    """last.pt, or prev.pt when last.pt is missing or unreadable (truncated by a failed save)."""
+    for name in ("last.pt", "prev.pt"):
+        f = out / name
+        if not f.exists():
+            continue
+        try:
+            return torch.load(f, map_location="cuda", weights_only=False)
+        except (EOFError, RuntimeError, OSError) as e:
+            print(f"{f} unreadable ({type(e).__name__}: {e}); trying the previous checkpoint", flush=True)
+    return None
 
 
 def loader(ds, args, shuffle=True, rank: int = 0, world: int = 1):
@@ -252,8 +299,7 @@ def main() -> None:
         raise SystemExit(f"model text_dim {cfg.text_dim} != text encoder width {encoder.dim}")
     model = Painter(cfg, proto, codec).cuda()
     step = 0
-    ckpt = args.out / "last.pt"
-    state = torch.load(ckpt, map_location="cuda", weights_only=False) if args.resume and ckpt.exists() else None
+    state = load_checkpoint(args.out) if args.resume else None
     new_params: set[str] = set(state.get("new_params", [])) if state else set()
     if args.init_weights and state is None:
         src = torch.load(args.init_weights, map_location="cuda", weights_only=False)
@@ -357,11 +403,9 @@ def main() -> None:
             log.flush()
 
         if is_main and (step % args.save_every == 0 or step == args.steps):
-            tmp = ckpt.with_suffix(".tmp")
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "new_params": sorted(new_params),
-                        "config": cfg.to_dict(), "protocol": proto.raw,
-                        "args": vars(args) | {"out": str(args.out)}}, tmp)
-            tmp.replace(ckpt)
+            save_checkpoint(args.out, {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+                                       "new_params": sorted(new_params), "config": cfg.to_dict(), "protocol": proto.raw,
+                                       "args": vars(args) | {"out": str(args.out)}}, log)
     if ddp:
         # DDP keeps replicas identical by construction; check it (cheap: one checksum per tensor)
         sums = torch.stack([p.detach().float().sum() for p in model.parameters()])
