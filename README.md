@@ -129,21 +129,6 @@ B=32：1118 → **1472**（+32%）
 </td></tr>
 </table>
 
-## 🆚 与 POP 2 的区别
-
-> 思路受 [Primitive Operation Painter 2](https://github.com/wonderfulearth/primitive-operation-painter)（MIT）启发：图像不是像素，而是一串可以查看、修改、继续生成的绘画操作。
-> 本项目从头实现，模型结构、数据流水线和推理运行时均为独立设计。
-
-| | POP 2 | Strata |
-|---|---|---|
-| 图元 | 矩形 / 椭圆 | 广义 2D 高斯：边缘硬度 β 统一软高斯和实心椭圆 |
-| 组织方式 | 全局 → 4×4 → 8×8 区域 | **语义图层**，每层内由粗到细 |
-| 属性编码 | 9 个独立属性 | 每图元 9 步：事件、位置、独立尺度/角度/硬度、Oklab 颜色码本、不透明度 |
-| 图元内属性依赖 | 多分支 FlexAttention | 两级 Transformer：主干每图元一位置 + 小型属性解码器 |
-| 图层编辑 | — | `REDRAW_k` / `REFINE_k`，分层导出 ORA / SVG |
-| 数据分解 | GPU 随机搜索 | 可微渲染 + 梯度优化，量化感知拟合 |
-| 推理 | libtorch 原生引擎 | ONNX → 自研 C++ 运行时（ORT + CUDA Graph）、量化工具与算子库 |
-
 ## 🚀 快速开始
 
 ```sh
@@ -219,7 +204,9 @@ docs/                    设计文档与实验记录
 | 部署与性能 | [runtime_design.md](docs/runtime_design.md) · [quant_report.md](docs/quant_report.md) · [perf_log.md](docs/perf_log.md) |
 | 数据 | [anime_data_log.md](docs/anime_data_log.md) · [data_lessons.md](docs/data_lessons.md) · [image_cond_log.md](docs/image_cond_log.md) |
 
-## 📜 许可
+## 📜 许可与致谢
+
+思路受 [Primitive Operation Painter 2](https://github.com/wonderfulearth/primitive-operation-painter) 启发，本项目的代码从头实现。
 
 代码采用 [Apache License 2.0](LICENSE) 发布，第三方组件的说明见 [NOTICE](NOTICE)。
 
