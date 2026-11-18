@@ -50,7 +50,10 @@ def line_mask(img: np.ndarray, thr: float = 0.10, radius: int = 2, min_px: int =
     """Thin dark structures of an RGB uint8 image -> bool mask."""
     g = (img[..., :3].astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)) / 255
     bh = closing(g, disk(radius)) - g                      # black-hat: dark lines narrower than the disk
-    return remove_small_objects(bh > thr, max_size=min_px - 1)   # removes objects of <= max_size px
+    try:                       # scikit-image >= 0.26 (min_size deprecated there): removes objects of <= max_size px
+        return remove_small_objects(bh > thr, max_size=min_px - 1)
+    except TypeError:          # older scikit-image: removes objects of < min_size px (the same objects)
+        return remove_small_objects(bh > thr, min_size=min_px)
 
 
 def trace(skel: np.ndarray) -> list[list[tuple[int, int]]]:
