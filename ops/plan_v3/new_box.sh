@@ -1,11 +1,10 @@
 #!/bin/bash
-# New SCNet box (2026-11-18, new account, empty storage; ~11 card-hours of balance).
-# Only what GRPO v2 and the evaluations need was uploaded from the laptop (3.1 GB): CLIP B/16 + L/14 judge,
-# attribute classifier, captions/splits, the two 192-image validation sets, base_v3 model_final.pt, and one
-# trajectory per domain (seqsrc/face_t0, seqsrc/anime_t0) for the source embeddings.
-#  1. source embeddings from decomposer reconstructions (also builds the native rasterizer once)
-#  2. GRPO v2 from base_v3 (as grpo_real.sh): 200 steps, faces + anime evaluated every 25 steps
-#  3. sampling sweep on base_v3 (CFG x top-p, Renyi), faces + anime
+# New SCNet box (2026-11-18, new account, Kunshan; ~11 card-hours of balance). The old box's file storage
+# (everything but the Qwen captioner) was copied over directly (old -> new rsync, sizes + SHA spot-checked).
+#  1. GRPO v2 (grpo_real) resumes from its step-25 checkpoint (the old box stopped at step 49): to 200 steps,
+#     faces + anime evaluated every 25 steps -> eval/grpo_real_summary.txt
+#  2. in parallel: the draft-order ablation (draft_ablation.sh; it died on FlashAttention before, fixed)
+#  3. when both are done: sampling sweep on base_v3 (CFG x top-p, Renyi), faces + anime -> eval/sampling_sweep.txt
 # Writes "new_box finished" to $R/new_box.log at the end: the card can be stopped then.
 set -u
 R=/root/private_data; B=$R/runs/base_v3; G=$R/runs/grpo_real; LOG=$R/new_box.log
@@ -16,12 +15,6 @@ cd $R/lpp_dev
 export OMP_NUM_THREADS=3 MKL_NUM_THREADS=3 LPP_RASTER=native LPP_EXT_BUILD=$R/ext_build_v2
 mkdir -p $R/eval
 say "start"
-
-if [ ! -f $R/source_emb_b16.npz.complete ]; then
-  python -u tools/source_embeddings.py --seq $R/seqsrc/face_t0 $R/seqsrc/anime_t0 \
-    --text-encoder $R/models/chinese-clip-vit-base-patch16 --out $R/source_emb_b16.npz > $R/source_emb.log 2>&1 \
-    && say "source embeddings ready: $(tail -1 $R/source_emb.log)" || say "source embeddings FAILED (see source_emb.log)"
-fi
 
 J=(--text-encoder $R/models/chinese-clip-vit-base-patch16 --judge-encoder $R/models/chinese-clip-vit-large-patch14-fp16
    --captions $R/captions_v3.jsonl --n 192 --batch 48)
@@ -44,32 +37,37 @@ print(f"{name:28s} | faces {part(face)} | anime {part(anime)}", flush=True)
 PY
 }
 
-if [ ! -e $G ]; then
-  mkdir -p $G
+setsid bash $R/lpp_dev/ops/plan_v3/draft_ablation.sh > $R/draft_ablation.out 2>&1 < /dev/null &
+say "draft ablation started"
+
+if ! grep -q "GRPO v2 exited" $LOG 2>/dev/null; then
   SRC=(); [ -f $R/source_emb_b16.npz.complete ] && SRC=(--source-emb $R/source_emb_b16.npz --w-src 1)
-  [ -f $SUM ] || echo "base_v3_final (old box)        | faces R@1 0.146 R@5 0.307 FD 0.387 | anime R@1 0.052 R@5 0.229 FD 0.240" > $SUM
-  python -u tools/train_grpo.py --init $B/model_final.pt --out $G \
+  python -u tools/train_grpo.py --init $B/model_final.pt --out $G --resume \
     --text-encoder $R/models/chinese-clip-vit-base-patch16 --captions $R/captions_v3.jsonl \
     --split-manifest $R/split_v3_faces_anime.jsonl --anime-frac 0.5 "${SRC[@]}" \
     --attr-classifier $R/models/attr_resnet18.pt --attributes $R/celebamask256/attributes.json \
     --adv-mode per-component --w-clip 1 --w-attr 1 --w-orphan 0.5 \
     --steps 200 --prompts 8 --group 8 --micro-batch 16 --lr 1e-5 --beta 0.04 \
-    --sample-every 25 --save-every 25 --keep-snapshots > $G/stdout.log 2>&1 < /dev/null &
+    --sample-every 25 --save-every 25 --keep-snapshots >> $G/stdout.log 2>&1 < /dev/null &
   GP=$!
-  say "GRPO v2 started (pid $GP)"
+  say "GRPO v2 resumed (pid $GP)"
   for s in $(seq 25 25 200); do
+    n=grpo_real_step$(printf %03d $s)
+    grep -q "^$n " $SUM 2>/dev/null && continue    # evaluated already (step 25, on the old box)
     f=$G/model_step$(printf %03d $s).pt
     while [ ! -f $f ]; do kill -0 $GP 2>/dev/null || break 2; sleep 60; done
     sleep 30                                     # let the snapshot finish writing
-    n=grpo_real_step$(printf %03d $s)
     ev $n $f face && ev anime_$n $f anime && { line $n $n anime_$n >> $SUM; say "evaluated step $s"; } || say "eval step $s FAILED"
   done
   wait $GP; say "GRPO v2 exited ($?)"
 fi
 
+until grep -q "draft ablation finished\|FAILED" $R/draft_ablation.log 2>/dev/null && ! pgrep -f draft_ablation.sh > /dev/null; do sleep 120; done
+say "draft ablation done; sampling sweep starting"
 Bf=$B/model_final.pt
 sweep() {   # sweep TAG CKPT SAMPLING...
   local t=$1 ck=$2; shift 2
+  grep -q "^$t " $SW 2>/dev/null && return 0
   ev sweep_${t}_face $ck face "$@" && ev sweep_${t}_anime $ck anime "$@" \
     && line $t sweep_${t}_face sweep_${t}_anime >> $SW || say "sweep $t FAILED"
 }
