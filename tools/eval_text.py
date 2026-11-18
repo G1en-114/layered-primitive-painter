@@ -40,7 +40,8 @@ from lpp.protocol import _parse  # noqa: E402
 from lpp.render.dispatch import render_group  # noqa: E402
 from lpp.render.reference import flatten_on_base  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
-from lpp.sequence import paint_order  # noqa: E402
+from lpp.render.strokes import render_strokes  # noqa: E402
+from lpp.sequence import paint_order, strokes  # noqa: E402
 from lpp.text import TextEncoder  # noqa: E402
 
 def frechet(a: np.ndarray, b: np.ndarray) -> float:
@@ -194,7 +195,11 @@ def main() -> None:
                     continue
                 prims = codec.decode({k2: attrs[:, i].unsqueeze(0).to(dev) for i, k2 in enumerate(proto.attr_names)})
                 o = orphan_stats(prims, lay.to(dev), 128, proto=proto)["orphan"]
-                img = flatten_on_base(render_group(prims, 256, proto), proto)[0]
+                if proto.has_lines:      # v3: per layer Gaussians, then lines (lpp.render.strokes)
+                    sa, sl, sline = strokes(s, proto)
+                    img = render_strokes(sa, sl, sline, codec)[0]
+                else:
+                    img = flatten_on_base(render_group(prims, 256, proto), proto)[0]
                 row.append(((img.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8), o, len(s), e))
             cands.append(row)
         if args.best_of > 1:
