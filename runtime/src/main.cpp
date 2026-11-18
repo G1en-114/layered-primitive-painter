@@ -74,15 +74,15 @@ int main(int argc, char** argv) {
     std::vector<int64_t> rec(size_t(B) * Tmax * (3 + A), -2), lens(B);
     for (int b = 0; b < B; ++b) {
       lens[b] = static_cast<int64_t>(seqs[b].size());
-      std::vector<Prim> prims;
+      std::vector<Stroke> strokes;
       for (size_t t = 0; t < seqs[b].size(); ++t) {
         const auto& r = seqs[b][t];
         int64_t* row = &rec[(size_t(b) * Tmax + t) * (3 + A)];
         row[0] = r.kind, row[1] = r.event, row[2] = r.layer;
         std::copy(r.attrs.begin(), r.attrs.end(), row + 3);
-        if (r.kind == P.kind_primitive) prims.push_back(P.decode(r.attrs.data()));   // full mode: paint order
+        if (r.kind == P.kind_primitive) strokes.push_back({static_cast<int>(r.layer), r.event == P.line_ev, r.attrs.data()});
       }
-      auto img = render_rgb8(P, prims, P.canvas_size);
+      auto img = render_strokes_rgb8(P, strokes, P.canvas_size);     // per layer: Gaussians, then lines
       stbi_write_png((a["--out"] + "/sample_" + std::to_string(b) + ".png").c_str(), P.canvas_size, P.canvas_size, 3,
                      img.data(), P.canvas_size * 3);
     }

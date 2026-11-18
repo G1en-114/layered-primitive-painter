@@ -23,7 +23,15 @@ void paint(const Protocol& proto, const Prim& p, int S, float* P, float* T);
 // channel-major [3 + L][S][S] (lpp.canvas.compose).
 void compose(const Protocol& proto, const Layered& st, float* out);
 
+// Paint one Bezier line (protocol v3) into (P, T): hard edge, one-pixel ramp (lpp.render.bezier, 16 pieces).
+void paint_line(const Protocol& proto, const Line& l, int S, float* P, float* T);
+
 // Final image: primitives in paint order over the base colour -> RGB8 [S][S][3].
 std::vector<unsigned char> render_rgb8(const Protocol& proto, const std::vector<Prim>& prims, int S);
+
+// Final image of a stroke sequence as protocol v3 composites it (lpp.render.strokes): layers back to front;
+// inside a layer its Gaussians, then its lines, each in sequence order. tokens: one row per stroke.
+struct Stroke { int layer; bool line; const int64_t* tokens; };
+std::vector<unsigned char> render_strokes_rgb8(const Protocol& proto, const std::vector<Stroke>& strokes, int S);
 
 }  // namespace lpp

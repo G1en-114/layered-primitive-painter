@@ -1,5 +1,7 @@
 #include "protocol.h"
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -39,8 +41,25 @@ Prim Protocol::decode(const int64_t* tok) const {
     else if (n == "theta") p.theta = v;
     else if (n == "beta") p.beta = v;
     else if (n == "alpha") p.alpha = v;
+    else if (n == "bend") p.bend = v;
     else throw std::runtime_error("unsupported attribute " + n);
   }
+  return p;
+}
+
+Line Protocol::decode_line(const int64_t* tok) const {
+  const Prim p = decode(tok);                  // x, y = chord midpoint; theta; sx = half length; sy = half width
+  const float dx = std::cos(p.theta), dy = std::sin(p.theta), nx = -dy, ny = dx, h = p.sx;
+  return {p.x - h * dx, p.y - h * dy, p.x + p.bend * h * nx, p.y + p.bend * h * ny, p.x + h * dx, p.y + h * dy,
+          2.f * p.sy, p.r, p.g, p.b, p.alpha};
+}
+
+Prim Protocol::decode_canvas(const int64_t* tok, bool line) const {
+  Prim p = decode(tok);
+  if (!line) return p;
+  const float nx = -std::sin(p.theta), ny = std::cos(p.theta), off = p.bend * p.sx / 2.f;   // B(0.5)
+  p.x += off * nx, p.y += off * ny;
+  p.beta = beta_max;
   return p;
 }
 
@@ -66,6 +85,14 @@ Protocol Protocol::load(const std::string& dir) {
   P.max_text_positions = c["max_text_positions"];
   P.kind_bos = c["kinds"]["BOS"], P.kind_control = c["kinds"]["CONTROL"], P.kind_primitive = c["kinds"]["PRIMITIVE"];
   P.no_attr = c["no_attr"];
+  P.prim_ev = P.event_id("PRIMITIVE");
+  for (size_t i = 0; i < P.events.size(); ++i)
+    if (P.events[i] == "LINE") P.line_ev = static_cast<int>(i);
+  for (size_t i = 0; i < P.attrs.size(); ++i) {
+    if (P.attrs[i] == "beta") P.beta_attr = static_cast<int>(i);
+    if (P.attrs[i] == "bend") P.bend_attr = static_cast<int>(i), P.bend_mid = static_cast<int>(P.vocab[i] / 2);
+  }
+  if (P.table.count("beta")) P.beta_max = *std::max_element(P.table["beta"].begin(), P.table["beta"].end());
 
   const json m = read_json(dir + "/manifest.json");
   const json& cfg = m["config"];

@@ -18,11 +18,25 @@ WALK = ROOT / "runtime/build/lpp_grammar_walk"
 EXPORTS = sorted(p.parent for p in (ROOT / "out/onnx").glob("*/manifest.json"))
 
 
+def _one_per_protocol(exports):
+    """One export per protocol version (v2 Gaussian-only, v3 with LINE): the grammar differs between them."""
+    seen, out = set(), []
+    for e in exports:
+        v = json.loads((e / "manifest.json").read_text())["protocol"].get("version", 1)
+        if v not in seen:
+            seen.add(v)
+            out.append(e)
+    return out
+
+
+EXPORTS = _one_per_protocol(EXPORTS)
+
+
 @pytest.mark.skipif(not WALK.exists() or not EXPORTS, reason="runtime not built or no ONNX export")
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("require", [(), (0, 2)])
-def test_cpp_grammar_matches_python(draft, require):
-    export = EXPORTS[0]
+@pytest.mark.parametrize("export", EXPORTS or [None], ids=lambda e: e.name if e else "none")
+def test_cpp_grammar_matches_python(draft, require, export):
     proto = _parse(json.loads((export / "manifest.json").read_text())["protocol"])
     steps = refines_chained = 0
     for seed in range(150):

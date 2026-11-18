@@ -89,6 +89,9 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
 
     rand = uniforms or (lambda step, field: torch.rand(B))
     prim_ev, eos = proto.event_id("PRIMITIVE"), proto.event_id("EOS")
+    strokes_ev = set(proto.stroke_events)                                     # PRIMITIVE (+ LINE in v3)
+    line_ev = proto.event_id("LINE") if proto.has_lines else None
+    fixed = {e: proto.fixed_tokens(e) for e in proto.stroke_events}
     grammars = [Grammar(proto, require_before_eos=frozenset(cfg.require_before_eos), allow_special=False,
                         draft=m.cfg.get("order", "layer") == "draft")
                 for _ in range(B)]
@@ -127,11 +130,14 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
         event = _sample(logits.masked_fill(~allowed, float("-inf")), cfg, rand(step, "event"), "event")
         ev = event.tolist()
         attrs = np.full((B, A), NO_ATTR, np.int64)
-        if prim_ev in ev:
+        if any(e in strokes_ev for e in ev):
             for i, name in enumerate(m.attr_names):
                 outs = m.run("decode_heads", h=h, event=rows(event.numpy()), attrs=rows(np.maximum(attrs, 0)))
                 attrs[:, i] = _sample(guide(outs[1 + i]), cfg, rand(step, name), name).numpy()
-            attrs[np.array(ev) != prim_ev] = NO_ATTR
+            for e, fx in fixed.items():                                       # as lpp.sample.generate
+                for nm, tk in fx.items():
+                    attrs[np.array(ev) == e, list(m.attr_names).index(nm)] = tk
+            attrs[~np.isin(np.array(ev), list(strokes_ev))] = NO_ATTR
         layer = []
         for b, g in enumerate(grammars):
             if g.done:
@@ -142,7 +148,7 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
             else:
                 g.step(ev[b])
             layer.append(g.current if not g.done else -1)
-        kind = [KIND_PRIMITIVE if e == prim_ev else KIND_CONTROL for e in ev]
+        kind = [KIND_PRIMITIVE if e in strokes_ev else KIND_CONTROL for e in ev]
         live = [not d for d in done]
         for key, v in (("kind", kind), ("event", ev), ("layer", layer), ("attrs", attrs)):
             out[key].append(np.asarray(v))
@@ -155,7 +161,7 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
             if not live[b]:
                 continue
             if kind[b] == KIND_PRIMITIVE:
-                pending[b].append((attrs[b].copy(), layer[b]))
+                pending[b].append((attrs[b].copy(), layer[b], ev[b] == line_ev))
                 since[b] += 1
             if is_checkpoint(kind[b], since[b], k_ck):
                 hit.append(b)
@@ -165,12 +171,14 @@ def ort_generate(m: OrtPainter, codec: Codec, batch: int, cfg: SampleConfig, tex
             if n:
                 tok = torch.zeros(len(hit), n, A, dtype=torch.long)
                 lay = torch.full((len(hit), n), -1, dtype=torch.long)
+                isl = torch.zeros((len(hit), n), dtype=torch.bool)
                 for j, b in enumerate(hit):
                     if pending[b]:
-                        tok[j, :len(pending[b])] = torch.from_numpy(np.stack([a for a, _ in pending[b]])).clamp(min=0)
-                        lay[j, :len(pending[b])] = torch.tensor([la for _, la in pending[b]])
+                        tok[j, :len(pending[b])] = torch.from_numpy(np.stack([a for a, _, _ in pending[b]])).clamp(min=0)
+                        lay[j, :len(pending[b])] = torch.tensor([la for _, la, _ in pending[b]])
+                        isl[j, :len(pending[b])] = torch.tensor([ln for _, _, ln in pending[b]])
                 tok, lay = tok.to(dev), lay.to(dev)
-                prims = codec.decode({nm: tok[..., i] for i, nm in enumerate(proto.attr_names)})
+                prims = codec.decode_canvas({nm: tok[..., i] for i, nm in enumerate(proto.attr_names)}, isl.to(dev))
                 prims = prims.with_alpha(prims.alpha * (lay >= 0))
                 idx = torch.tensor(hit, device=dev)
                 P_, T_ = add_primitives((state[0][idx], state[1][idx]), prims, lay, size, proto)

@@ -79,16 +79,21 @@ def composite(alpha: torch.Tensor, rgb: torch.Tensor, under: torch.Tensor) -> to
     return torch.einsum("bnhw,bnc->bchw", w, rgb) + log_t.sum(1, keepdim=True).exp() * under
 
 
-def curve_alpha_local(c: Curves, size: int, window: int = 48, soft: float | None = None,
+def curve_alpha_local(c: Curves, size: int, window: int | None = None, soft: float | None = None,
                       segments: int = 16) -> torch.Tensor:
     """curve_alpha for B = 1, computed in a window x window patch around each curve and placed into the
-    canvas: memory and time scale with N * window^2 instead of N * size^2. Curves must fit their window
-    (span + width + 2 px margin); the window origin is not differentiated (as a rasteriser's tile)."""
+    canvas: memory and time scale with N * window^2 instead of N * size^2. window=None sizes it to the largest
+    curve of the call (span + width + margins), so no curve is ever cut; the window origin is not
+    differentiated (as a rasteriser's tile)."""
     assert c.p0.shape[0] == 1, "batch of one image"
     N, dev, dt = c.n, c.p0.device, c.p0.dtype
     pts = points(c, segments)[0]                                            # [N, K + 1, 2]
     margin = 2 + (8 * soft if soft else 0)                                  # soft tail: sigmoid(-16) ~ 1e-7
     lo = torch.floor(pts.detach().amin(1) - c.width.detach()[0, :, None] / 2 - margin).long()  # [N, 2] (x, y)
+    if window is None:      # fit the largest curve of the call, clipped to the canvas (only those pixels count)
+        lo = lo.clamp(0, size - 1)
+        hi = (pts.detach().amax(1) + c.width.detach()[0, :, None] / 2 + margin).ceil().long().clamp(1, size)
+        window = (max(16, int((hi - lo).max()) + 1) + 7) // 8 * 8
     r = torch.arange(window, device=dev)
     gx = lo[:, None, 0] + r[None]                                           # [N, S] canvas x of patch columns
     gy = lo[:, None, 1] + r[None]
@@ -134,7 +139,7 @@ def outline(r: Regions, per_piece: int = 8) -> torch.Tensor:
     return q.flatten(2, 3)
 
 
-def region_alpha_local(r: Regions, size: int, window: int = 128, soft: float | None = None,
+def region_alpha_local(r: Regions, size: int, window: int | None = None, soft: float | None = None,
                        per_piece: int = 8) -> torch.Tensor:
     """Per-pixel alpha [1, N, H, W] of filled regions (B = 1), each computed in a window around it.
     Signed distance to the boundary polyline: the magnitude from the nearest edge, the sign from an even-odd
@@ -144,6 +149,10 @@ def region_alpha_local(r: Regions, size: int, window: int = 128, soft: float | N
     poly = outline(r, per_piece)[0]                                        # [N, E, 2]
     margin = 2 + (8 * soft if soft else 0)
     lo = torch.floor(poly.detach().amin(1) - margin).long()               # [N, 2]
+    if window is None:
+        lo = lo.clamp(0, size - 1)
+        hi = (poly.detach().amax(1) + margin).ceil().long().clamp(1, size)
+        window = (max(16, int((hi - lo).max()) + 1) + 7) // 8 * 8
     rr = torch.arange(window, device=dev)
     gx, gy = lo[:, None, 0] + rr[None], lo[:, None, 1] + rr[None]
     px = (gx[:, None, :].expand(N, window, window).to(dt) + 0.5).reshape(N, 1, -1)   # [N, 1, P]

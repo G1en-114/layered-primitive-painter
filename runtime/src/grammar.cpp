@@ -21,7 +21,10 @@ std::vector<int> Grammar::allowed_events() const {
   std::vector<int> out;
   if (done_) return out;
   auto seen = [&](int k) { auto it = seen_.find(k); return it == seen_.end() ? 0 : it->second; };
-  if (current_ >= 0 && p_.layer_cap[current_] - seen(current_) > 0) out.push_back(prim_);
+  if (current_ >= 0 && p_.layer_cap[current_] - seen(current_) > 0) {
+    out.push_back(prim_);
+    if (p_.line_ev >= 0) out.push_back(p_.line_ev);      // protocol v3: lines share the layer cap
+  }
   if (current_ >= 0 && count_ == 0) return out;           // a marker must be followed by a primitive
   bool req_ok = true;
   for (int r : require_)
@@ -51,7 +54,7 @@ void Grammar::step(int event) {
   auto allowed = allowed_events();
   if (std::find(allowed.begin(), allowed.end(), event) == allowed.end())
     throw std::runtime_error("event " + p_.events[event] + " not allowed");
-  if (event == prim_) {
+  if (event == prim_ || (p_.line_ev >= 0 && event == p_.line_ev)) {
     ++count_;
     ++seen_[current_];
   } else if (event == eos_) {

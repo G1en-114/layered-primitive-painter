@@ -1,5 +1,7 @@
 #include "painter.h"
 
+#include <tuple>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -334,7 +336,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
   std::vector<std::vector<Record>> out(B);
   for (int b = 0; b < B; ++b) out[b].push_back({P.kind_bos, -1, -1, std::vector<int64_t>(A, P.no_attr)});
   std::vector<bool> done(B, false);
-  std::vector<std::vector<std::pair<std::vector<int64_t>, int>>> pending(B);
+  std::vector<std::vector<std::tuple<std::vector<int64_t>, int, bool>>> pending(B);   // tokens, layer, is line
   std::vector<int> since(B, 0);
   std::vector<float> lg;
 
@@ -404,7 +406,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
       ev[b] = sample_top_p(m.data(), E, cfg.sample, uni(step, 0, b));
     }
     std::vector<std::vector<int64_t>> attrs(B, std::vector<int64_t>(A, P.no_attr));
-    if (std::find(ev.begin(), ev.end(), prim_ev) != ev.end()) {
+    if (std::any_of(ev.begin(), ev.end(), [&](int64_t e) { return P.is_stroke(e); })) {
       Tensor evt = Tensor::I({R}), at = Tensor::I({R, A});
       for (int r = 0; r < R; ++r) evt.i[r] = ev[r % B];
       for (int i = 0; i < A; ++i) {
@@ -414,14 +416,17 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
         const int n = static_cast<int>(P.vocab[i]);
         for (int b = 0; b < B; ++b) attrs[b][i] = sample_top_p(guided_row(heads[1 + i], b, n), n, cfg.sample, uni(step, 1 + i, b));
       }
-      for (int b = 0; b < B; ++b)
-        if (ev[b] != prim_ev) std::fill(attrs[b].begin(), attrs[b].end(), P.no_attr);
+      for (int b = 0; b < B; ++b) {
+        if (!P.is_stroke(ev[b])) std::fill(attrs[b].begin(), attrs[b].end(), P.no_attr);
+        else if (ev[b] == P.line_ev && P.beta_attr >= 0) attrs[b][P.beta_attr] = 0;      // lines: beta = 0
+        else if (ev[b] == prim_ev && P.bend_attr >= 0) attrs[b][P.bend_attr] = P.bend_mid;  // Gaussians: bend = 0
+      }
     }
     std::vector<int64_t> layer(B), kind(B);
     std::vector<uint8_t> live(B);
     for (int b = 0; b < B; ++b) {
       live[b] = !done[b];
-      kind[b] = ev[b] == prim_ev ? P.kind_primitive : P.kind_control;
+      kind[b] = P.is_stroke(ev[b]) ? P.kind_primitive : P.kind_control;
       if (gram[b].done()) {
         layer[b] = -1;
       } else {
@@ -439,7 +444,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
     for (int b = 0; b < B; ++b) {
       if (!live[b]) continue;
       if (kind[b] == P.kind_primitive) {
-        pending[b].push_back({attrs[b], static_cast<int>(layer[b])});
+        pending[b].push_back({attrs[b], static_cast<int>(layer[b]), ev[b] == P.line_ev});
         ++since[b];
       }
       if (kind[b] == P.kind_bos || kind[b] == P.kind_control || since[b] >= P.canvas_k) {
@@ -453,11 +458,11 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
         const int b = hit[j];
         auto& st = canvas[b];
         const size_t plane = size_t(S) * S;
-        for (auto& [a, k] : pending[b]) {
+        for (auto& [a, k, is_line] : pending[b]) {
           if (k < 0) continue;
           std::vector<int64_t> t(a);
           for (auto& v : t) v = std::max<int64_t>(v, 0);
-          paint(P, P.decode(t.data()), S, st.P.data() + size_t(k) * 3 * plane, st.T.data() + size_t(k) * plane);
+          paint(P, P.decode_canvas(t.data(), is_line), S, st.P.data() + size_t(k) * 3 * plane, st.T.data() + size_t(k) * plane);
         }
         pending[b].clear();
         compose(P, st, cv.f.data() + j * (3 + NL) * plane);

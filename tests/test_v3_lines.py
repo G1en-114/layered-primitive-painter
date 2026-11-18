@@ -100,7 +100,7 @@ def test_lines_composite_over_their_layer_and_under_the_next(v3, codec3):
     no_line = render_strokes(attrs[[0, 2]], layer[[0, 2]], is_line[[0, 2]], codec3)[0]
     diff = (img - no_line).abs().sum(0)
     assert diff[128, 105] > 0.1                                          # the line shows on the fill
-    assert diff[128, 165] < 1e-3                                         # and is hidden by layer 4 there
+    assert diff[128, 165] < 0.02 * diff[128, 105]                        # and layer 4 hides it (alpha <= 0.99)
 
 
 def test_decoding_canvases_equal_training_canvases_with_lines(v3, codec3):
