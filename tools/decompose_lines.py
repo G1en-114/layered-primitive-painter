@@ -35,12 +35,15 @@ from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import load_shards, widen  # noqa: E402
 from lpp.decompose.fill import morton_code  # noqa: E402
 from lpp.protocol import PROTOCOL_V3_PATH, load_protocol  # noqa: E402
-from lpp.render.bezier import Curves, composite, curve_alpha_local  # noqa: E402
+from lpp.render.bezier import Curves  # noqa: E402
+from lpp.render.triton_lines import render_lines_triton  # noqa: E402
 from lpp.render.reference import Primitives  # noqa: E402
-from lpp.render.reference import render_group as ref_group  # noqa: E402
+from lpp.render.dispatch import render_group as ref_group  # noqa: E402  (Triton/native tile rasterizer, differentiable: 60x the reference)
 from lpp.render.strokes import render_strokes  # noqa: E402
 
 LINE_ROUND = 2          # lines come right after the two sketch rounds of their layer
+MAX_HALF_LEN, MAX_HALF_WIDTH = 16.0, 4.0
+WINDOW = 64             # 2 * 16 + 2 * 4 + soft margin 2 + 8 * 0.7 < 64
 
 
 def st(cont: torch.Tensor, disc: torch.Tensor) -> torch.Tensor:
@@ -102,11 +105,12 @@ def decompose_one(e, img, labels, codec, proto, args, dev):
                    {"params": [lrgb, lal], "lr": 0.05}]
 
         def lines():
-            h, th, b = llh.exp(), lth, torch.tanh(lbend)
+            # pieces are <= 20 px: keep them short and thin while fitting (bounded windows, no runaway)
+            h, th, b = llh.exp().clamp(max=MAX_HALF_LEN), lth, torch.tanh(lbend)
             d = torch.stack([th.cos(), th.sin()], -1)
             n = torch.stack([-th.sin(), th.cos()], -1)
             cv = Curves(p0=lc - h[..., None] * d, p1=lc + (b * h)[..., None] * n, p2=lc + h[..., None] * d,
-                        width=2 * llw.exp(), rgb=torch.sigmoid(lrgb), alpha=torch.sigmoid(lal) * 0.99)
+                        width=2 * llw.exp().clamp(max=MAX_HALF_WIDTH), rgb=torch.sigmoid(lrgb), alpha=torch.sigmoid(lal) * 0.99)
             q = codec.decode_lines(codec.encode_lines(cv))
             return Curves(p0=st(cv.p0, q.p0), p1=st(cv.p1, q.p1), p2=st(cv.p2, q.p2), width=st(cv.width, q.width),
                           rgb=st(cv.rgb, q.rgb), alpha=st(cv.alpha, q.alpha))
@@ -114,7 +118,7 @@ def decompose_one(e, img, labels, codec, proto, args, dev):
     def compose(soft):
         g = gauss()
         cv = lines() if K else None
-        a = curve_alpha_local(cv, 256, soft=soft) if K else None
+        a = None
         out = base.expand(1, 3, 256, 256)
         for k in layers:
             P, T = ref_group(g[(klay == k).nonzero()[:, 0]], 256, proto)
@@ -123,7 +127,8 @@ def decompose_one(e, img, labels, codec, proto, args, dev):
                 sel = (lline == k).nonzero()[:, 0]
                 # lines of layer k over everything so far equals lines over layer k's group, then the group
                 # over the layers below (curves sit at the top of layer k)
-                out = composite(a[:, sel], cv.rgb[:, sel], out)
+                Pl, Tl = render_lines_triton(cv[sel], 256, soft=soft)   # tile kernel, 45x the dense path
+                out = Pl + Tl * out
         return out
 
     opt = torch.optim.Adam(groups)

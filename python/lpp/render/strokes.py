@@ -25,7 +25,12 @@ def render_strokes(attrs: torch.Tensor, layer: torch.Tensor, is_line: torch.Tens
             img = P + T * img
         if len(ln):
             c = codec.decode_lines(tok(ln))
-            img = composite(curve_alpha_local(c, size), c.rgb, img)
+            if img.is_cuda:
+                from .triton_lines import render_lines_triton
+                P, T = render_lines_triton(c, size, canvas=proto.canvas_size, max_alpha=proto.max_alpha)
+                img = P + T * img
+            else:
+                img = composite(curve_alpha_local(c, size), c.rgb, img)
     return img
 
 
