@@ -117,3 +117,28 @@ The anime decompositions are far from converged: line art is hard for the round-
 gain about 1.1 dB, most of it in the first 100 steps. Anime gets its polish for free in the line-stroke
 re-decomposition (P6). For faces, the model, not the data, holds back realism (83% of the FD gap). So polishing
 the 360k face trajectories, roughly 20 DCU-hours in a batched run, waits.
+
+## Production decomposer: where the line gain goes (10 images, 200 steps, 2026-11-18)
+
+The line probe gained +1.12 dB over its refit control, and the first `decompose_lines.py` gained nothing. Measured
+step by step on the same images:
+
+| variant | PSNR | over control |
+|---|---|---|
+| control: no lines, same joint refit | 26.45 | - |
+| lines snapped to tokens every step (straight-through) | 26.44 | +0.00 |
+| lines snapped only when written | 26.59 | +0.14 |
+| **position and angle snapped and frozen for the last 20% of the steps, the rest adapts (default now)** | **26.93** | **+0.48** |
+| before the final snap (ceiling of the token parametrisation) | 27.24 | +0.79 |
+| probe: free control points, positions/colours quantised only at the end | 27.59 | +1.14 |
+
+The global and per-layer swaps give the same result, and the Triton and torch line renderers agree (26.59 against
+26.67). The remaining gap has two parts:
+
+- The symmetric parametrisation (no control-point offset along the chord) costs 0.35 dB.
+- The grids cost the rest. Quantising one attribute at a time: position 0.33 dB, angle 0.12, width 0.06, bend 0.05,
+  length and opacity 0.01. A 0.5 px position grid is coarse for a 1 px line. The fix is a finer x/y grid in the
+  protocol (1024 bins), which touches the whole data path (later).
+
+Line F1 rises regardless (0.78 to 0.85 on the first production shard), and so does the model trained on it: anime
+judge FD 0.367 (control) to 0.332 after the attribute-loss fix.
