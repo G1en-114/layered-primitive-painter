@@ -103,6 +103,9 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--attr-temperature", default=None,
                     help="per-attribute temperature overrides, e.g. x=0.7,y=0.7")
+    ap.add_argument("--best-of", type=int, default=1,
+                    help="paint N candidates per prompt and keep the one the conditioning CLIP (--text-encoder, "
+                         "not the judge) scores highest against the prompt")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-grid", type=int, default=16, help="samples (with their real images) in the grid")
     ap.add_argument("--judge-encoder", type=Path, default=None,
@@ -166,6 +169,7 @@ def main() -> None:
         early, gen_seconds = int(z["early"]), float(z["seconds"])
         print(f"reusing {len(gen)} generated images from {cache}", flush=True)
     started = time.perf_counter()
+    picker = None
     for b0 in range(len(gen), args.n, args.batch):
         batch_prompts = prompts[b0:b0 + args.batch]
         text, text_valid = (None, None) if args.no_text else encoder(batch_prompts)
@@ -177,26 +181,42 @@ def main() -> None:
         if targets is not None:
             target = torch.from_numpy(np.stack([targets.get(i, False) for i in ids[b0:b0 + args.batch]]))
             target = target.to(dev).permute(0, 3, 1, 2).float() / 255.0
-        g = torch.Generator(device=dev).manual_seed(args.seed * 100003 + b0)
-        for s in generate(model, batch=len(batch_prompts), cfg=sc, text=text, text_valid=text_valid,
-                          generator=g, codec=codec, image=image, image_valid=image_valid, target=target):
-            attrs, lay = paint_order(s)
-            lengths.append(len(s))
-            early += int(2 not in lay.tolist())
-            if attrs.shape[0] == 0:
-                gen.append(np.full((256, 256, 3), 255, np.uint8))
-                continue
-            prims = codec.decode({k: attrs[:, i].unsqueeze(0).to(dev) for i, k in enumerate(proto.attr_names)})
-            orphan.append(orphan_stats(prims, lay.to(dev), 128, proto=proto)["orphan"])
-            img = flatten_on_base(render_group(prims, 256, proto), proto)[0]
-            gen.append((img.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
+        cands = []                                   # per candidate round: [(img, orphan, length, early)]
+        for k in range(args.best_of):
+            g = torch.Generator(device=dev).manual_seed(args.seed * 100003 + b0 + 7919 * k)
+            row = []
+            for s in generate(model, batch=len(batch_prompts), cfg=sc, text=text, text_valid=text_valid,
+                              generator=g, codec=codec, image=image, image_valid=image_valid, target=target):
+                attrs, lay = paint_order(s)
+                e = int(2 not in lay.tolist())
+                if attrs.shape[0] == 0:
+                    row.append((np.full((256, 256, 3), 255, np.uint8), None, len(s), e))
+                    continue
+                prims = codec.decode({k2: attrs[:, i].unsqueeze(0).to(dev) for i, k2 in enumerate(proto.attr_names)})
+                o = orphan_stats(prims, lay.to(dev), 128, proto=proto)["orphan"]
+                img = flatten_on_base(render_group(prims, 256, proto), proto)[0]
+                row.append(((img.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8), o, len(s), e))
+            cands.append(row)
+        if args.best_of > 1:
+            if picker is None:
+                picker = ClipScorer(args.text_encoder, dev)
+            t = picker.texts(batch_prompts)
+            sc_k = torch.stack([(picker.images([c[0] for c in row]) * t).sum(1) for row in cands])   # [K, B]
+            pick = sc_k.argmax(0).tolist()
+        else:
+            pick = [0] * len(batch_prompts)
+        for j, k in enumerate(pick):
+            img, o, n_rec, e = cands[k][j]
+            gen.append(img); lengths.append(n_rec); early += e
+            if o is not None:
+                orphan.append(o)
         print(f"  generated {len(gen)}/{args.n}  {len(gen) / (time.perf_counter() - started):.2f} img/s",
               flush=True)
     if not cache.exists():
         gen_seconds = time.perf_counter() - started
         np.savez(cache, ids=np.array(ids), images=np.stack(gen), orphan=np.array(orphan),
                  lengths=np.array(lengths), early=early, seconds=gen_seconds)
-    del model
+    del model, picker
     torch.cuda.empty_cache()
 
     clip = ClipScorer(args.text_encoder, dev)
@@ -205,7 +225,7 @@ def main() -> None:
     half = len(r_np) // 2
     result = {
         "step": state["step"], "checkpoint": str(args.ckpt), "n": args.n, "cfg_scale": args.cfg_scale,
-        "renyi_alpha": args.renyi_alpha, "temperature": args.temperature, "attr_temperature": args.attr_temperature,
+        "renyi_alpha": args.renyi_alpha, "temperature": args.temperature, "best_of": args.best_of, "attr_temperature": args.attr_temperature,
         "top_p": args.top_p, "seed": args.seed,
         "generated": {"clip_score": round(100 * float((gi * t).sum(1).mean()), 3), **retrieval(gi, t),
                       "clip_fd": round(frechet(g_np, r_np), 4),
