@@ -103,6 +103,53 @@ class Codec:
             alpha=a("alpha").dequantize(tok["alpha"]),
         )
 
+    # ---- LINE strokes (protocol v3) ------------------------------------------------------------
+    def decode_lines(self, tok: dict[str, torch.Tensor]) -> "Curves":
+        """Line tokens [B, N] -> Bezier curves. Chord midpoint (x, y), direction theta, half length sigma_x,
+        half width sigma_y, control point = midpoint + bend * half_length * normal."""
+        from .render.bezier import Curves
+        a = self.proto.attr
+        c = torch.stack([a("x").dequantize(tok["x"]), a("y").dequantize(tok["y"])], -1)
+        th, h = a("theta").dequantize(tok["theta"]), a("sigma_x").dequantize(tok["sigma_x"])
+        d = torch.stack([th.cos(), th.sin()], -1)
+        n = torch.stack([-th.sin(), th.cos()], -1)
+        bend = a("bend").dequantize(tok["bend"])
+        return Curves(p0=c - h[..., None] * d, p1=c + (bend * h)[..., None] * n, p2=c + h[..., None] * d,
+                      width=2 * a("sigma_y").dequantize(tok["sigma_y"]),
+                      rgb=oklab_to_srgb(self.color_codes.to(c.device)[tok["color"]]), alpha=a("alpha").dequantize(tok["alpha"]))
+
+    def decode_canvas(self, tok: dict[str, torch.Tensor], is_line: torch.Tensor | None) -> Primitives:
+        """Strokes for the low-resolution canvas feedback (64 px), as Gaussians: a line becomes a hard-edged
+        Gaussian over its extent (half length x half width, beta at the hardest level, centred on the curve's
+        midpoint). At 64 px a 1-3 px line is under a pixel wide, and training and decoding both use this, so
+        the model always sees the same canvas for the same strokes."""
+        p = self.decode(tok)
+        if is_line is None or not self.proto.has_lines or not bool(is_line.any()):
+            return p
+        a = self.proto.attr
+        th, h = a("theta").dequantize(tok["theta"]), a("sigma_x").dequantize(tok["sigma_x"])
+        n = torch.stack([-th.sin(), th.cos()], -1)
+        mid = p.xy + (a("bend").dequantize(tok["bend"]) * h / 2)[..., None] * n     # B(0.5) of the curve
+        m = is_line[..., None]
+        return Primitives(xy=torch.where(m, mid, p.xy), sigma=p.sigma, theta=p.theta,
+                          beta=torch.where(is_line, torch.full_like(p.beta, max(self.proto.beta_levels)), p.beta),
+                          rgb=p.rgb, alpha=p.alpha)
+
+    def encode_lines(self, cv: "Curves") -> dict[str, torch.Tensor]:
+        """Bezier curves [B, N] -> line tokens. The control point's offset along the chord is not kept
+        (the line parametrisation is symmetric about the chord's normal), so fit lines in this form."""
+        proto, a = self.proto, self.proto.attr
+        mid, chord = (cv.p0 + cv.p2) / 2, cv.p2 - cv.p0
+        h = (chord.norm(dim=-1) / 2).clamp(proto.sigma_min, proto.sigma_max)
+        th = torch.remainder(torch.atan2(chord[..., 1], chord[..., 0]), torch.pi)
+        n = torch.stack([-th.sin(), th.cos()], -1)
+        bend = (((cv.p1 - mid) * n).sum(-1) / h).clamp(-1, 1)
+        return {"x": a("x").quantize(mid[..., 0]), "y": a("y").quantize(mid[..., 1]),
+                "sigma_x": a("sigma_x").quantize(h), "sigma_y": a("sigma_y").quantize((cv.width / 2).clamp(proto.sigma_min, proto.sigma_max)),
+                "theta": a("theta").quantize(th), "beta": torch.zeros_like(a("x").quantize(mid[..., 0])),
+                "color": nearest(self.color_codes.to(cv.rgb.device), srgb_to_oklab(cv.rgb.clamp(0, 1))),
+                "alpha": a("alpha").quantize(cv.alpha), "bend": a("bend").quantize(bend)}
+
     def snap(self, p: Primitives, straight_through: bool = True) -> Primitives:
         """Quantize then dequantize. With straight_through, gradients pass to `p`
         as if snapping were the identity (used by quantization-aware fitting)."""

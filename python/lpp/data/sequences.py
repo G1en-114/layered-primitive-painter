@@ -22,6 +22,7 @@ class Example:
     round: torch.Tensor    # [N]
     image_id: int
     flip: bool = False
+    is_line: torch.Tensor | None = None   # [N] bool, protocol v3 line strokes (None: all Gaussians)
 
 
 def load_shards(paths: list[Path]) -> list[Example]:
@@ -39,10 +40,23 @@ def load_shards(paths: list[Path]) -> list[Example]:
             tokens = torch.from_numpy(z["tokens"].astype(np.int64))
             layer = torch.from_numpy(z["layer"].astype(np.int64))
             rounds = torch.from_numpy(z["round"].astype(np.int64))
+            lines = torch.from_numpy(z["is_line"].astype(bool)) if "is_line" in z.files else None
         for i, image_id in enumerate(ids):
             a, b = int(off[i]), int(off[i + 1])
-            out.append(Example(tokens[a:b], layer[a:b], rounds[a:b], int(image_id), flipped))
+            out.append(Example(tokens[a:b], layer[a:b], rounds[a:b], int(image_id), flipped,
+                               lines[a:b] if lines is not None else None))
     return out
+
+
+def widen(tokens: torch.Tensor, proto) -> torch.Tensor:
+    """Gaussian-only (v2) decomposition tokens under a v3 protocol: append the attributes v2 does not have,
+    with the token a Gaussian always carries (bend = 0). v2 data trains a v3 model unchanged."""
+    A = len(proto.attr_names)
+    if tokens.shape[1] == A:
+        return tokens
+    fixed = proto.fixed_tokens(proto.event_id("PRIMITIVE"))
+    extra = [torch.full((tokens.shape[0], 1), fixed[n], dtype=tokens.dtype) for n in proto.attr_names[tokens.shape[1]:]]
+    return torch.cat([tokens, *extra], 1)
 
 
 class ImageTokenStore:
@@ -115,7 +129,7 @@ class SequenceDataset(Dataset):
         mode = sample_mode(ex.layer, ex.round, self.rng, self.p_redraw, self.p_refine)
         if self.order == "draft" and mode["mode"] == "full":
             mode = {"mode": "draft", "split_round": self.draft_rounds}
-        seq = build(ex.tokens, ex.layer, ex.round, proto=self.proto, **mode)
+        seq = build(widen(ex.tokens, self.proto), ex.layer, ex.round, proto=self.proto, is_line=ex.is_line, **mode)
         if self.p_perturb > 0 and self.rng.random() < self.p_perturb:
             seq = perturb(seq, self.rng, self.proto)
         if self.captions is not None:

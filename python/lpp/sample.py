@@ -109,6 +109,9 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         return torch.cat([t, t]) if guided else t
     rand = uniforms or (lambda step, field: torch.rand(B, device=dev, generator=generator))
     prim_ev = proto.event_id("PRIMITIVE")
+    stroke_evs = torch.tensor(proto.stroke_events, device=dev)              # PRIMITIVE (+ LINE in v3)
+    line_ev = proto.event_id("LINE") if proto.has_lines else None
+    fixed = {e: proto.fixed_tokens(e) for e in proto.stroke_events}         # slots a stroke type does not use
 
     special_ids = {proto.redraw_event(k) for k in range(proto.num_layers)} | \
                   {proto.refine_event(k) for k in range(proto.num_layers)}
@@ -182,17 +185,21 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         ev = event.tolist()              # the one device->host sync for this record
 
         attrs = torch.full((B, A), NO_ATTR, dtype=torch.long, device=dev)
-        is_prim = event == prim_ev
-        if prim_ev in ev:
+        is_prim = torch.isin(event, stroke_evs)                             # any stroke: decode its attributes
+        if any(e in proto.stroke_events for e in ev):
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
                 logits = model.attr_logits(name, dh[:, -1], rows(prev) if prev is not None else None)
                 attrs[:, i] = _sample(guide(logits), cfg, rand(step, name), name)
+            for e, fx in fixed.items():                                     # beta = 0 on lines, bend = 0 on Gaussians
+                for nm, tk in fx.items():
+                    attrs[:, model.attr_names.index(nm)] = torch.where(event == e, torch.full_like(attrs[:, 0], tk),
+                                                                       attrs[:, model.attr_names.index(nm)])
             attrs[~is_prim] = NO_ATTR
         if forced is not None and step < Tf:
             attrs = torch.where(in_prefix[:, None], f_attrs[:, step], attrs)
         if prev is not None:
-            prev = torch.where((event == prim_ev)[:, None], attrs, prev)
+            prev = torch.where(is_prim[:, None], attrs, prev)
 
         layer_cpu = []
         for b, g in enumerate(grammars):
@@ -205,7 +212,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
                 g.step(ev[b])
             layer_cpu.append(g.current if not g.done else -1)
         layer = torch.tensor(layer_cpu, device=dev)
-        kind_cpu = [KIND_PRIMITIVE if e == prim_ev else KIND_CONTROL for e in ev]
+        kind_cpu = [KIND_PRIMITIVE if e in proto.stroke_events else KIND_CONTROL for e in ev]
+        line_cpu = [e == line_ev for e in ev]
         kind = torch.where(is_prim, KIND_PRIMITIVE, KIND_CONTROL)
 
         live_cpu = [not d for d in done_cpu]
@@ -218,7 +226,8 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         x = model.embed_records(rows(kind)[:, None], rows(event)[:, None], rows(layer)[:, None],
                                 rows(attrs)[:, None])
         if tracker is not None:
-            tracker.update(kind, attrs, layer, live, kind_cpu=kind_cpu, layer_cpu=layer_cpu, live_cpu=live_cpu)
+            tracker.update(kind, attrs, layer, live, kind_cpu=kind_cpu, layer_cpu=layer_cpu, live_cpu=live_cpu,
+                           line_cpu=line_cpu)
             ctx = ("current", rows(tracker.tokens), torch.ones(R, 1, dtype=torch.bool, device=dev))
         h = model.backbone(x, rows(live)[:, None], cache, canvas_ctx=ctx, target_ctx=tctx)[:, -1]
 

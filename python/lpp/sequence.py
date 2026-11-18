@@ -83,7 +83,7 @@ class Grammar:
             return []
         out = []
         if self.current >= 0 and self._cap_left() > 0:
-            out.append(p.event_id("PRIMITIVE"))
+            out.extend(p.stroke_events)          # PRIMITIVE, and LINE from protocol v3 (same layer cap)
         if self.current >= 0 and self.count == 0:
             return out                         # a marker must be followed by a primitive
         required_done = all(self.seen.get(r, 0) > 0 for r in self.require_before_eos)
@@ -125,7 +125,7 @@ class Grammar:
             raise ValueError(f"event {self.proto.events[event]} not allowed here "
                              f"(layer {self.current}, count {self.count}, special {self.special})")
         name = self.proto.events[event]
-        if name == "PRIMITIVE":
+        if name in ("PRIMITIVE", "LINE"):
             self.count += 1
             self.seen[self.current] = self.seen.get(self.current, 0) + 1
         elif name == "EOS":
@@ -155,7 +155,7 @@ def validate(seq: DrawSeq, proto: Protocol | None = None, draft: bool = False) -
 # ---------------------------------------------------------------------------- building
 def build(tokens: torch.Tensor, layer: torch.Tensor, rounds: torch.Tensor, mode: str = "full",
           target: int | None = None, split_round: int | None = None,
-          proto: Protocol | None = None) -> DrawSeq:
+          proto: Protocol | None = None, is_line: torch.Tensor | None = None) -> DrawSeq:
     """Assemble a drawing sequence from one decomposition.
 
     tokens [N, A] attribute tokens in decomposer order (layer, then round, then Morton),
@@ -163,10 +163,15 @@ def build(tokens: torch.Tensor, layer: torch.Tensor, rounds: torch.Tensor, mode:
     layer `target`'s rounds < split_round in place and moves the rest to the end; 'draft'
     does that for every layer (rounds < split_round of all layers, then each layer's rest
     after a REFINE marker, layers in order).
+    is_line [N] bool (protocol v3): those strokes become LINE records. Where lines go inside a layer is the
+    data's order (the line-stroke decomposer gives them the round after the sketch rounds).
     """
     proto = proto or load_protocol()
     A = len(proto.attributes)
     prim_event = proto.event_id("PRIMITIVE")
+    line_event = proto.event_id("LINE") if proto.has_lines else None
+    if is_line is not None and is_line.any() and line_event is None:
+        raise ValueError("line strokes need a protocol with LINE events (v3)")
     kind, event, attrs, lay = [KIND_BOS], [-1], [[NO_ATTR] * A], [-1]
 
     def marker(ev: int, k: int) -> None:
@@ -174,7 +179,8 @@ def build(tokens: torch.Tensor, layer: torch.Tensor, rounds: torch.Tensor, mode:
 
     def prims(idx: torch.Tensor, k: int) -> None:
         for i in idx.tolist():
-            kind.append(KIND_PRIMITIVE), event.append(prim_event), attrs.append(tokens[i].tolist())
+            ln = is_line is not None and bool(is_line[i])
+            kind.append(KIND_PRIMITIVE), event.append(line_event if ln else prim_event), attrs.append(tokens[i].tolist())
             lay.append(k)
 
     present = [int(k) for k in torch.unique(layer).tolist()]
@@ -241,6 +247,15 @@ def sample_mode(layer: torch.Tensor, rounds: torch.Tensor, rng: random.Random,
             k, s = rng.choice(options)
             return {"mode": "refine", "target": k, "split_round": s}
     return {"mode": "full"}
+
+
+def strokes(seq: DrawSeq, proto: Protocol | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """All strokes of a sequence in sequence order -> (attrs [N, A], layer [N], is_line [N]), for
+    lpp.render.strokes.render_strokes (which composites them as the protocol says)."""
+    proto = proto or load_protocol()
+    is_stroke = seq.kind == KIND_PRIMITIVE
+    line = proto.event_id("LINE") if proto.has_lines else -2
+    return seq.attrs[is_stroke], seq.layer[is_stroke], seq.event[is_stroke] == line
 
 
 def paint_order(seq: DrawSeq) -> tuple[torch.Tensor, torch.Tensor]:

@@ -19,6 +19,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROTOCOL_PATH = REPO_ROOT / "protocol.json"
+PROTOCOL_V3_PATH = REPO_ROOT / "protocol_v3.json"      # + LINE strokes (docs/line_strokes.md)
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,25 @@ class Protocol:
     def refine_event(self, layer: int) -> int:
         return self.event_id(f"REFINE_{layer}")
 
+    # ---- strokes: Gaussians (PRIMITIVE) and, from v3, Bezier lines (LINE) ----------------
+    @property
+    def has_lines(self) -> bool:
+        return "LINE" in self.events
+
+    @property
+    def stroke_events(self) -> tuple[int, ...]:
+        """Event ids of records that carry attributes (painted strokes)."""
+        return (self.event_id("PRIMITIVE"),) + ((self.event_id("LINE"),) if self.has_lines else ())
+
+    def fixed_tokens(self, event: int) -> dict[str, int]:
+        """Attributes a stroke type does not use, with the one token they always carry: a LINE has no edge
+        hardness (beta = 0), a Gaussian no bend (the middle bin, 0)."""
+        if not self.has_lines:
+            return {}
+        if event == self.event_id("LINE"):
+            return {"beta": 0}
+        return {"bend": self.attr("bend").bins // 2}
+
     @property
     def num_layers(self) -> int:
         return len(self.layers)
@@ -212,6 +232,8 @@ def _validate(p: Protocol) -> None:
             raise ValueError("shape codebook size must equal codes_per_beta * len(beta_levels)")
     elif not {"sigma_x", "sigma_y", "theta", "beta"} <= set(p.attr_names):
         raise ValueError("protocol needs either a 'shape' codebook or sigma_x/sigma_y/theta/beta")
+    if p.has_lines and "bend" not in p.attr_names:
+        raise ValueError("a protocol with LINE events needs the bend attribute")
     if len(set(p.attr_names)) != len(p.attr_names):
         raise ValueError("duplicate attribute names")
     seen: set[str] = set()

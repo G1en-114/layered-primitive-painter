@@ -101,7 +101,8 @@ def build_training_canvases(batch: dict, codec: Codec, k: int = 32, size: int = 
     S = int(incl[:, -1].max())
 
     is_prim = (kind == KIND_PRIMITIVE) & valid & (member < incl[:, -1:])   # drop the trailing tail
-    prims = codec.decode({n: attrs[..., i].clamp(min=0) for i, n in enumerate(proto.attr_names)})
+    is_line = (batch["event"] == proto.event_id("LINE")) if proto.has_lines else None
+    prims = codec.decode_canvas({n: attrs[..., i].clamp(min=0) for i, n in enumerate(proto.attr_names)}, is_line)
     prims = prims.with_alpha(prims.alpha * is_prim)
     lay = torch.where(is_prim, layer, torch.full_like(layer, -1))
 
@@ -164,7 +165,7 @@ class CanvasTracker:
     @torch.no_grad()
     def update(self, kind: torch.Tensor, attrs: torch.Tensor, layer: torch.Tensor, live: torch.Tensor,
                kind_cpu: list[int] | None = None, layer_cpu: list[int] | None = None,
-               live_cpu: list[bool] | None = None) -> None:
+               live_cpu: list[bool] | None = None, line_cpu: list[bool] | None = None) -> None:
         """The *_cpu lists, when given, are host copies of kind/layer/live (avoids a device sync
         per sample); the tensors stay the source of truth for attrs."""
         kind_cpu = kind.tolist() if kind_cpu is None else kind_cpu
@@ -176,7 +177,7 @@ class CanvasTracker:
                 continue
             kb = kind_cpu[b]
             if kb == KIND_PRIMITIVE:
-                self.pending[b].append((attrs[b], layer_cpu[b]))
+                self.pending[b].append((attrs[b], layer_cpu[b], bool(line_cpu[b]) if line_cpu else False))
                 self.since[b] += 1
             if is_checkpoint(kb, self.since[b], self.k):
                 hit.append(b)
@@ -189,13 +190,16 @@ class CanvasTracker:
             dev = attrs.device
             tok = torch.zeros(len(hit), n, A, dtype=torch.long, device=dev)
             lay_cpu = torch.full((len(hit), n), -1, dtype=torch.long)
+            ln_cpu = torch.zeros((len(hit), n), dtype=torch.bool)
             for i, b in enumerate(hit):               # one stack per sample, not one write per record
                 if self.pending[b]:
                     m = len(self.pending[b])
-                    tok[i, :m] = torch.stack([a for a, _ in self.pending[b]]).clamp(min=0)
-                    lay_cpu[i, :m] = torch.tensor([layer_id for _, layer_id in self.pending[b]])
+                    tok[i, :m] = torch.stack([a for a, _, _ in self.pending[b]]).clamp(min=0)
+                    lay_cpu[i, :m] = torch.tensor([layer_id for _, layer_id, _ in self.pending[b]])
+                    ln_cpu[i, :m] = torch.tensor([ln for _, _, ln in self.pending[b]])
             lay = lay_cpu.to(dev, non_blocking=True)
-            prims = self.codec.decode({nm: tok[..., i] for i, nm in enumerate(self.proto.attr_names)})
+            prims = self.codec.decode_canvas({nm: tok[..., i] for i, nm in enumerate(self.proto.attr_names)},
+                                             ln_cpu.to(dev, non_blocking=True))
             prims = prims.with_alpha(prims.alpha * (lay >= 0))
             idx = torch.tensor(hit, device=dev)
             sub = (self.state[0][idx], self.state[1][idx])
