@@ -82,6 +82,8 @@ class Codec:
             betas = torch.tensor(proto.beta_levels, device=p.beta.device)
             beta_idx = (torch.log(p.beta.clamp(min=1e-3))[..., None] - torch.log(betas)).abs().argmin(-1)
             out["shape"] = beta_idx * self.shape_codes.shape[0] + nearest(self.shape_codes, to_logcov(sx, sy, th))
+        for n, t in proto.fixed_tokens(proto.event_id("PRIMITIVE")).items():   # v3: bend = 0 on Gaussians
+            out.setdefault(n, torch.full_like(out["x"], t))
         return {n: out[n] for n in proto.attr_names}
 
     def decode(self, tok: dict[str, torch.Tensor]) -> Primitives:
