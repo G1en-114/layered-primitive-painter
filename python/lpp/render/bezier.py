@@ -107,3 +107,61 @@ def curve_alpha_local(c: Curves, size: int, window: int = 48, soft: float | None
     n = torch.arange(N, device=dev)[:, None, None].expand(N, window, window)
     canvas = canvas.index_put((n, iy, ix), patch)
     return canvas[None, :, window:window + size, window:window + size]
+
+
+@dataclass
+class Regions:
+    """Filled closed shapes, [B, N, ...]: `segments` quadratic Bezier pieces end to end. pts [B, N, 2S, 2] holds,
+    for piece j, its start pts[2j] and control point pts[2j+1]; piece j ends at pts[2j+2] (wrapping to pts[0]).
+    Used for cel shadows and highlights (with lpp.render.blend), after LIVE / DiffVG's closed paths."""
+
+    pts: torch.Tensor    # [B, N, 2S, 2]
+    rgb: torch.Tensor    # [B, N, 3]
+    alpha: torch.Tensor  # [B, N]
+
+    @property
+    def n(self) -> int:
+        return self.pts.shape[1]
+
+
+def outline(r: Regions, per_piece: int = 8) -> torch.Tensor:
+    """Closed polyline through each region's boundary: [B, N, S * per_piece, 2] (first vertex not repeated)."""
+    p0 = r.pts[:, :, 0::2]
+    p1 = r.pts[:, :, 1::2]
+    p2 = torch.roll(p0, -1, dims=2)
+    t = torch.linspace(0, 1, per_piece + 1, device=r.pts.device, dtype=r.pts.dtype)[:-1].view(1, 1, 1, -1, 1)
+    q = (1 - t) ** 2 * p0[..., None, :] + 2 * (1 - t) * t * p1[..., None, :] + t ** 2 * p2[..., None, :]
+    return q.flatten(2, 3)
+
+
+def region_alpha_local(r: Regions, size: int, window: int = 128, soft: float | None = None,
+                       per_piece: int = 8) -> torch.Tensor:
+    """Per-pixel alpha [1, N, H, W] of filled regions (B = 1), each computed in a window around it.
+    Signed distance to the boundary polyline: the magnitude from the nearest edge, the sign from an even-odd
+    ray crossing test; coverage clamp(sd + 0.5, 0, 1), or sigmoid(sd / soft) for fitting."""
+    assert r.pts.shape[0] == 1, "batch of one image"
+    N, dev, dt = r.n, r.pts.device, r.pts.dtype
+    poly = outline(r, per_piece)[0]                                        # [N, E, 2]
+    margin = 2 + (8 * soft if soft else 0)
+    lo = torch.floor(poly.detach().amin(1) - margin).long()               # [N, 2]
+    rr = torch.arange(window, device=dev)
+    gx, gy = lo[:, None, 0] + rr[None], lo[:, None, 1] + rr[None]
+    px = (gx[:, None, :].expand(N, window, window).to(dt) + 0.5).reshape(N, 1, -1)   # [N, 1, P]
+    py = (gy[:, :, None].expand(N, window, window).to(dt) + 0.5).reshape(N, 1, -1)
+    a, b = poly, torch.roll(poly, -1, dims=1)                              # edges a -> b, [N, E, 2]
+    ax, ay, bx, by = a[..., 0, None], a[..., 1, None], b[..., 0, None], b[..., 1, None]
+    ex, ey = bx - ax, by - ay
+    t = (((px - ax) * ex + (py - ay) * ey) / (ex * ex + ey * ey).clamp(min=1e-8)).clamp(0, 1)
+    d = ((((px - ax - t * ex) ** 2 + (py - ay - t * ey) ** 2).amin(1)) + 1e-8).sqrt()   # [N, P]
+    with torch.no_grad():                                                  # even-odd rule, horizontal ray to +x
+        cross = ((ay > py) != (by > py)) & (px < ax + (py - ay) * ex / torch.where(ey == 0, torch.full_like(ey, 1e-8), ey))
+        inside = cross.sum(1) % 2 == 1
+    sd = torch.where(inside, d, -d)
+    cov = torch.sigmoid(sd / soft) if soft else (sd + 0.5).clamp(0, 1)
+    patch = (cov * r.alpha[0].clamp(0, MAX_ALPHA)[:, None]).clamp(max=MAX_ALPHA).view(N, window, window)
+    canvas = torch.zeros(N, size + 2 * window, size + 2 * window, device=dev, dtype=dt)
+    iy = (gy + window).clamp(0, size + 2 * window - 1)[:, :, None].expand(N, window, window)
+    ix = (gx + window).clamp(0, size + 2 * window - 1)[:, None, :].expand(N, window, window)
+    n = torch.arange(N, device=dev)[:, None, None].expand(N, window, window)
+    canvas = canvas.index_put((n, iy, ix), patch)
+    return canvas[None, :, window:window + size, window:window + size]

@@ -36,7 +36,9 @@ from line_probe import f1, psnr, to_u8  # noqa: E402
 from lpp.codec import Codec  # noqa: E402
 from lpp.data.sequences import load_shards  # noqa: E402
 from lpp.protocol import load_protocol  # noqa: E402
+from lpp.render.bezier import Regions, region_alpha_local  # noqa: E402
 from lpp.render.blend import multiply  # noqa: E402
+from line_probe import quantize_curves  # noqa: E402,F401  (same token grid for region points below)
 from lpp.render.reference import Primitives, pixel_alpha  # noqa: E402
 from lpp.render.reference import render_group as ref_group  # noqa: E402
 
@@ -82,6 +84,43 @@ def shadow_regions(img, labels, base, max_strokes: int, min_px: int = 20):
     return out[:max_strokes]
 
 
+def quantize_colours(rgb: torch.Tensor, codec) -> torch.Tensor:
+    from lpp.codebook import nearest
+    from lpp.color import oklab_to_srgb, srgb_to_oklab
+    return oklab_to_srgb(codec.color_codes[nearest(codec.color_codes, srgb_to_oklab(rgb.clamp(0, 1)))])
+
+
+def region_init(img, labels, base, max_regions: int, pieces: int = 6, min_px: int = 20):
+    """Shadow components -> closed Bezier outlines: the longest contour resampled to 2 * pieces points by arc
+    length; even points are piece ends, odd ones become control points so each piece passes through them.
+    -> [(layer, pts [2P, 2], ratio rgb, area, member mask)] largest first."""
+    from skimage.measure import find_contours
+    f = img[..., :3].astype(np.float32) / 255
+    sm = shadow_mask(img, labels, base)
+    out = []
+    for k in np.unique(labels):
+        if k == 0:
+            continue
+        comp, n = ndimage.label(sm & (labels == k))
+        for c in range(1, n + 1):
+            m = comp == c
+            if m.sum() < min_px:
+                continue
+            cs = find_contours(np.pad(m, 1).astype(np.float32), 0.5)
+            cy = max(cs, key=len) - 1                                     # (row, col), undo the padding
+            xy = np.stack([cy[:, 1] + 0.5, cy[:, 0] + 0.5], 1)
+            seg = np.r_[0, np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))]
+            q = np.stack([np.interp(np.linspace(0, seg[-1], 2 * pieces, endpoint=False), seg, xy[:, i]) for i in (0, 1)], 1)
+            pts = q.copy()
+            for j in range(pieces):                                       # control so B(0.5) = the odd sample
+                a, b = q[2 * j], q[(2 * j + 2) % (2 * pieces)]
+                pts[2 * j + 1] = 2 * q[2 * j + 1] - (a + b) / 2
+            ratio = np.clip(np.median(f[m] / np.maximum(base[int(k)], 1e-3), 0), 0.15, 1.0)
+            out.append((int(k), pts.astype(np.float32), ratio, int(m.sum()), m))
+    out.sort(key=lambda r: -r[3])
+    return out[:max_regions]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seq", type=Path, required=True)
@@ -89,6 +128,9 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--max-strokes", type=int, default=60)
     ap.add_argument("--steps", type=int, default=300)
+    ap.add_argument("--regions", action="store_true",
+                    help="closed Bezier shadow regions (6 pieces, ~3 Gaussians' worth of attributes each) instead of one hard Gaussian per region")
+    ap.add_argument("--per-region", type=int, default=3, help="Gaussians removed per region (equal attribute budget)")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -112,13 +154,30 @@ def main() -> None:
         prims = codec.decode({k: tok[:, j].unsqueeze(0) for j, k in enumerate(proto.attr_names)})
         layers = sorted(lay.unique().tolist())
         base = base_colours(img, labels)
-        regs = shadow_regions(img, labels, base, args.max_strokes)
+        regs = region_init(img, labels, base, args.max_strokes) if args.regions else shadow_regions(img, labels, base, args.max_strokes)
         M = len(regs)
 
         # equal budget: per layer, drop as many of today's shadow-painting Gaussians as it gets shade strokes
         lum = prims.rgb[0] @ torch.tensor(LUMA, device=dev)
         keep = torch.ones(len(lay), dtype=torch.bool, device=dev)
-        for k in layers:
+        if args.regions:      # stricter: centre inside the shadow (1 px), darker than the layer's base, round >= 2
+            cx = prims.xy[0, :, 0].long().clamp(0, 255).cpu().numpy()
+            cyy = prims.xy[0, :, 1].long().clamp(0, 255).cpu().numpy()
+            for k in layers:
+                need = args.per_region * sum(1 for g in regs if g[0] == k)
+                if not need:
+                    continue
+                shadow_k = ndimage.binary_dilation(np.any([g[4] for g in regs if g[0] == k], 0))
+                bl = float(base[int(k)] @ LUMA)
+                idx = ((lay == k) & (rnd >= 2)).nonzero()[:, 0]
+                inside = torch.tensor(shadow_k[cyy, cx], device=dev)[idx]
+                dark = idx[inside & (lum[idx] < 0.85 * bl)]
+                dark = dark[lum[dark].argsort()]
+                rest = idx[~torch.isin(idx, dark)]
+                rest = rest[prims.sigma[0, rest].max(-1).values.argsort()]
+                keep[torch.cat([dark, rest])[:need]] = False
+        else:
+          for k in layers:
             need = sum(1 for g in regs if g[0] == k)
             if not need:
                 continue
@@ -144,9 +203,16 @@ def main() -> None:
                             if (sel_lay == k).any() else empty()) for k in layers}
             return p, fn
 
+        soft_now = [None]                                             # region edge softness while fitting
+
         def compose(groups, shade=None, shade_lay=None):
             imgt = base_c.expand(1, 3, 256, 256)
-            a = pixel_alpha(shade, 256, proto) if shade is not None else None
+            if shade is None:
+                a = None
+            elif isinstance(shade, Regions):
+                a = region_alpha_local(shade, 256, soft=soft_now[0])
+            else:
+                a = pixel_alpha(shade, 256, proto)
             for k in layers:
                 P, T = groups[k]
                 if a is not None and (shade_lay == k).any():
@@ -172,7 +238,27 @@ def main() -> None:
             refit = to_u8(compose(fa()))
         kidx = keep.nonzero()[:, 0]
         pk, fk = live(prims[kidx], lay[kidx])
-        if M:
+        if M and args.regions:
+            t = lambda v: torch.tensor(np.array(v), dtype=torch.float32, device=dev)[None]   # noqa: E731
+            s_lay = torch.tensor([g[0] for g in regs], device=dev)
+            rpts = t([g[1] for g in regs]).requires_grad_(True)
+            rrgb = torch.logit(t([g[2] for g in regs]).clamp(0.02, 0.98)).requires_grad_(True)
+            ral = torch.full((1, M), 1.5, device=dev, requires_grad=True)
+            shade = lambda: Regions(pts=rpts, rgb=torch.sigmoid(rrgb), alpha=torch.sigmoid(ral) * 0.99)   # noqa: E731
+            opt_extra = [{"params": [rpts], "lr": 0.15}, {"params": [rrgb, ral], "lr": 0.03}]
+            step_box = [0]
+            def fn_r():
+                soft_now[0] = 0.7 + (0.2 - 0.7) * step_box[0] / max(args.steps - 1, 1)
+                step_box[0] += 1
+                return compose(fk(), shade(), s_lay)
+            fit(pk, fn_r, extra=opt_extra)
+            soft_now[0] = None
+            with torch.no_grad():
+                ax, ay, aa = proto.attr("x"), proto.attr("y"), proto.attr("alpha")
+                rq = Regions(pts=torch.stack([ax.dequantize(ax.quantize(rpts[..., 0])), ay.dequantize(ay.quantize(rpts[..., 1]))], -1),
+                             rgb=quantize_colours(torch.sigmoid(rrgb), codec), alpha=aa.dequantize(aa.quantize(torch.sigmoid(ral) * 0.99)))
+                shaded = to_u8(compose(fk(), rq, s_lay))
+        elif M:
             t = lambda v: torch.tensor(np.array(v), dtype=torch.float32, device=dev)[None]   # noqa: E731
             s_lay = torch.tensor([g[0] for g in regs], device=dev)
             sp = {"xy": t([[g[1], g[2]] for g in regs]).requires_grad_(True),
@@ -195,7 +281,7 @@ def main() -> None:
         edge = lambda m: m ^ ndimage.binary_erosion(m)                          # noqa: E731
         gt = edge(shadow_mask(img, labels, base))
         se = lambda x: f1(edge(shadow_mask(x, labels, base)), gt)               # noqa: E731
-        row = {"id": e.image_id, "gaussians": int(len(lay)), "shade_strokes": M,
+        row = {"id": e.image_id, "gaussians": int(len(lay)), "shade_strokes": M, "removed": int((~keep).sum()),
                "psnr_full": psnr(full, img), "psnr_refit": psnr(refit, img), "psnr_shade": psnr(shaded, img),
                "edge_f1_full": se(full), "edge_f1_refit": se(refit), "edge_f1_shade": se(shaded)}
         rows.append(row)

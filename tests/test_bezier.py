@@ -57,3 +57,29 @@ def test_local_window_matches_full_canvas():
             assert (full - local).abs().max() < 1e-3
         else:
             assert torch.allclose(full, local, atol=1e-5)
+
+
+def square_region(x0, y0, x1, y1):
+    """A square as 4 straight Bezier pieces (control points at the edge midpoints)."""
+    c = [(x0, y0), ((x0 + x1) / 2, y0), (x1, y0), (x1, (y0 + y1) / 2), (x1, y1), ((x0 + x1) / 2, y1),
+         (x0, y1), (x0, (y0 + y1) / 2)]
+    from lpp.render.bezier import Regions
+    return Regions(pts=torch.tensor([[c]], dtype=torch.float32), rgb=torch.zeros(1, 1, 3), alpha=torch.full((1, 1), 0.99))
+
+
+def test_region_fills_its_inside_with_an_antialiased_edge():
+    from lpp.render.bezier import region_alpha_local
+    a = region_alpha_local(square_region(8.0, 8.0, 24.0, 24.0), 32, window=32)[0, 0]
+    assert a[16, 16] > 0.98 and a[8, 8] > 0.98                     # pixel centre (8.5, 8.5) is 0.5 px inside
+    assert a[7, 16] == 0 and a[16, 25] == 0                       # 0.5 px outside -> coverage 0
+    assert abs(a.sum().item() - 0.99 * 16 * 16) < 1.0             # area of the 16 x 16 square
+
+
+def test_region_soft_edge_has_point_gradients():
+    from lpp.render.bezier import region_alpha_local
+    r = square_region(8.0, 8.0, 24.0, 24.0)
+    r.pts.requires_grad_(True)
+    a = region_alpha_local(r, 32, window=48, soft=0.5)
+    (a.sum()).backward()                                           # growing the square raises the sum
+    g = r.pts.grad[0, 0]
+    assert g[2, 0] > 0 and g[0, 0] < 0                             # right corner moves right, left corner left

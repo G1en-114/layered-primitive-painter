@@ -79,10 +79,26 @@ decomposer's Gaussians are far from converged (80 Adam steps per round).
 - The distance term does not help (the thresholded skeleton is not precise enough to pull towards). It is off.
 - Contour-first changes nothing in reconstruction. It stays on, because it puts the curves where the model can
   read them off the canvas.
-- Not run yet (paused): pieces of 20 px, budgets of 100 and 300 curves. Rerunning
-  `ops/plan_v3/local_line_ablation.sh` skips the finished runs.
-- Shadows, first attempt (2 images): one hard Gaussian per shadow region under clipped multiply is worse than the
-  refit (25.84 vs 26.29 dB). Next: closed Bezier regions for cel shadows, and a stricter choice of which strokes
-  paint shadows.
+- Piece length and budget (joint + contour first + distance term):
+
+  | setting | curves | PSNR | line F1 |
+  |---|---|---|---|
+  | pieces 10 px | 181 | 28.38 | 0.888 |
+  | pieces 14 px (default) | 173 | 28.46 | 0.901 |
+  | pieces 20 px | 161 | 28.55 | 0.903 |
+  | at most 100 curves | 97 | 28.13 | 0.868 |
+  | at most 300 curves | 200 | 28.63 | 0.911 |
+
+  Longer pieces mean fewer curves for the same quality. The budget saturates near 200, which is about all the
+  line art there is (a cap of 300 uses 200). About 100 curves already give most of the gain.
+  Chosen: 20 px pieces and a cap of 200 curves, about a quarter of a ~700-stroke painting.
+- Shadows (2 images, 100 steps; the refit control is 26.29 dB):
+  - one hard Gaussian per shadow region under clipped multiply: 25.84 dB;
+  - closed Bezier regions (`bezier.Regions`, 6 pieces, 3 Gaussians removed per region): 25.18 dB.
+
+  Both are worse. A single base colour per layer is too crude for hair and clothes with several colours, so the
+  "shadows" include parts that are simply darker. Reconstruction also cannot show the benefit the multiply design
+  aims at, which is easier learning. Shadows stay out of protocol v3 until per-layer colour clustering gives base
+  colours, and until a small model shows the multiply strokes are easier to learn.
 - The refit itself, +2.9 dB, applies to every decomposition. Polishing the existing data (faces too) is a
   separate, cheap-per-image win.
