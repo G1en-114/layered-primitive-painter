@@ -79,6 +79,10 @@ class ModelConfig:
     # one offset distribution is shared by every location instead of being relearned per bin.
     # Zero-initialised: an exact no-op at the start of training.
     rel_pos: bool = False
+    # protocol v3: separate attribute heads for LINE strokes. The same slot means different things on the two
+    # stroke types (sigma_x: Gaussian radius vs. half the line's length; sigma_y: radius vs. half its width),
+    # so one head would have to fold two unrelated distributions into one; start as copies of the Gaussian heads.
+    line_heads: bool = False
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -347,6 +351,10 @@ class Painter(nn.Module):
         self.dec_norm = nn.RMSNorm(dd)
         self.heads = nn.ModuleDict({"event": nn.Linear(dd, self.n_events)} |
                                    {n: nn.Linear(dd, self.vocab[n]) for n in self.attr_names})
+        self.line_event = proto.event_id("LINE") if proto.has_lines else None
+        if cfg.line_heads and self.line_event is not None:
+            self.line_heads = nn.ModuleDict({n: nn.Linear(dd, self.vocab[n]) for n in self.attr_names})
+        self.register_buffer("stroke_events", torch.tensor(proto.stroke_events), persistent=False)
         self.rel_attrs = [n for n in REL_ATTRS if n in self.attr_names] if cfg.rel_pos else []
         if self.rel_attrs:
             self.rel_heads = nn.ModuleDict({n: nn.Linear(dd, 2 * self.vocab[n] - 1) for n in self.rel_attrs})
@@ -462,10 +470,14 @@ class Painter(nn.Module):
             x = blk(x, None, mask)
         return self.dec_norm(x)
 
-    def attr_logits(self, name: str, hidden: torch.Tensor, prev: torch.Tensor | None = None) -> torch.Tensor:
+    def attr_logits(self, name: str, hidden: torch.Tensor, prev: torch.Tensor | None = None,
+                    event: torch.Tensor | None = None) -> torch.Tensor:
         """Logits of attribute `name` from decoder states [M, d_dec]. prev [M, A]: the previous primitive's
-        attributes (-1 = none yet); used by the relative position heads only."""
+        attributes (-1 = none yet), for the relative position heads. event [M]: the stroke type, for the
+        LINE heads (cfg.line_heads)."""
         logits = self.heads[name](hidden)
+        if event is not None and hasattr(self, "line_heads"):
+            logits = torch.where((event == self.line_event)[:, None], self.line_heads[name](hidden), logits)
         if name in self.rel_attrs and prev is not None:
             V = self.vocab[name]
             p = prev[:, self.attr_names.index(name)]
@@ -495,10 +507,10 @@ class Painter(nn.Module):
         prev = self.prev_primitive(batch["kind"], batch["attrs"])
         out = self.decoder(hs, ev, at)
         losses = {"event": F.cross_entropy(self.heads["event"](out[:, 0]).float(), ev)}
-        prim = ev == self.proto.event_id("PRIMITIVE")
+        prim = torch.isin(ev, self.stroke_events)          # every stroke type carries attributes (v3: LINE too)
         pp = prev[sel][prim] if prev is not None else None
         for i, name in enumerate(self.attr_names):
-            logits = self.attr_logits(name, out[prim, 1 + i], pp).float()
+            logits = self.attr_logits(name, out[prim, 1 + i], pp, ev[prim]).float()
             target = at[prim, i]
             attr = self.proto.attr(name)
             if isinstance(attr, CodebookAttr):
@@ -526,12 +538,12 @@ class Painter(nn.Module):
         if event_allowed is not None:
             ev_logits = ev_logits.masked_fill(~event_allowed[sel], float("-inf"))
         lp = F.log_softmax(ev_logits, -1).gather(1, ev[:, None])[:, 0]
-        prim = ev == self.proto.event_id("PRIMITIVE")
+        prim = torch.isin(ev, self.stroke_events)
         attr_lp = torch.zeros_like(lp)
         prev = self.prev_primitive(batch["kind"], batch["attrs"])
         pp = prev[sel][prim] if prev is not None else None
         for i, name in enumerate(self.attr_names):
-            logits = self.attr_logits(name, out[prim, 1 + i], pp).float()
+            logits = self.attr_logits(name, out[prim, 1 + i], pp, ev[prim]).float()
             attr_lp[prim] += F.log_softmax(logits, -1).gather(1, at[prim, i][:, None])[:, 0]
         res = torch.zeros(tgt_event.shape, dtype=torch.float32, device=h.device)
         res[sel] = lp + attr_lp

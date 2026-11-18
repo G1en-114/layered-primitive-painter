@@ -313,7 +313,7 @@ class DecodeHeads(nn.Module):
         x = p.dec_norm(x)
         outs = [p.heads["event"](x[:, 0])]
         for i, name in enumerate(p.attr_names):
-            outs.append(p.heads[name](x[:, 1 + i]))
+            outs.append(p.attr_logits(name, x[:, 1 + i], event=event))   # v3 LINE heads by the event input
         return tuple(outs)
 
 

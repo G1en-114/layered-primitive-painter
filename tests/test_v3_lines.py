@@ -122,3 +122,25 @@ def test_decoding_canvases_equal_training_canvases_with_lines(v3, codec3):
         n = int(checkpoint_flags(b["kind"][i:i + 1], 8)[0][b["valid"][i]].sum())
         for j in range(n):
             assert torch.allclose(hist[i][j], canvas[i, j], atol=2e-4), (i, j)
+
+
+def test_line_strokes_get_attribute_losses(v3, codec3):
+    """The attribute losses must cover LINE records, not only Gaussians (v3 smoke run, 2026-11-18: they
+    did not, and the line attributes stayed untrained). Changing only the lines' targets must move the loss."""
+    tok, lay, rnd, is_line = lined_example(v3, seed=3)
+    ex = [Example(tok, lay, rnd, image_id=0, is_line=is_line)]
+    b = {k: v.to(DEV) for k, v in collate([SequenceDataset(ex, v3, seed=0, p_redraw=0, p_refine=0)[0]]).items()}
+    cfg = ModelConfig.tiny()
+    cfg.line_heads = True
+    torch.manual_seed(0)
+    m = Painter(cfg, v3, codec3).to(DEV)
+    base = m(b)["sigma_y"].item()
+    line_rows = b["tgt_event"] == v3.event_id("LINE")
+    assert line_rows.any()
+    b2 = dict(b)
+    b2["tgt_attrs"] = b["tgt_attrs"].clone()
+    b2["tgt_attrs"][line_rows, v3.attr_names.index("sigma_y")] = 0
+    assert abs(m(b2)["sigma_y"].item() - base) > 1e-4
+    with torch.no_grad():                                         # and the LINE heads are what scores them
+        m.line_heads["sigma_y"].bias.add_(torch.linspace(-5, 5, m.vocab["sigma_y"], device=DEV))
+    assert abs(m(b)["sigma_y"].item() - base) > 1e-3

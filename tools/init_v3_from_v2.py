@@ -7,7 +7,8 @@ carry over unchanged. The new pieces:
   - the LINE row of the event head starts as the PRIMITIVE row with a lower bias (the model begins by
     preferring Gaussians and learns where lines go);
   - the bend embedding (backbone and attribute decoder), the decoder's extra step embedding and the bend
-    head start fresh (bend is a constant 0 on every v2 stroke, so nothing to transfer).
+    head start fresh (bend is a constant 0 on every v2 stroke, so nothing to transfer);
+  - separate LINE attribute heads (cfg.line_heads) start as copies of the Gaussian heads.
 The result is a normal checkpoint (model, step 0, config, v3 protocol) for tools/train.py --init.
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ def main() -> None:
     src = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     v3 = load_protocol(PROTOCOL_V3_PATH)
     cfg = ModelConfig(**src["config"])
+    cfg.line_heads = True
     torch.manual_seed(0)
     model = Painter(cfg, v3, Codec.load(proto=v3, device="cpu"))
     dst = model.state_dict()
@@ -53,6 +55,10 @@ def main() -> None:
     prim, line = v3.event_id("PRIMITIVE"), v3.event_id("LINE")
     dst["heads.event.weight"][line] = dst["heads.event.weight"][prim]
     dst["heads.event.bias"][line] = dst["heads.event.bias"][prim] + args.line_bias
+    for n in model.attr_names:                         # LINE heads start as the Gaussian heads
+        if n in v3.attr_names[: len(src["protocol"]["attributes"])]:
+            dst[f"line_heads.{n}.weight"] = dst[f"heads.{n}.weight"].clone()
+            dst[f"line_heads.{n}.bias"] = dst[f"heads.{n}.bias"].clone()
     model.load_state_dict(dst)
     torch.save({"model": model.state_dict(), "step": 0, "config": cfg.to_dict(), "protocol": v3.raw,
                 "init_from": str(args.ckpt)}, args.out)

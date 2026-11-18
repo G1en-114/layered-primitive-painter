@@ -189,7 +189,7 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         if any(e in proto.stroke_events for e in ev):
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
-                logits = model.attr_logits(name, dh[:, -1], rows(prev) if prev is not None else None)
+                logits = model.attr_logits(name, dh[:, -1], rows(prev) if prev is not None else None, rows(event))
                 attrs[:, i] = _sample(guide(logits), cfg, rand(step, name), name)
             for e, fx in fixed.items():                                     # beta = 0 on lines, bend = 0 on Gaussians
                 for nm, tk in fx.items():

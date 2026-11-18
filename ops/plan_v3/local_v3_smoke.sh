@@ -18,7 +18,7 @@ say "control data ready: lines $(grep -o 'mean PSNR [0-9.]* dB' out/decompose_li
 [ -f runs/quick_abs_v3init.pt ] || "$PY" tools/init_v3_from_v2.py --ckpt runs/quick_abs/last.pt --out runs/quick_abs_v3init.pt
 train() {   # train NAME DATA
   [ -f runs/v3s_$1/last.pt ] && grep -q '"step": 2000' runs/v3s_$1/log.jsonl 2>/dev/null && return 0
-  flock out/gpu.lock "$PY" -u tools/train.py --data "$2/decomp_*.npz" --protocol protocol_v3.json --out runs/v3s_$1 --config small \
+  flock out/gpu.lock "$PY" -u tools/train.py --data "$2/decomp_*.npz" --protocol protocol_v3.json --out runs/v3s_$1 --config small --line-heads \
     --init-weights runs/quick_abs_v3init.pt --batch 8 --accum 4 --steps 2000 --lr 1e-4 --min-lr 1e-5 --warmup 100 --workers 3 --seed 0 \
     --captions data/captions/captions_v3.jsonl --split-manifest data/split_v3_faces_anime.jsonl \
     --text-encoder data/models/chinese-clip-vit-base-patch16 --text-drop 0.1 --cfg-scale 2.0 \

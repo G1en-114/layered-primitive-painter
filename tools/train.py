@@ -202,6 +202,7 @@ def main() -> None:
     ap.add_argument("--order", choices=["layer", "draft"], default="layer",
                     help="painting order of full sequences: layer by layer, or draft (all layers' coarse rounds first)")
     ap.add_argument("--draft-rounds", type=int, default=2, help="--order draft: rounds per layer in the sketch")
+    ap.add_argument("--line-heads", action="store_true", help="protocol v3: separate attribute heads for LINE strokes")
     ap.add_argument("--rel-pos", action="store_true",
                     help="relative position heads for x/y (offset from the previous primitive, model.py)")
     ap.add_argument("--canvas-k", type=int, default=32)
@@ -302,6 +303,7 @@ def main() -> None:
         cfg.canvas, cfg.canvas_k, cfg.canvas_size = True, args.canvas_k, args.canvas_size
     cfg.order, cfg.draft_rounds = args.order, args.draft_rounds
     cfg.rel_pos = args.rel_pos
+    cfg.line_heads = args.line_heads
     if image_tokens is not None:
         n_img = json.loads((args.image_tokens / "meta.json").read_text())["tokens"]
         # the image prefix comes on top of the protocol's worst case (rotary tables are not saved,
