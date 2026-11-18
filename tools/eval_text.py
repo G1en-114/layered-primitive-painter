@@ -100,6 +100,9 @@ def main() -> None:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--renyi-alpha", type=float, default=None,
                     help="Renyi-entropy adaptive truncation with uniform choice inside it (replaces top-p)")
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--attr-temperature", default=None,
+                    help="per-attribute temperature overrides, e.g. x=0.7,y=0.7")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-grid", type=int, default=16, help="samples (with their real images) in the grid")
     ap.add_argument("--judge-encoder", type=Path, default=None,
@@ -150,7 +153,9 @@ def main() -> None:
         raise SystemExit("--no-text only makes sense with --image-tokens or --target-images")
     print(f"checkpoint step {state['step']}, {model.num_params() / 1e6:.1f}M; {len(ids)} prompts", flush=True)
 
-    sc = SampleConfig(temperature=1.0, top_p=args.top_p, cfg_scale=args.cfg_scale, renyi_alpha=args.renyi_alpha)
+    attr_t = {k: float(v) for k, v in (kv.split("=") for kv in args.attr_temperature.split(","))} if args.attr_temperature else None
+    sc = SampleConfig(temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg_scale,
+                      renyi_alpha=args.renyi_alpha, attr_temperature=attr_t)
     gen, orphan, lengths, early = [], [], [], 0
     cache = args.out / "generated.npz"
     if cache.exists():               # scoring can be rerun without regenerating
@@ -200,7 +205,7 @@ def main() -> None:
     half = len(r_np) // 2
     result = {
         "step": state["step"], "checkpoint": str(args.ckpt), "n": args.n, "cfg_scale": args.cfg_scale,
-        "renyi_alpha": args.renyi_alpha,
+        "renyi_alpha": args.renyi_alpha, "temperature": args.temperature, "attr_temperature": args.attr_temperature,
         "top_p": args.top_p, "seed": args.seed,
         "generated": {"clip_score": round(100 * float((gi * t).sum(1).mean()), 3), **retrieval(gi, t),
                       "clip_fd": round(frechet(g_np, r_np), 4),

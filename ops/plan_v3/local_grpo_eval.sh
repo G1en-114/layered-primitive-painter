@@ -35,7 +35,7 @@ fetch() {   # fetch REMOTE LOCAL: parallel ranged download, verified
 }
 ev() {   # ev NAME CKPT face|anime
   local -a d=("${FACE[@]}"); [ $3 = anime ] && d=("${ANIME[@]}")
-  [ -f $O/$1/metrics.json ] || "$PY" -u tools/eval_text.py --ckpt $2 --out $O/$1 "${J[@]}" "${d[@]}" > $O/$1.log 2>&1
+  [ -f $O/$1/metrics.json ] || flock out/gpu.lock "$PY" -u tools/eval_text.py --ckpt $2 --out $O/$1 "${J[@]}" "${d[@]}" > $O/$1.log 2>&1
 }
 push() {    # push NAME: upload the small files, metrics.json last (the box polls for it)
   X "mkdir -p $R/eval/.up_$1" && tar cf - -C $O/$1 prompts.json grid_generated_over_real.png metrics.json \
