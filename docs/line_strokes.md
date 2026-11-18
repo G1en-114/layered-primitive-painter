@@ -45,3 +45,15 @@ Smoke test, 2 images, 60 steps, about 180 curves per image:
 |---|---|---|---|
 | PSNR | 24.2 dB | 23.5 dB | 25.4 dB |
 | line F1 | 0.61 | 0.56 | 0.77 |
+
+Full probe: 16 images (anime_v2_l6_t0/decomp_003), 300 steps, 56-200 curves per image (mean 173):
+
+| | all Gaussians (692) | minus the K smallest | plus K curves (same count) |
+|---|---|---|---|
+| PSNR | 24.59 dB | 23.86 dB | **26.39 dB** |
+| line F1 | 0.682 | 0.634 | **0.823** |
+
+Every image improves: +0.7 to +4.1 dB (median +1.7) and line F1 +0.06 to +0.22. The lines in the samples are
+continuous where the Gaussians left dotted smears (hair strands, face outline, eyes). The gate was 27 dB. These
+numbers fit the curves alone, on top of fixed Gaussians that were fitted without them. Next: fit both jointly,
+and tune the piece length and the budget.
