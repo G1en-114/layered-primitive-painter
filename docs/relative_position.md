@@ -41,3 +41,26 @@ The same run as the 12-trajectory small ablation (runs/plan11_4090/plan11_result
 - validation x/y loss;
 - judge R@1/R@5 and FD;
 - the samples, by eye.
+
+## Result (2026-11-18): no lasting gain
+
+The laptop run: 4 face trajectories, batch 8 × accum 4, 3000 steps, absolute → relative.
+
+| step | x | y | total |
+|---|---|---|---|
+| 500 | 5.204 → 5.158 | 4.667 → 4.625 | 32.874 → 32.761 |
+| 1000 | 4.974 → 4.970 | 4.491 → 4.489 | 31.904 → 31.877 |
+| 2000 | 4.859 → 4.857 | 4.374 → 4.377 | 31.088 → 31.030 |
+| 3000 | 4.833 → 4.833 | 4.327 → 4.331 | 30.779 → 30.728 |
+
+The DCU run: 12 trajectories, the same run as the layer-order baseline.
+
+| step | x | y |
+|---|---|---|
+| 2000 | 4.912 → 4.910 | 4.426 → 4.425 |
+| 4000 | 4.844 → 4.845 | 4.355 → 4.354 |
+
+The relative heads speed up the first few hundred steps, then the absolute model catches up. The backbone already
+sees every previous stroke's position as input and learns "near the last one" on its own. So the remaining position
+uncertainty is not the offset from the last stroke. It is which part of the picture the next stroke goes to.
+The heads stay in the code (off by default); they cost nothing and the tests cover them.
