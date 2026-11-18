@@ -288,11 +288,12 @@ def main() -> None:
         rows.append(row)
         print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in row.items()}), flush=True)
         if len(sheet) < 6:
-            sheet.append(np.concatenate([img, full, trimmed, lined, np.repeat(gt[..., None] * 255, 3, -1).astype(np.uint8)], 1))
+            third = refit if refit is not None else trimmed     # with --joint: the same-steps Gaussian-only control
+            sheet.append(np.concatenate([img, full, third, lined, np.repeat(gt[..., None] * 255, 3, -1).astype(np.uint8)], 1))
     mean = {k: round(float(np.mean([r[k] for r in rows])), 3) for k in rows[0] if k != "id"}
     print("mean", json.dumps(mean), flush=True)
     (args.out / "line_probe.json").write_text(json.dumps({"rows": rows, "mean": mean, "args": vars(args)}, indent=1, default=str))
-    Image.fromarray(np.concatenate(sheet, 0)).save(args.out / "sheet.png")   # original | all | trimmed | + lines | line art
+    Image.fromarray(np.concatenate(sheet, 0)).save(args.out / "sheet.png")   # original | all | trimmed (refit with --joint) | + lines | line art
 
 
 if __name__ == "__main__":

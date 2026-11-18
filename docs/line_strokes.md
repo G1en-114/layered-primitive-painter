@@ -57,3 +57,32 @@ Every image improves: +0.7 to +4.1 dB (median +1.7) and line F1 +0.06 to +0.22. 
 continuous where the Gaussians left dotted smears (hair strands, face outline, eyes). The gate was 27 dB. These
 numbers fit the curves alone, on top of fixed Gaussians that were fitted without them. Next: fit both jointly,
 and tune the piece length and the budget.
+
+## P1 ablation (16 images, 300 steps, curves quantized at evaluation, 2026-11-18)
+
+Refit control: all 692 original Gaussians, no curves, the same joint fitting and steps. It shows that the
+decomposer's Gaussians are far from converged (80 Adam steps per round).
+
+| configuration | curves | PSNR | line F1 |
+|---|---|---|---|
+| current data (all Gaussians as decomposed) | 0 | 24.59 | 0.682 |
+| curves only, Gaussians fixed | 173 | 26.23 | 0.822 |
+| + contour first | 173 | 26.25 | 0.820 |
+| + skeleton distance term (1e-4) | 173 | 26.09 | 0.822 |
+| refit control (Gaussians only) | 0 | 27.46 | 0.803 |
+| **joint (Gaussians + curves)** | 173 | **28.60** | **0.902** |
+| joint + contour first + distance term | 173 | 28.46 | 0.901 |
+| same, pieces of 10 px | 181 | 28.38 | 0.888 |
+
+- Joint fitting with curves: +4.0 dB over the current data. Of that, +1.1 dB and +0.10 line F1 are the curves'
+  own share over the same-steps refit. The gate (27 dB) is passed.
+- The distance term does not help (the thresholded skeleton is not precise enough to pull towards). It is off.
+- Contour-first changes nothing in reconstruction. It stays on, because it puts the curves where the model can
+  read them off the canvas.
+- Not run yet (paused): pieces of 20 px, budgets of 100 and 300 curves. Rerunning
+  `ops/plan_v3/local_line_ablation.sh` skips the finished runs.
+- Shadows, first attempt (2 images): one hard Gaussian per shadow region under clipped multiply is worse than the
+  refit (25.84 vs 26.29 dB). Next: closed Bezier regions for cel shadows, and a stricter choice of which strokes
+  paint shadows.
+- The refit itself, +2.9 dB, applies to every decomposition. Polishing the existing data (faces too) is a
+  separate, cheap-per-image win.
