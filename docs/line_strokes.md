@@ -102,3 +102,18 @@ decomposer's Gaussians are far from converged (80 Adam steps per round).
   colours, and until a small model shows the multiply strokes are easier to learn.
 - The refit itself, +2.9 dB, applies to every decomposition. Polishing the existing data (faces too) is a
   separate, cheap-per-image win.
+
+## Polishing the decompositions (tools/refit_probe.py, 2026-11-18)
+
+Refit all strokes of a decomposition jointly, snapped to the token grid every step. Sixteen images each, laptop,
+one image at a time:
+
+| domain | as decomposed | +100 steps | +300 steps | time for 300 steps |
+|---|---|---|---|---|
+| faces (v2, trajectory 0) | 30.22 dB | 31.36 | 31.57 | 17 s |
+| anime (anime_v2_l6_t0) | 24.59 dB | | 27.46 | |
+
+The anime decompositions are far from converged: line art is hard for the round-by-round fitting. The faces
+gain about 1.1 dB, most of it in the first 100 steps. Anime gets its polish for free in the line-stroke
+re-decomposition (P6). For faces, the model, not the data, holds back realism (83% of the FD gap). So polishing
+the 360k face trajectories, roughly 20 DCU-hours in a batched run, waits.
