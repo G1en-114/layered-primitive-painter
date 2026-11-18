@@ -129,8 +129,12 @@ def loader(ds, args, shuffle=True, rank: int = 0, world: int = 1):
     if world > 1 and shuffle:
         from torch.utils.data.distributed import DistributedSampler
         sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True)
+    # fork on Linux: Python 3.14 defaults to forkserver, which pickles the whole dataset into /dev/shm
+    # (quota exceeded on the laptop); fork shares it copy-on-write, as Python <= 3.13 did
+    ctx = "fork" if args.workers > 0 and sys.platform == "linux" else None
     dl = DataLoader(ds, batch_size=args.batch, shuffle=shuffle and sampler is None, sampler=sampler, collate_fn=collate,
-                    num_workers=args.workers, drop_last=drop_last, persistent_workers=args.workers > 0)
+                    num_workers=args.workers, drop_last=drop_last, persistent_workers=args.workers > 0,
+                    multiprocessing_context=ctx)
     epoch = 0
     while True:
         if sampler is not None:
