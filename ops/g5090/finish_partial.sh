@@ -1,12 +1,12 @@
 #!/bin/bash
-# Laptop, after the 5090 voucher: the last 5090 batch (shards 48-59) took only the first ~365 images of each shard.
+# Laptop, after the 5090 voucher: its deadline batches (shards 48-71) took only the first images of each shard.
 # Once the laptop's own conversion (shards 60-106) is done, convert the rest of those shards (--skip N), written as
 # decomp_NNN_rest.npz next to the partial outputs (load_shards reads both).
 set -u
 cd "$(dirname "$0")/../.."
 PY="$HOME/AI infra/.venv/bin/python"; D=data/seq/anime_v3_lines_full_t0
 until grep -q "decomp_106.npz: written" out/decompose_laptop_t0_rest.log 2>/dev/null; do sleep 300; done
-for i in $(seq 48 59); do
+for i in $(seq 48 71); do
   s=$(printf "decomp_%03d" $i); [ -f $D/$s.npz ] || { echo "missing $s.npz (not fetched)"; continue; }
   [ -f $D/${s}_rest.npz ] && continue
   done_n=$("$PY" -c "import numpy as np; print(len(np.load('$D/$s.npz')['ids']))")
