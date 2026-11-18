@@ -1,6 +1,6 @@
 #!/bin/bash
 # Laptop GPU, early signal for docs/relative_position.md: small model on the 4 local face trajectories,
-# absolute vs relative position heads, 3000 steps each, run side by side (same data, seed, hyperparameters).
+# absolute vs relative position heads, 3000 steps each, run one after the other (8 GB holds one; same data, seed, hyperparameters).
 set -u
 cd "$(dirname "$0")/../.."
 PY="$HOME/AI infra/.venv/bin/python"
@@ -14,7 +14,7 @@ run() {   # run NAME EXTRA...
     --eval-every 500 --save-every 1000 "$@" > runs/quick_$n.log 2>&1
 }
 mkdir -p runs
-run abs & run rel --rel-pos & wait
+run rel --rel-pos; run abs
 "$PY" - <<'PY'
 import json
 def vals(p):
