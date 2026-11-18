@@ -139,7 +139,8 @@ def test_line_strokes_get_attribute_losses(v3, codec3):
     assert line_rows.any()
     b2 = dict(b)
     b2["tgt_attrs"] = b["tgt_attrs"].clone()
-    b2["tgt_attrs"][line_rows, v3.attr_names.index("sigma_y")] = 0
+    j = v3.attr_names.index("sigma_y")
+    b2["tgt_attrs"][:, :, j] = torch.where(line_rows, torch.zeros_like(b2["tgt_attrs"][:, :, j]), b2["tgt_attrs"][:, :, j])
     assert abs(m(b2)["sigma_y"].item() - base) > 1e-4
     with torch.no_grad():                                         # and the LINE heads are what scores them
         m.line_heads["sigma_y"].bias.add_(torch.linspace(-5, 5, m.vocab["sigma_y"], device=DEV))
