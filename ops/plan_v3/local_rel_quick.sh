@@ -7,7 +7,7 @@ PY="$HOME/AI infra/.venv/bin/python"
 run() {   # run NAME EXTRA...
   local n=$1; shift
   "$PY" -u tools/train.py --data "data/seq/quick4/*/decomp_*.npz" \
-    --out runs/quick_$n --config small --batch 16 --accum 2 --steps 3000 --lr 3e-4 --min-lr 3e-5 --warmup 300 --workers 3 --seed 0 \
+    --out runs/quick_$n --config small --batch 8 --accum 4 --steps 3000 --lr 3e-4 --min-lr 3e-5 --warmup 300 --workers 3 --seed 0 \
     --captions data/captions/captions_clean_v1.jsonl --attributes data/celebamask256/attributes.json \
     --split-manifest data/celebamask256_split_v1.jsonl --text-encoder data/models/chinese-clip-vit-base-patch16 \
     --text-drop 0.1 --cfg-scale 2.0 --canvas --canvas-k 32 --canvas-size 64 --perturb 0.3 \
