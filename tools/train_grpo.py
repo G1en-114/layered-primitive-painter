@@ -100,10 +100,13 @@ def main() -> None:
                     help="share of prompts drawn from anime captions (default: as they come in the pool)")
     ap.add_argument("--keep-snapshots", action="store_true",
                     help="also write weights-only model_stepNNN.pt at every save (for evaluation off the run)")
-    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto")
+    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default=None,
+                    help="default: math on ROCm/HIP (no FlashAttention libraries in the DTK builds), auto elsewhere")
     args = ap.parse_args()
     if args.group < 2:
         ap.error("--group needs at least 2 samples to form an advantage")
+    if args.sdpa_backend is None:
+        args.sdpa_backend = "math" if torch.version.hip else "auto"
     if args.sdpa_backend == "math":
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)

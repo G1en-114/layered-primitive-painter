@@ -183,8 +183,8 @@ def main() -> None:
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
     ap.add_argument("--compile", action="store_true")
-    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto",
-                    help="math avoids unavailable FlashAttention libraries on some DTK builds")
+    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default=None,
+                    help="default: math on ROCm/HIP (no FlashAttention libraries in the DTK builds), auto elsewhere")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--captions", type=Path, default=None, help="captions.jsonl from tools/caption_vlm.py")
@@ -228,6 +228,8 @@ def main() -> None:
     is_main = rank == 0
     if not is_main:                                   # one copy of the console output
         sys.stdout = open(os.devnull, "w")
+    if args.sdpa_backend is None:
+        args.sdpa_backend = "math" if torch.version.hip else "auto"
     if args.sdpa_backend == "math":
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)

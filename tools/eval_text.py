@@ -115,11 +115,13 @@ def main() -> None:
                     help="pixel-target models (cfg.target): condition each sample on its validation image's pixels "
                          "(tools/build_target_store.py output)")
     ap.add_argument("--no-text", action="store_true", help="with --image-tokens/--target-images: image only, no prompt")
-    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default="auto",
-                    help="math avoids unavailable FlashAttention libraries on some DTK builds")
+    ap.add_argument("--sdpa-backend", choices=["auto", "math"], default=None,
+                    help="default: math on ROCm/HIP (no FlashAttention libraries in the DTK builds), auto elsewhere")
     args = ap.parse_args()
     if args.n < 10:
         ap.error("--n must be at least 10 for retrieval and distance metrics")
+    if args.sdpa_backend is None:
+        args.sdpa_backend = "math" if torch.version.hip else "auto"
     if args.sdpa_backend == "math":
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
