@@ -25,6 +25,7 @@ from .protocol import CodebookAttr, PeriodicAttr, Protocol
 from .sequence import KIND_PRIMITIVE
 
 N_KINDS = 4          # TEXT, BOS, CONTROL, PRIMITIVE
+REL_ATTRS = ("x", "y")                              # attributes with a relative position head
 SOFT_LABEL_SIGMA = {"alpha": 0.5, "beta": 0.5}   # in bins; other ordinal attributes use 1.0
 
 
@@ -72,6 +73,12 @@ class ModelConfig:
     # needs it: a draft model's grammar allows chained REFINE markers.
     order: str = "layer"
     draft_rounds: int = 2
+    # relative position heads (docs/relative_position.md): x and y logits are the absolute head plus a
+    # head over the offset from the previous primitive, logit[b] = abs[b] + rel[b - prev + bins - 1].
+    # Inside a round primitives follow a Z-order curve, so the next one is usually close to the last;
+    # one offset distribution is shared by every location instead of being relearned per bin.
+    # Zero-initialised: an exact no-op at the start of training.
+    rel_pos: bool = False
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -340,7 +347,13 @@ class Painter(nn.Module):
         self.dec_norm = nn.RMSNorm(dd)
         self.heads = nn.ModuleDict({"event": nn.Linear(dd, self.n_events)} |
                                    {n: nn.Linear(dd, self.vocab[n]) for n in self.attr_names})
+        self.rel_attrs = [n for n in REL_ATTRS if n in self.attr_names] if cfg.rel_pos else []
+        if self.rel_attrs:
+            self.rel_heads = nn.ModuleDict({n: nn.Linear(dd, 2 * self.vocab[n] - 1) for n in self.rel_attrs})
         self.apply(self._init)
+        for h in getattr(self, "rel_heads", {}).values():
+            nn.init.zeros_(h.weight)
+            nn.init.zeros_(h.bias)
         if cfg.target:
             with torch.no_grad():
                 for c in self.target_cross.values():
@@ -449,6 +462,29 @@ class Painter(nn.Module):
             x = blk(x, None, mask)
         return self.dec_norm(x)
 
+    def attr_logits(self, name: str, hidden: torch.Tensor, prev: torch.Tensor | None = None) -> torch.Tensor:
+        """Logits of attribute `name` from decoder states [M, d_dec]. prev [M, A]: the previous primitive's
+        attributes (-1 = none yet); used by the relative position heads only."""
+        logits = self.heads[name](hidden)
+        if name in self.rel_attrs and prev is not None:
+            V = self.vocab[name]
+            p = prev[:, self.attr_names.index(name)]
+            rel = self.rel_heads[name](hidden)                                   # [M, 2V - 1]
+            idx = torch.arange(V, device=hidden.device)[None, :] - p.clamp(min=0)[:, None] + (V - 1)
+            logits = logits + rel.gather(1, idx) * (p >= 0)[:, None].to(rel.dtype)
+        return logits
+
+    def prev_primitive(self, kind: torch.Tensor, attrs: torch.Tensor) -> torch.Tensor | None:
+        """For every input position [B, T]: the attributes of the last primitive at or before it,
+        [B, T, A], -1 where there is none (only needed by the relative heads)."""
+        if not self.rel_attrs:
+            return None
+        T = kind.shape[1]
+        i = torch.arange(T, device=kind.device).expand_as(kind)
+        last = torch.where(kind == KIND_PRIMITIVE, i, torch.full_like(i, -1)).cummax(1).values
+        prev = attrs.gather(1, last.clamp(min=0)[..., None].expand(-1, -1, attrs.shape[-1]))
+        return torch.where((last >= 0)[..., None], prev, torch.full_like(prev, -1))
+
     # ---- training ---------------------------------------------------------
     def forward(self, batch: dict) -> dict:
         """Teacher-forced losses. batch from data.collate()."""
@@ -456,11 +492,13 @@ class Painter(nn.Module):
         tgt_event, tgt_attrs = batch["tgt_event"], batch["tgt_attrs"]
         sel = tgt_event >= 0
         hs, ev, at = h[sel], tgt_event[sel], tgt_attrs[sel]
+        prev = self.prev_primitive(batch["kind"], batch["attrs"])
         out = self.decoder(hs, ev, at)
         losses = {"event": F.cross_entropy(self.heads["event"](out[:, 0]).float(), ev)}
         prim = ev == self.proto.event_id("PRIMITIVE")
+        pp = prev[sel][prim] if prev is not None else None
         for i, name in enumerate(self.attr_names):
-            logits = self.heads[name](out[prim, 1 + i]).float()
+            logits = self.attr_logits(name, out[prim, 1 + i], pp).float()
             target = at[prim, i]
             attr = self.proto.attr(name)
             if isinstance(attr, CodebookAttr):
@@ -490,8 +528,10 @@ class Painter(nn.Module):
         lp = F.log_softmax(ev_logits, -1).gather(1, ev[:, None])[:, 0]
         prim = ev == self.proto.event_id("PRIMITIVE")
         attr_lp = torch.zeros_like(lp)
+        prev = self.prev_primitive(batch["kind"], batch["attrs"])
+        pp = prev[sel][prim] if prev is not None else None
         for i, name in enumerate(self.attr_names):
-            logits = self.heads[name](out[prim, 1 + i]).float()
+            logits = self.attr_logits(name, out[prim, 1 + i], pp).float()
             attr_lp[prim] += F.log_softmax(logits, -1).gather(1, at[prim, i][:, None])[:, 0]
         res = torch.zeros(tgt_event.shape, dtype=torch.float32, device=h.device)
         res[sel] = lp + attr_lp

@@ -342,6 +342,8 @@ def exportable(painter: Painter) -> Painter:
 
 
 def graphs(painter: Painter) -> dict[str, nn.Module]:
+    if getattr(painter, "rel_attrs", None):
+        raise NotImplementedError("relative position heads (cfg.rel_pos) are not in the ONNX/C++ runtime yet")
     painter = exportable(painter)
     g = {"embed_record": EmbedRecord(painter), "embed_text": EmbedText(painter), "chunk": Chunk(painter),
          "chunk_cached": ChunkCached(painter),

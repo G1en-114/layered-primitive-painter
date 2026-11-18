@@ -160,6 +160,7 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
                                       ("attrs", rec_attrs))}
     done_cpu = [False] * B
     n_events, eos = len(proto.events), proto.event_id("EOS")
+    prev = torch.full((B, A), -1, dtype=torch.long, device=dev) if model.rel_attrs else None   # last primitive
     for step in range(1, max_records):
         # event, masked by each sequence's grammar
         dh = model.decoder(h, torch.zeros(R, dtype=torch.long, device=dev),
@@ -185,10 +186,13 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
         if prim_ev in ev:
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
-                attrs[:, i] = _sample(guide(model.heads[name](dh[:, -1])), cfg, rand(step, name), name)
+                logits = model.attr_logits(name, dh[:, -1], rows(prev) if prev is not None else None)
+                attrs[:, i] = _sample(guide(logits), cfg, rand(step, name), name)
             attrs[~is_prim] = NO_ATTR
         if forced is not None and step < Tf:
             attrs = torch.where(in_prefix[:, None], f_attrs[:, step], attrs)
+        if prev is not None:
+            prev = torch.where((event == prim_ev)[:, None], attrs, prev)
 
         layer_cpu = []
         for b, g in enumerate(grammars):

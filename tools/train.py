@@ -198,6 +198,8 @@ def main() -> None:
     ap.add_argument("--order", choices=["layer", "draft"], default="layer",
                     help="painting order of full sequences: layer by layer, or draft (all layers' coarse rounds first)")
     ap.add_argument("--draft-rounds", type=int, default=2, help="--order draft: rounds per layer in the sketch")
+    ap.add_argument("--rel-pos", action="store_true",
+                    help="relative position heads for x/y (offset from the previous primitive, model.py)")
     ap.add_argument("--canvas-k", type=int, default=32)
     ap.add_argument("--canvas-size", type=int, default=64)
     ap.add_argument("--perturb", type=float, default=0.0, help="share of training sequences with a corrupted history")
@@ -295,6 +297,7 @@ def main() -> None:
     if args.canvas:
         cfg.canvas, cfg.canvas_k, cfg.canvas_size = True, args.canvas_k, args.canvas_size
     cfg.order, cfg.draft_rounds = args.order, args.draft_rounds
+    cfg.rel_pos = args.rel_pos
     if image_tokens is not None:
         n_img = json.loads((args.image_tokens / "meta.json").read_text())["tokens"]
         # the image prefix comes on top of the protocol's worst case (rotary tables are not saved,
