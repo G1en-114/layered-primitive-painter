@@ -274,6 +274,9 @@ def main() -> None:
     ap.add_argument("--max-curves", type=int, default=200)
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--limit", type=int, default=None, help="images per shard (smoke runs)")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="skip each shard's first N images (finish a shard an earlier --limit run cut short); the output "
+                         "is written as <shard>_rest.npz next to it, so both parts load together")
     ap.add_argument("--line-qat", choices=["step", "late", "end", "freeze"], default="freeze",
                     help="lines on their token grid: every step (straight-through), the last 20%% of the steps, only "
                          "when writing, or freeze: position and angle snapped and fixed for the last 20%%, the rest adapts")
@@ -289,11 +292,11 @@ def main() -> None:
     (args.out / "config.json").write_text(json.dumps({"flip": False, "protocol_version": 3, "source": [str(s) for s in args.seq],
                                                       "piece": args.piece, "max_curves": args.max_curves, "steps": args.steps}, indent=1))
     for shard in args.seq:
-        final = args.out / shard.name
+        final = args.out / (shard.name if not args.skip else shard.name.replace(".npz", "_rest.npz"))
         if final.exists():
             print(f"{final} exists, skipped", flush=True)
             continue
-        exs = [e for e in load_shards([shard]) if not e.flip and e.image_id in where][: args.limit]
+        exs = [e for e in load_shards([shard]) if not e.flip and e.image_id in where][args.skip:][: args.limit]
         toks, lays, rnds, lines, offsets, ids, psnrs, t0 = [], [], [], [], [0], [], [], time.time()
         for i, e in enumerate(exs):
             sh, r = where[e.image_id]
