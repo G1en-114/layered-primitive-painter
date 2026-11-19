@@ -39,6 +39,9 @@ class OrtPainter:
         self.attr_names = self.manifest["attr_names"]
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # the KV cache grows by one position per call, so every call has new shapes; the CPU arena keeps a block for
+        # each and grew past 5 GB for two base-size variants (plan v4 deployment run). Plain malloc/free instead.
+        so.enable_cpu_mem_arena = False
         self.s = {name: ort.InferenceSession(str(onnx_dir / g["file"]), so, providers=providers)
                   for name, g in self.manifest["graphs"].items()}
 
