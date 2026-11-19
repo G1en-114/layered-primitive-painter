@@ -20,6 +20,10 @@ NEW=line_heads.,heads.bend.,heads.event.,event_emb.,dec_event_emb.,attr_emb.mods
 mkdir -p $RUNS
 rm -f $RUNS/train_done $RUNS/train_failed
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a $RUNS/train.log; }
+# NGC 25.01's NCCL 2.25.1 needs more shared memory than an RTX 5090 (sm_120) has ("ncclMaxSharedMem 82240 exceeds
+# 79856" -> "Cuda failure 1 'invalid argument'"); a newer NCCL beside it (pip nvidia-nccl-cu12 --target) is preloaded
+NCCL_LIB=${NCCL_LIB:-/root/nccl/nvidia/nccl/lib/libnccl.so.2}
+[ -f "$NCCL_LIB" ] && export LD_PRELOAD=$NCCL_LIB
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4} PYTHONUNBUFFERED=1
 LAUNCH=("$PY" -u); [ "$NGPU" -gt 1 ] && LAUNCH=("$PY" -u -m torch.distributed.run --standalone --nproc_per_node=$NGPU)
 COMMON=(--data "${FACES[@]}" "${ANIME[@]}" --protocol $CODE/protocol_v3.json --config base --line-heads --order draft

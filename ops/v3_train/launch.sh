@@ -81,8 +81,8 @@ ChineseCLIPModel.from_pretrained(\"chinese-clip-vit-large-patch14\").half().save
     touch chinese-clip-vit-large-patch14-fp16/model.safetensors.ok; ls -la chinese-clip-vit-large-patch14-fp16'
 }
 start() {
-  $G "pgrep -f 'v3_train/train.sh' > /dev/null" && { echo "training already running"; return 0; }
-  $G "cd $R && setsid nohup bash code/ops/v3_train/train.sh > runs_train.nohup 2>&1 < /dev/null &
+  $G "pgrep -f '[v]3_train/train.sh' > /dev/null" && { echo "training already running"; return 0; }
+  $G "cd $R || exit 1; setsid nohup bash code/ops/v3_train/train.sh > runs_train.nohup 2>&1 < /dev/null &
       sleep 5; setsid nohup bash code/ops/v3_train/eval_watch.sh > eval_watch.nohup 2>&1 < /dev/null &
       sleep 1; pgrep -af 'v3_train/(train|eval_watch).sh'"
 }
