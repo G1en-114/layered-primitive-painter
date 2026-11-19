@@ -32,7 +32,7 @@ from lpp.protocol import _parse  # noqa: E402
 from lpp.render.strokes import render_strokes  # noqa: E402
 from lpp.sample import SampleConfig, generate  # noqa: E402
 from lpp.sequence import KIND_PRIMITIVE, DrawSeq, build, strokes  # noqa: E402
-from lpp.text import TextEncoder  # noqa: E402
+from lpp.text import TextEncoder, with_domain  # noqa: E402
 
 DOMAINS = {   # name: (decomposer sequences, real images)
     "face": ("data/seq/v2", "data/celebamask256"),
@@ -87,7 +87,10 @@ def main() -> None:
     model.load_state_dict(s["model"])
     enc = TextEncoder(args.text_encoder, max_positions=proto.max_text_positions).cuda()
     splits = load_split_manifest(args.split_manifest)
-    caps = {int(r["id"]): r["long"] for r in (json.loads(x) for x in args.captions.read_text(encoding="utf-8").splitlines() if x.strip())}
+    # the domain word goes first, as in training (lpp.text.CaptionStore / with_domain) and eval_text: without it
+    # an anime caption reads like a photo caption and the model paints a real person
+    caps = {int(r["id"]): with_domain(r["long"], r.get("domain"))
+            for r in (json.loads(x) for x in args.captions.read_text(encoding="utf-8").splitlines() if x.strip())}
     sc = SampleConfig(temperature=1.0, top_p=args.top_p, cfg_scale=args.cfg_scale)
     summary = {}
     for dom in args.domains.split(","):
