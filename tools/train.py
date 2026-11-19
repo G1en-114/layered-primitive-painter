@@ -216,6 +216,8 @@ def main() -> None:
                     help="relative position heads for x/y (offset from the previous primitive, model.py)")
     ap.add_argument("--canvas-k", type=int, default=32)
     ap.add_argument("--canvas-size", type=int, default=64)
+    ap.add_argument("--canvas-stride", type=int, default=8, choices=[4, 8],
+                    help="canvas pixels per token side: 8 -> 8x8 tokens, 4 -> 16x16 (model.ModelConfig.canvas_stride)")
     ap.add_argument("--perturb", type=float, default=0.0, help="share of training sequences with a corrupted history")
     ap.add_argument("--image-tokens", type=Path, default=None,
                     help="CLIP image tokens (tools/extract_image_features.py): enables image conditioning")
@@ -314,6 +316,7 @@ def main() -> None:
     cfg = {"tiny": ModelConfig.tiny, "small": ModelConfig.small, "base": ModelConfig}[args.config]()
     if args.canvas:
         cfg.canvas, cfg.canvas_k, cfg.canvas_size = True, args.canvas_k, args.canvas_size
+        cfg.canvas_stride = args.canvas_stride
     cfg.order, cfg.draft_rounds = args.order, args.draft_rounds
     cfg.rel_pos = args.rel_pos
     cfg.line_heads = args.line_heads
