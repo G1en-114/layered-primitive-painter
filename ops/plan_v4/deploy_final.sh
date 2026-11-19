@@ -7,7 +7,7 @@
 #   3 quantized variants fp16 / int8 / int8w / int4w (tools/quantize_onnx.py)        CPU
 #   4 benchmark inputs for B = 1 / 8 / 32 (ort_generate --dump)                      CPU
 #   5 C++ runtime throughput, median of 3 (bench/runtime_quant_repeat.sh)           GPU + CPU
-#   6 quality per variant (tools/quant_eval.py)                                      GPU
+#   6 quality per variant, one variant + its reference per run (tools/quant_eval.py)  GPU / CPU
 # Log: out/deploy_v3/deploy.log
 set -u
 cd "$(dirname "$0")/../.."
@@ -35,11 +35,14 @@ for B in 1 8 32; do
 done
 [ -f $O/summary_median.txt ] && [ $(grep -c "\[ [0-9]" $O/summary_median.txt) -ge 24 ] \
   || { flock out/gpu.lock bash bench/runtime_quant_repeat.sh $M $O > $O/bench.log 2>&1; say "5 C++ throughput done"; }
-if [ ! -f $O/quant_eval/summary.json ]; then
+# quality: one quantized variant against its float32 reference per process; all six at once held ~5 GB of sessions
+# and pushed the 14 GB laptop into swap (kswapd at 98%)
+for pair in "int8-cpu=${M}_int8:CPU fp32-cpu=$M:CPU" "int4w-cpu=${M}_int4w:CPU fp32-cpu=$M:CPU" \
+            "fp16-cuda=${M}_fp16:CUDA fp32-cuda=$M:CUDA" "int8w-cuda=${M}_int8w:CUDA fp32-cuda=$M:CUDA"; do
+  read -r q ref <<< "$pair"; name=${q%%=*}
+  [ -f $O/quant_eval_$name/results.json ] && continue
   flock out/gpu.lock "$PY" tools/quant_eval.py --text-encoder $TE --captions data/captions/captions_v3.jsonl \
-    --split-manifest data/split_v3_faces_anime.jsonl --n 48 --capture 40 --cfg-scale 5.0 --out $O/quant_eval \
-    --variant fp32-cpu=$M:CPU --variant int8-cpu=${M}_int8:CPU --variant int4w-cpu=${M}_int4w:CPU \
-    --variant fp32-cuda=$M:CUDA --variant fp16-cuda=${M}_fp16:CUDA --variant int8w-cuda=${M}_int8w:CUDA \
-    > $O/quant_eval.log 2>&1 && say "6 quality per variant done" || say "6 quant_eval FAILED (quant_eval.log)"
-fi
+    --split-manifest data/split_v3_faces_anime.jsonl --n 48 --capture 40 --cfg-scale 5.0 --out $O/quant_eval_$name \
+    --variant $ref --variant $q > $O/quant_eval_$name.log 2>&1 && say "6 quality $name done" || say "6 quant_eval $name FAILED"
+done
 say "deployment run finished"
