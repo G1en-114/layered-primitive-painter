@@ -22,11 +22,12 @@ for m in chinese-clip-vit-base-patch16 chinese-clip-vit-large-patch14; do
   $G "mkdir -p $R/data/models/$m && cat > $R/data/models/$m/SHA256SUMS && touch $R/data/models/$m/SHA256SUMS.ok" \
     < data/models/$m/SHA256SUMS
 done
-bash ops/v3_train/launch.sh models > out/v3_models.log 2>&1 &
+setsid bash ops/v3_train/launch.sh models > out/v3_models.log 2>&1 < /dev/null &   # own session: Ctrl-C here does not kill it
 MODELS=$!
 
 echo "== 4/4 code + data"
-git archive HEAD | $G "rm -rf $R/code.new && mkdir -p $R/code.new && tar -x -C $R/code.new && rm -rf $R/code && mv $R/code.new $R/code"
+echo "sending code ($(( $(git archive HEAD | wc -c) / 1024 )) KB)..."
+git archive HEAD | pv -N code -pterab | $G "rm -rf $R/code.new && mkdir -p $R/code.new && tar -x -C $R/code.new && rm -rf $R/code && mv $R/code.new $R/code"
 echo "code $(git rev-parse --short HEAD) uploaded"
 [ -f runs/base_v3_lines_init.pt ] || "$HOME/AI infra/.venv/bin/python" tools/init_v3_from_v2.py \
   --ckpt runs/base_v3_snap/model_final.pt --out runs/base_v3_lines_init.pt
@@ -37,6 +38,7 @@ echo "code $(git rev-parse --short HEAD) uploaded"
      data/celebamask256_split_v1.jsonl data/celebamask256_val/* data/anime_val192/*
 } > out/v3_upload_list.txt
 sizes() { $G "cd $R && while read f; do [ -f \$f ] && echo \"\$f \$(stat -c %s \$f)\"; done" < out/v3_upload_list.txt; }
+echo "checking which files the box already has..."
 sizes > out/v3_remote_sizes.txt
 todo=out/v3_upload_todo.txt; : > $todo; bytes=0
 while read -r f; do

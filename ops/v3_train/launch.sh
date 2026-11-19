@@ -68,7 +68,9 @@ models() {  # the public text encoders: the box downloads them itself (hf-mirror
       cd $M/$m
       for f in $(awk "{print \$2}" SHA256SUMS); do
         sha256sum -c --status <(grep " $f\$" SHA256SUMS) 2>/dev/null && continue
-        curl -sfL --retry 5 -o $f.part https://hf-mirror.com/OFA-Sys/$m/resolve/main/$f && mv $f.part $f
+        { curl -sfL --retry 3 -o $f.part https://hf-mirror.com/OFA-Sys/$m/resolve/main/$f \
+          || curl -sfL --retry 3 -o $f.part https://www.modelscope.cn/models/AI-ModelScope/$m/resolve/master/$f; } \
+          && mv $f.part $f
       done
       sha256sum -c SHA256SUMS
     done
