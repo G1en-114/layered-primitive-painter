@@ -152,8 +152,8 @@ def main() -> None:
         store = ImageTokenStore(args.image_tokens)
     targets = None
     if args.target_images is not None:
-        if not model.cfg.target:
-            raise SystemExit("--target-images needs a target-conditioned checkpoint")
+        if not (model.cfg.target or getattr(model.cfg, "canvas_target", False)):
+            raise SystemExit("--target-images needs a target-conditioned or residual-canvas checkpoint")
         targets = TargetImageStore(args.target_images)
     if args.no_text and store is None and targets is None:
         raise SystemExit("--no-text only makes sense with --image-tokens or --target-images")

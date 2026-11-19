@@ -24,32 +24,35 @@ from pack_jpeg import decode_pack  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", type=Path, required=True)
+    ap.add_argument("--data", type=Path, required=True, nargs="+", help="one or more prepared image dirs (one store)")
     ap.add_argument("--jpeg", type=Path, default=None)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--size", type=int, default=128)
     args = ap.parse_args()
-    index = json.loads((args.data / "index.json").read_text())
-    ids = [i for s in index["shards"] for i in s["ids"]]
+    indexes = [(d, json.loads((d / "index.json").read_text())) for d in args.data]
+    ids = [i for _, index in indexes for s in index["shards"] for i in s["ids"]]
+    if len(set(ids)) != len(ids):
+        raise SystemExit("image ids repeat across --data dirs")
     args.out.mkdir(parents=True, exist_ok=True)
     out = np.lib.format.open_memmap(args.out / "images.npy", "w+", np.uint8, (len(ids), args.size, args.size, 3))
     row = 0
-    for s in index["shards"]:
-        npy = args.data / f"images_{s['shard']:03d}.npy"
-        if npy.exists():
-            imgs = jpeg_roundtrip(np.load(npy))
-        else:
-            imgs, pack_ids = decode_pack(args.jpeg / f"images_{s['shard']:03d}.jpg.npz")
-            if pack_ids.tolist() != s["ids"]:
-                raise ValueError(f"JPEG pack ids differ from index for shard {s['shard']}")
-        for im in imgs:
-            out[row] = np.asarray(Image.fromarray(im).resize((args.size, args.size), Image.Resampling.BOX))
-            row += 1
-        print(f"shard {s['shard']:03d}: {row}/{len(ids)}", flush=True)
+    for data, index in indexes:
+        for s in index["shards"]:
+            npy = data / f"images_{s['shard']:03d}.npy"
+            if npy.exists():
+                imgs = jpeg_roundtrip(np.load(npy))
+            else:
+                imgs, pack_ids = decode_pack(args.jpeg / f"images_{s['shard']:03d}.jpg.npz")
+                if pack_ids.tolist() != s["ids"]:
+                    raise ValueError(f"JPEG pack ids differ from index for shard {s['shard']}")
+            for im in imgs:
+                out[row] = np.asarray(Image.fromarray(im).resize((args.size, args.size), Image.Resampling.BOX))
+                row += 1
+            print(f"shard {s['shard']:03d}: {row}/{len(ids)}", flush=True)
     out.flush()
     (args.out / "ids.json").write_text(json.dumps(ids))
     (args.out / "meta.json").write_text(json.dumps({"size": args.size, "jpeg_quality": 95, "resample": "box",
-                                                     "source": str(args.data)}))
+                                                     "source": [str(d) for d in args.data]}))
 
 
 if __name__ == "__main__":
