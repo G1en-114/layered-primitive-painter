@@ -142,3 +142,40 @@ The global and per-layer swaps give the same result, and the Triton and torch li
 
 Line F1 rises regardless (0.78 to 0.85 on the first production shard), and so does the model trained on it: anime
 judge FD 0.367 (control) to 0.332 after the attribute-loss fix.
+
+## Formal training (2×RTX 5090, 2026-11-19)
+
+base_v3 (126M, Gaussians only) converted to protocol v3 (`tools/init_v3_from_v2.py`) and trained with lines and
+the draft paint order (`ops/v3_train/`). Data: 89k face sequences (4 Gaussian-only v2 trajectories, widened on load:
+replay against forgetting) + 50,321 anime images with Bézier lines (trajectory t0), about 64:36. LP-FT:
+- stage A, 1000 steps: only the parts v3 adds train (LINE heads, bend, event tables; 2.9M of 129M);
+- stage B, 12,000 steps: everything, lr 1e-4 → 1e-5.
+
+DDP on two GPUs, per-GPU batch 8 × accumulation 2 (global 32), 55k tokens/s, 1 h 35 min in total. Every 2000 steps
+a snapshot went to the laptop and was evaluated there (192 face + 192 anime prompts, CFG 5 / top-p 0.6, judge
+CLIP L/14; one standard error of R@5 is about 0.035). Troubleshooting log: docs/formal_training_incidents.md.
+
+| model | faces R@1 | faces R@5 | faces FD | anime R@1 | anime R@5 | anime FD |
+|---|---|---|---|---|---|---|
+| base_v3 (reference) | 0.172 | 0.380 | 0.373 | 0.115 | 0.375 | 0.227 |
+| A (LP), step 1000 | 0.130 | 0.307 | 0.380 | 0.099 | 0.276 | 0.271 |
+| B step 2000 | 0.182 | 0.349 | 0.376 | 0.115 | 0.312 | 0.237 |
+| B step 4000 | 0.198 | 0.380 | 0.366 | 0.125 | 0.312 | 0.233 |
+| B step 6000 | 0.146 | 0.385 | 0.376 | 0.146 | 0.370 | 0.228 |
+| B step 8000 | 0.203 | 0.396 | 0.368 | 0.130 | 0.432 | 0.215 |
+| B step 10000 | 0.182 | 0.375 | 0.372 | 0.156 | 0.417 | 0.213 |
+| **B step 12000 (final)** | 0.188 | **0.406** | 0.371 | 0.135 | **0.417** | **0.206** |
+
+- No forgetting: faces dip while the frozen trunk meets the new paint order (stage A), are back by step 4000, and end
+  at or slightly above base_v3.
+- Anime gains from the lines: R@5 +0.042 and FD 0.227 → 0.206, the most realistic anime yet.
+- Final model: `runs/v3_formal/B_ft/model_step012000.pt` (sha256 8bc318e992a192e1…).
+
+Best-of-4 (4 samples per prompt, CLIP B/16 picks, L/14 judges; same setting as base_v3's best):
+
+| best-of-4 | faces R@1 | faces R@5 | faces FD | anime R@1 | anime R@5 | anime FD |
+|---|---|---|---|---|---|---|
+| base_v3 | 0.193 | 0.432 | 0.375 | 0.151 | 0.479 | 0.221 |
+| **v3 final** | 0.177 | 0.422 | **0.369** | **0.208** | **0.500** | **0.197** |
+
+Next steps (quality problems seen in the images, image-to-painting by the model, deployment): docs/plan_v4.md.
