@@ -2,7 +2,7 @@
 # Laptop, after ops/plan_v4/deploy_final.sh: where the final v3 model's graphs should run, and what the decode step
 # costs (docs/quant_report.md did this for the small model; base is 6x larger). Median of 3, 400 records per sample.
 #   7 placements: cpu | cuda-all | cuda (backbone + heads on GPU) | cuda-hybrid (backbone only) | cuda-auto
-#   8 static one-step graphs + CUDA Graph (export --step-batches 1 8 32) vs the dynamic chunk_cached path, cuda-auto
+#   8 static one-step graphs + CUDA Graph (export --step-batches 2 16 64: rows = 2 x images with CFG) vs the dynamic chunk_cached path, cuda-auto
 #   9 per-graph time at B=1 (LPP_PROFILE=1) for cuda-hybrid and cuda-all
 # Summaries: out/deploy_v3/placement.txt, step.txt, profile_*.log
 set -u
@@ -28,7 +28,7 @@ if [ ! -s $O/placement.txt ]; then
   mv $O/placement.tmp $O/placement.txt; say "7 placements done"
 fi
 if [ ! -s $O/step.txt ]; then
-  [ -f ${M}_step/manifest.json ] || "$PY" tools/export_onnx.py --ckpt $C --out ${M}_step --step-batches 1 8 32 \
+  [ -f ${M}_step/manifest.json ] || "$PY" tools/export_onnx.py --ckpt $C --out ${M}_step --step-batches 2 16 64 \
     > $O/export_step.log 2>&1 || say "8 step export FAILED (export_step.log)"
   echo "variant B records_per_s_median" > $O/step.tmp
   for B in 1 8 32; do
