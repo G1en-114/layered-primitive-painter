@@ -36,13 +36,14 @@ done
 [ -f $O/summary_median.txt ] && [ $(grep -c "\[ [0-9]" $O/summary_median.txt) -ge 24 ] \
   || { flock out/gpu.lock bash bench/runtime_quant_repeat.sh $M $O > $O/bench.log 2>&1; say "5 C++ throughput done"; }
 # quality: one quantized variant against its float32 reference per process; all six at once held ~5 GB of sessions
-# and pushed the 14 GB laptop into swap (kswapd at 98%)
+# and pushed the 14 GB laptop into swap (kswapd at 98%); 24 prompts: the KV cache of 48 prompts x 2 (CFG) rows x 16
+# layers x 1024 positions is ~3.2 GB per variant, two variants plus copies came to ~16 GB
 for pair in "int8-cpu=${M}_int8:CPU fp32-cpu=$M:CPU" "int4w-cpu=${M}_int4w:CPU fp32-cpu=$M:CPU" \
             "fp16-cuda=${M}_fp16:CUDA fp32-cuda=$M:CUDA" "int8w-cuda=${M}_int8w:CUDA fp32-cuda=$M:CUDA"; do
   read -r q ref <<< "$pair"; name=${q%%=*}
   [ -f $O/quant_eval_$name/results.json ] && continue
   flock out/gpu.lock "$PY" tools/quant_eval.py --text-encoder $TE --captions data/captions/captions_v3.jsonl \
-    --split-manifest data/split_v3_faces_anime.jsonl --n 48 --capture 40 --cfg-scale 5.0 --out $O/quant_eval_$name \
+    --split-manifest data/split_v3_faces_anime.jsonl --n 24 --capture 40 --cfg-scale 5.0 --out $O/quant_eval_$name \
     --variant $ref --variant $q > $O/quant_eval_$name.log 2>&1 && say "6 quality $name done" || say "6 quant_eval $name FAILED"
 done
 say "deployment run finished"
