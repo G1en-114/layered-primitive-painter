@@ -27,7 +27,10 @@ EOF'
   local miss; miss=$($G "python -c 'import importlib.util as u; print(\" \".join(m for m in (\"PIL\",\"transformers\",\"safetensors\") if u.find_spec(m) is None))'")
   [ -z "$miss" ] && return 0
   miss=${miss/PIL/pillow}
-  $G "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple $miss \"numpy==\$(python -c 'import numpy; print(numpy.__version__)')\""
+  # the box's torch is NVIDIA's 2.6.0a0 build: transformers 5.x rejects it (needs >= 2.6) and 4.50+ refuse to
+  # torch.load the text encoder's pytorch_model.bin below 2.6, so 4.48.3; system python (PEP 668) -> --break-system-packages
+  miss=${miss/transformers/transformers==4.48.3}
+  $G "pip install -q --break-system-packages -i https://pypi.tuna.tsinghua.edu.cn/simple $miss \"numpy==\$(python -c 'import numpy; print(numpy.__version__)')\""
 }
 put() {     # put LOCAL REMOTE_REL: atomic, skipped when already there (FILE.ok)
   local l=$1 r=$R/$2
