@@ -165,7 +165,7 @@ LP-FT 两阶段（A：只训新增部分 1000 步；B：全参 12000 步），DD
 
 **排查过程**：检查逻辑是 `$G "pgrep -f 'v3_train/train.sh' > /dev/null"`。远端 sshd 以 `bash -c "pgrep -f 'v3_train/train.sh' ..."` 执行，这个 bash 的命令行本身就包含该字符串，所以 pgrep 匹配到了自己的父 shell。之前在本地用 pkill/pgrep 也误杀过自己的 shell（exit 143/144），是同一类问题。
 
-**修复**：改成 `pgrep -f '[v]3_train/train.sh'`。正则 `[v]` 匹配字母 v，但命令行里写的是 `[v]`，字面上不再包含 `v3_train`，所以不会匹配自身（本次修复写在 launch.sh，提交情况以主会话为准）。
+**修复**：改成 `pgrep -f '[v]3_train/train.sh'`。正则 `[v]` 匹配字母 v，但命令行里写的是 `[v]`，字面上不再包含 `v3_train`，所以不会匹配自身（launch.sh，提交 657065e）。
 
 **面试可能追问**
 - Q：`ps | grep foo` 为什么总能看到 grep 自己？怎么避免？A：grep 的命令行里有 foo；可以用 `grep [f]oo`、`pgrep -x` 精确匹配进程名，或者用 pid 文件 / systemd unit 管理进程，而不是靠模式匹配。
@@ -177,12 +177,12 @@ LP-FT 两阶段（A：只训新增部分 1000 步；B：全参 12000 步），DD
 
 **排查过程**：命令串是 `cd $R && setsid nohup bash code/.../train.sh > ... &`，换行后是 `setsid nohup bash code/.../eval_watch.sh ... &`。`&` 作用于整个 `cd && cmd` 列表，它在后台子 shell 里执行，所以 cd 只改变那个子 shell 的目录。下一行在 ssh 登录目录（~）下执行，相对路径 `code/...` 不存在，nohup 输出也落在 ~。另外 stage A 很快失败（第 10 条），train.sh 写了 `train_failed`，所以 watcher 就算启动了也会立即退出。
 
-**修复**：改为 `cd $R; setsid nohup ... &`，先在当前 shell 里 cd（修复状态以主会话为准）。
+**修复**：改为 `cd $R; setsid nohup ... &`，先在当前 shell 里 cd（launch.sh，提交 657065e）。
 
 **面试可能追问**
 - Q：`a && b &` 的语义？A：整个 AND 列表放到后台子 shell 执行，里面对环境（cwd、变量）的修改不影响当前 shell。
 
-## 10. NCCL 2.25.1 在 RTX 5090 上通信失败（进行中）
+## 10. NCCL 2.25.1 在 RTX 5090 上通信失败
 
 **现象**：stage A 双卡（torchrun，2 GPU × batch 16）启动约 1.5 分钟后（数据已加载：218 shards，135,071 train / 4,250 val），在 DDP 构造时的 `_verify_param_shape_across_processes`，也就是第一次集合通信处崩溃：
 `torch.distributed.DistBackendError: NCCL error ... unhandled cuda error ... NCCL version 2.25.1`
@@ -196,9 +196,11 @@ LP-FT 两阶段（A：只训新增部分 1000 步；B：全参 12000 步），DD
 
 **根因**：容器自带的 NCCL 版本没有适配消费级 Blackwell 的共享内存上限（P2P/SHM 只是传输层，换掉也绕不开 kernel 本身）。
 
-**修复方案（进行中）**：用 `pip install --no-deps --target /root/nccl nvidia-nccl-cu12==2.27.7` 把新版 NCCL 装到独立目录，启动时 `LD_PRELOAD=/root/nccl/nvidia/nccl/lib/libnccl.so.2` 替换系统库，不动镜像原有的包。备选：gloo 后端（all-reduce 走 CPU，每步约 0.5 GB 梯度，会明显变慢）。
+**修复**：用 `pip install --no-deps --target /root/nccl nvidia-nccl-cu12==2.27.7` 把新版 NCCL 装到独立目录，启动时 `LD_PRELOAD=/root/nccl/nvidia/nccl/lib/libnccl.so.2` 替换系统库，不动镜像原有的包。备选：gloo 后端（all-reduce 走 CPU，每步约 0.5 GB 梯度，会明显变慢）。
 
-> TODO（主会话补）：2.27.7 + LD_PRELOAD 的最小复现结果；train.sh 里如何固化（环境变量或 launch 脚本）；最终训练速度。
+**结果**：最小复现（2 rank all_reduce，rank0 值 1、rank1 值 2）在 2.27.7 + LD_PRELOAD 下两边都得到 3.0，日志 `NCCL version 2.27.7+cuda12.9`。固化在 `ops/v3_train/train.sh`：`/root/nccl/.../libnccl.so.2` 存在就 `export LD_PRELOAD`。训练速度：每 GPU batch 16 时 61.8k token/s，改为 batch 8 × accum 2 后 59.1k token/s（见第 13 条）。
+
+**一个小插曲**：pip 安装第一次跑在 SSH 前台，连接中途断开（`mux_client_request_session: read from master failed: Broken pipe`），装到一半。第二次改成在远端 `setsid nohup` 后台跑，结果写日志文件，本地用轮询等结束标记。教训：计费机器上任何超过几十秒的操作都放远端后台，不要依赖一条 SSH 连接。
 
 **面试可能追问**
 - Q：NCCL 报 'invalid argument'，你怎么排查？A：先用最小 all_reduce 脚本排除业务代码；再开 `NCCL_DEBUG=INFO` 看拓扑、传输和 kernel 配置；逐个关掉 P2P/SHM/IB 缩小范围；最后对照 NCCL 版本、驱动和 GPU 架构的兼容性。
@@ -213,6 +215,34 @@ LP-FT 两阶段（A：只训新增部分 1000 步；B：全参 12000 步），DD
 - **DCU（HIP）上 flash attention 失败**：在 HIP 上 SDPA 默认改为 math 后端（train / eval_text / train_grpo 一致）。
 - **Python 3.14 默认 forkserver 撑爆 /dev/shm 配额**：forkserver 会把整个数据集 pickle 到 /dev/shm。在 Linux 上 DataLoader 显式改用 `multiprocessing_context="fork"`（copy-on-write 共享）。
 - **SCNet 网关截断长 SSH 输出流**：大文件下载会断。改为分段 `dd`（每段后 `sleep 3`），校验大小，不对就重试（`ops/plan_v3/local_grpo_eval.sh` 的 `fetch()`）。
+
+## 12. 重启训练时 pkill 把自己的 SSH 会话杀了（同一个坑第二次）
+
+**现象**：为了改 batch，在一条 `ssh ... '...'` 里先 `pkill -f "[v]3_train/train.sh"`，后面同一条命令里又写了 `bash code/ops/v3_train/train.sh` 来重启。ssh 直接返回 255。
+
+**排查**：重连后 `ps` 发现 torchrun 和 train.py 还在跑，但父脚本 train.sh 没了，所以 stage A 结束后不会有人启动 stage B。
+
+**根因**：`[v]` 技巧只在命令行里**没有**真实字符串时才有效。这条远端 `bash -c` 的命令行后半段就含有 `v3_train/train.sh`（重启那句），所以 pkill 先杀了 train.sh，又匹配到并杀掉了执行它的 bash 自己，后面的 kill 和重启都没执行。
+
+**修复**：把"按 PID 停进程 + 重启"写成脚本文件传到远端（`cat > /root/restart.sh`），再 `bash /root/restart.sh`。这样进程命令行只是 `bash /root/restart.sh`，不会匹配；脚本里还跳过 `$$`。
+
+**面试可能追问**
+- 为什么 `pgrep -f` 容易误伤？——它匹配的是完整命令行，包括 `bash -c '<整段脚本>'` 这种把脚本内容放进 argv 的进程。
+- 更稳的做法？——记 PID 文件（启动时 `echo $! > pid`），或者用 systemd / supervisord 管理进程，按 unit 停止，而不是按字符串匹配。
+
+## 13. 显存余量：batch 16 太满，评测挪回笔记本
+
+**现象**：batch 16 时 stage A 两张卡显存分别用到 28.8 / 31.0 GB（共 32 GB）。stage B 要多出全部参数的梯度和 Adam 状态（约 2 GB），eval_watch 还要在 GPU 1 上并发跑评测。
+
+**判断**：B 很可能 OOM；而且评测和训练抢同一张卡，哪一个先申请到显存是随机的，评测进程可能把训练挤掉。
+
+**修复**：
+- 每卡 batch 8 × 梯度累积 2，全局 batch 仍是 32，数学上不变；速度只降 4%（61.8k→59.1k token/s），显存降到 24.9 / 28.4 GB。
+- 评测完全移到笔记本：先测下载速度（远端→笔记本约 2.6 MB/s，一个 506 MB 快照约 3 分钟），笔记本 GPU 评一个快照约 6 分钟，而快照每 13 分钟左右出一个，跟得上。`fetch.sh` 拉快照、`local_eval.sh` 在本地评测；远端只训练，训练一结束就能关机，评测不再占用计费时间。
+
+**面试可能追问**
+- 梯度累积和大 batch 等价吗？——对 AdamW + 无 BatchNorm 的 Transformer，损失按 accum 平均后梯度等价；差别只在吞吐和显存。DDP 下用 `no_sync()` 只在最后一个 micro-batch all-reduce。
+- 为什么不直接让评测和训练共享一张卡？——PyTorch 缓存分配器会把显存留在进程里不还，两个进程都按需增长，碰到峰值就会有一个 OOM，而且不可控。
 
 ## 可迁移的经验
 

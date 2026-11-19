@@ -19,8 +19,8 @@ bash ops/v3_train/launch.sh start fetch || exit 1
 echo "training started; progress every 30 s (Ctrl-C stops only this display)"
 while true; do
   $G "tail -1 $R/runs/train.log; f=$R/runs/B_ft/log.jsonl; [ -f \$f ] || f=$R/runs/A_lp/log.jsonl
-      [ -f \$f ] && grep records_per_s \$f | tail -1 | cut -c1-110; tail -1 $R/eval/summary.txt 2>/dev/null
+      [ -f \$f ] && grep records_per_s \$f | tail -1 | cut -c1-110; true
       nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader | tr '\n' ' '; echo" 2>/dev/null
-  echo "--"
+  tail -1 out/v3_train/eval/summary.txt 2>/dev/null; echo "--"
   sleep 30
 done

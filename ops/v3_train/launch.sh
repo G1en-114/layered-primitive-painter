@@ -80,18 +80,18 @@ ChineseCLIPModel.from_pretrained(\"chinese-clip-vit-large-patch14\").half().save
     cp chinese-clip-vit-large-patch14/{configuration.json,preprocessor_config.json,vocab.txt} chinese-clip-vit-large-patch14-fp16/
     touch chinese-clip-vit-large-patch14-fp16/model.safetensors.ok; ls -la chinese-clip-vit-large-patch14-fp16'
 }
-start() {
+start() {   # training only: the box's 32 GB per GPU are full with it, the laptop evaluates (local_eval.sh)
   $G "pgrep -f '[v]3_train/train.sh' > /dev/null" && { echo "training already running"; return 0; }
   $G "cd $R || exit 1; setsid nohup bash code/ops/v3_train/train.sh > runs_train.nohup 2>&1 < /dev/null &
-      sleep 5; setsid nohup bash code/ops/v3_train/eval_watch.sh > eval_watch.nohup 2>&1 < /dev/null &
-      sleep 1; pgrep -af 'v3_train/(train|eval_watch).sh'"
+      sleep 3; pgrep -af '[v]3_train/train.sh'"
 }
-fetch() {   # a detached loop on the laptop: survives closing Claude and the terminal
-  systemctl --user is-active -q lpp-v3-fetch && { echo "fetch loop already running"; return 0; }
-  systemd-run --user --unit lpp-v3-fetch --same-dir bash ops/v3_train/fetch.sh
+fetch() {   # detached loops on the laptop (survive closing Claude and the terminal): pull results, evaluate them
+  systemctl --user is-active -q lpp-v3-fetch || systemd-run --user --unit lpp-v3-fetch --same-dir bash ops/v3_train/fetch.sh
+  systemctl --user is-active -q lpp-v3-eval || systemd-run --user --unit lpp-v3-eval --same-dir bash ops/v3_train/local_eval.sh
 }
 status() {
-  $G "tail -3 $R/runs/train.log; tail -2 $R/runs/B_ft/log.jsonl 2>/dev/null || tail -2 $R/runs/A_lp/log.jsonl; cat $R/eval/summary.txt 2>/dev/null; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader"
+  cat out/v3_train/eval/summary.txt 2>/dev/null
+  $G "tail -3 $R/runs/train.log; tail -2 $R/runs/B_ft/log.jsonl 2>/dev/null || tail -2 $R/runs/A_lp/log.jsonl; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader"
 }
 steps=("$@"); [ "${1:-all}" = all ] && steps=(connect setup upload models start fetch)
 for s in "${steps[@]}"; do $s || { echo "step $s failed"; exit 1; }; done

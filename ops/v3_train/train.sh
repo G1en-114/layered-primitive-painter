@@ -5,11 +5,12 @@
 #   A  only the new parts train (LINE heads, bend, event tables), trunk frozen          STEPS_A steps
 #   B  everything, low learning rate, from A's weights; model snapshots every SNAP steps   STEPS_B steps
 # Resume-safe: re-running skips a finished stage and resumes an interrupted one from its last.pt.
+# Per-GPU batch 8 x accum 2 (global 32): batch 16 left 1-3 GB of the 5090's 32 GB, too little for stage B.
 # Paths and sizes come from the environment (defaults: the rented 2x5090 box); ops/v3_train/dry_run.sh runs
 # the same script on the laptop with tiny settings. Ends by writing RUNS/train_done (or RUNS/train_failed).
 set -u
 ROOT=${ROOT:-/root/lpp/v3train}; CODE=${CODE:-$ROOT/code}; RUNS=${RUNS:-$ROOT/runs}
-PY=${PY:-python}; NGPU=${NGPU:-2}; BATCH=${BATCH:-16}; ACCUM=${ACCUM:-1}; WORKERS=${WORKERS:-6}
+PY=${PY:-python}; NGPU=${NGPU:-2}; BATCH=${BATCH:-8}; ACCUM=${ACCUM:-2}; WORKERS=${WORKERS:-6}
 STEPS_A=${STEPS_A:-1000}; STEPS_B=${STEPS_B:-12000}; SNAP=${SNAP:-2000}; SAVE=${SAVE:-500}; EVAL=${EVAL:-1000}
 INIT=${INIT:-$ROOT/runs/base_v3_lines_init.pt}
 D=$ROOT/data
