@@ -31,9 +31,9 @@ for m in fp16 int8 int8w int4w; do
 done
 for B in 1 8 32; do
   [ -f $O/in_b$B/uniforms.npy ] || "$PY" tools/ort_generate.py --onnx $M --ckpt $C --text-encoder $TE --n $B \
-    --max-records 2 --cfg-scale 5.0 --dump $O/in_b$B > $O/dump_b$B.log 2>&1 || say "4 inputs B=$B FAILED"
+    --max-records 400 --cfg-scale 5.0 --dump $O/in_b$B > $O/dump_b$B.log 2>&1 || say "4 inputs B=$B FAILED"
 done
-[ -f $O/summary_median.txt ] && [ $(wc -l < $O/summary_median.txt) -ge 25 ] \
+[ -f $O/summary_median.txt ] && [ $(grep -c "\[ [0-9]" $O/summary_median.txt) -ge 24 ] \
   || { flock out/gpu.lock bash bench/runtime_quant_repeat.sh $M $O > $O/bench.log 2>&1; say "5 C++ throughput done"; }
 if [ ! -f $O/quant_eval/summary.json ]; then
   flock out/gpu.lock "$PY" tools/quant_eval.py --text-encoder $TE --captions data/captions/captions_v3.jsonl \

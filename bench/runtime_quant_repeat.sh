@@ -1,7 +1,7 @@
 #!/bin/bash
 # Median of 3 runs per configuration (C++ runtime, 400 records max per sample), all precisions, B = 1 / 8 / 32.
 set -u
-M=$1; O=$2; cd "$(dirname "$0")/.."
+M=$1; O=$2; cd "$(dirname "$0")/.."; mkdir -p $O/rep
 echo "provider prec B rec_per_s_median runs" > $O/summary_median.txt
 for prov in cpu cuda; do
   precs="fp32 int8 int8w int4w"; [ $prov = cuda ] && precs="fp32 fp16 int8w int4w"
