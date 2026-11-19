@@ -169,7 +169,7 @@ def render_samples(model, codec, n, path, seed, encoder=None, cfg_scale=2.0):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="glob of decomp_*.npz shards")
+    ap.add_argument("--data", required=True, nargs="+", help="glob(s) of decomp_*.npz shards (several: mixed datasets)")
     ap.add_argument("--config", default="small", choices=["tiny", "small", "base"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--batch", type=int, default=32)
@@ -185,6 +185,10 @@ def main() -> None:
     ap.add_argument("--protocol", type=Path, default=None, help="explicit versioned protocol/profile")
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="also keep model-only snapshots <out>/model_step<N>.pt every N steps (for evaluation)")
+    ap.add_argument("--train-only", default=None,
+                    help="comma-separated parameter-name prefixes: freeze every other parameter (LP-FT's first stage)")
     ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--sdpa-backend", choices=["auto", "math"], default=None,
@@ -250,13 +254,14 @@ def main() -> None:
 
     proto = load_protocol(args.protocol) if args.protocol else load_protocol()
     codec = Codec.load(proto=proto, device="cuda")
-    files = sorted(Path(p) for p in glob.glob(args.data))
+    files = sorted({Path(f) for pat in args.data for f in glob.glob(pat)})
     if not files:
         raise SystemExit(f"no shards match {args.data}")
     for d in sorted({f.parent for f in files}):        # data and model must use the same protocol
         cfg_file = d / "config.json"
         data_version = json.loads(cfg_file.read_text()).get("protocol_version", 1) if cfg_file.exists() else 1
-        if data_version != proto.version:
+        # v3 only appends to v2 (the LINE event, the bend attribute): v2 shards are widened on load
+        if data_version != proto.version and not (data_version == 2 and proto.version == 3):
             raise SystemExit(f"{d} was made with protocol v{data_version}, training uses v{proto.version}; "
                              f"pass --protocol for that version")
     examples = load_shards(files)
@@ -326,13 +331,21 @@ def main() -> None:
         new_params = set(missing)
         print(f"initialised from {args.init_weights} (step {src.get('step')}); "
               f"{len(missing)} new tensors start fresh: {sorted({k.split('.')[0] for k in missing})}")
+    if args.train_only:
+        keep = tuple(p.strip() for p in args.train_only.split(",") if p.strip())
+        for n, prm in model.named_parameters():
+            prm.requires_grad_(n.startswith(keep))
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if n_train == 0:
+            raise SystemExit(f"--train-only {args.train_only} matches no parameter")
+        print(f"--train-only: {n_train / 1e6:.2f}M of {model.num_params() / 1e6:.1f}M parameters train")
     # parameter groups: weight decay or not, and new (fresh) tensors at lr * --new-lr-mult, so modules
     # added to a trained model are not starved by the small fine-tuning learning rate
     groups = []
     for is_new in (False, True):
         for wd in (True, False):
             ps = [p for n, p in model.named_parameters()
-                  if (n in new_params) == is_new and (p.dim() >= 2 and "emb" not in n) == wd]
+                  if p.requires_grad and (n in new_params) == is_new and (p.dim() >= 2 and "emb" not in n) == wd]
             if ps:
                 groups.append({"params": ps, "weight_decay": args.wd if wd else 0.0,
                                "lr_mult": args.new_lr_mult if is_new else 1.0})
@@ -382,7 +395,7 @@ def main() -> None:
             for k, v in losses.items():
                 totals[k] = totals.get(k, 0.0) + v.item() / args.accum
             seen += int(batch["valid"].sum())
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+        gnorm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
@@ -423,6 +436,10 @@ def main() -> None:
             save_checkpoint(args.out, {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                                        "new_params": sorted(new_params), "config": cfg.to_dict(), "protocol": proto.raw,
                                        "args": vars(args) | {"out": str(args.out)}}, log)
+        if is_main and args.snapshot_every and (step % args.snapshot_every == 0 or step == args.steps):
+            snap, tmp = args.out / f"model_step{step:06d}.pt", args.out / f"model_step{step:06d}.tmp"
+            torch.save({"model": model.state_dict(), "step": step, "config": cfg.to_dict(), "protocol": proto.raw}, tmp)
+            tmp.replace(snap)                          # atomic: watchers only ever see complete snapshots
     if ddp:
         # DDP keeps replicas identical by construction; check it (cheap: one checksum per tensor)
         sums = torch.stack([p.detach().float().sum() for p in model.parameters()])
