@@ -18,6 +18,7 @@ same update rule runs in training (all checkpoints at once) and in decoding
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from .codec import Codec
 from .render.dispatch import render_group
@@ -45,6 +46,25 @@ def checkpoint_flags(kind: torch.Tensor, k: int) -> torch.Tensor:
 def is_checkpoint(kind: int, prims_since_last: int, k: int) -> bool:
     """Decoding-time twin of checkpoint_flags (prims_since_last counts this record)."""
     return kind in (KIND_BOS, KIND_CONTROL) or prims_since_last >= k
+
+
+TARGET_CHANNELS = 7    # residual canvas: target RGB, target - canvas RGB, has-target plane
+
+
+def target_at(target: torch.Tensor, size: int) -> torch.Tensor:
+    """Target images [N, 3, S, S] in [0, 1] -> the canvas size (area average, as the canvas itself is a 64 px render)."""
+    return target if target.shape[-1] == size else F.interpolate(target, size=(size, size), mode="area")
+
+
+def with_target(canvas: torch.Tensor, target: torch.Tensor | None, has: torch.Tensor | None) -> torch.Tensor:
+    """Residual canvas input: canvas [N, 3 + L, S, S] -> [N, 3 + L + 7, S, S] with the target, target minus the canvas
+    RGB, and a plane of ones for rows that have a target; all zeros for rows without one (text only), so such rows
+    see what a text model sees (the extra input weights start at zero). target [N, 3, S, S] at the canvas size."""
+    N, _, S, _ = canvas.shape
+    if target is None:
+        return torch.cat([canvas, canvas.new_zeros(N, TARGET_CHANNELS, S, S)], 1)
+    m = has.to(canvas.dtype).view(N, 1, 1, 1)
+    return torch.cat([canvas, target * m, (target - canvas[:, :3]) * m, m.expand(N, 1, S, S)], 1)
 
 
 def empty_state(B: int, n_layers: int, size: int, device):
@@ -79,11 +99,12 @@ def add_primitives(state, prims: Primitives, layer: torch.Tensor, size: int, pro
 
 
 @torch.no_grad()
-def build_training_canvases(batch: dict, codec: Codec, k: int = 32, size: int = 64):
+def build_training_canvases(batch: dict, codec: Codec, k: int = 32, size: int = 64, canvas_target: bool = False):
     """All checkpoint canvases of a teacher-forced batch.
 
     batch: kind/layer/attrs/valid [B, T] input records (collate output, on the GPU).
-    Returns canvas [B, S, 3 + L, size, size] and seg [B, T]: the checkpoint whose canvas
+    Returns canvas [B, S, 3 + L, size, size] (+ 7 residual-canvas channels with canvas_target, from batch["target"] /
+    batch["target_valid"] when present) and seg [B, T]: the checkpoint whose canvas
     position t sees (latest checkpoint <= t), -1 for padding.
 
     Segment j = the records after checkpoint j-1 up to and including checkpoint j, so
@@ -138,7 +159,17 @@ def build_training_canvases(batch: dict, codec: Codec, k: int = 32, size: int = 
     for j in range(S):                                    # segment j goes on top of everything before
         P, Tt = Pg[:, j] + Tg[:, j] * P, Tg[:, j] * Tt
         canvases.append(compose((P, Tt), base))
-    return torch.stack(canvases, 1), seg
+    out = torch.stack(canvases, 1)
+    if canvas_target:
+        C = out.shape[2]
+        tgt = batch.get("target")
+        if tgt is not None:
+            tgt = target_at(tgt.to(out.dtype), size)[:, None].expand(B, S, 3, size, size).reshape(B * S, 3, size, size)
+            has = batch["target_valid"][:, None].expand(B, S).reshape(B * S)
+        else:
+            has = None
+        out = with_target(out.reshape(B * S, C, size, size), tgt, has).view(B, S, C + TARGET_CHANNELS, size, size)
+    return out, seg
 
 
 class CanvasTracker:
@@ -150,7 +181,9 @@ class CanvasTracker:
     rendering as build_training_canvases, so training and decoding see identical canvases.
     """
 
-    def __init__(self, model, codec: Codec, batch: int, device, record: bool = False):
+    def __init__(self, model, codec: Codec, batch: int, device, record: bool = False,
+                 target: torch.Tensor | None = None):
+        """target [batch, 3, S, S] in [0, 1]: the image to paint, for residual-canvas models (cfg.canvas_target)."""
         cfg, proto = model.cfg, codec.proto
         self.model, self.codec, self.proto = model, codec, proto
         self.k, self.size = cfg.canvas_k, cfg.canvas_size
@@ -158,9 +191,22 @@ class CanvasTracker:
         self.base = torch.tensor(proto.base_color, device=device)
         self.pending: list[list[tuple[torch.Tensor, int]]] = [[] for _ in range(batch)]
         self.since = [0] * batch
-        canvas = compose(self.state, self.base)
+        self.canvas_target = bool(getattr(cfg, "canvas_target", False))
+        if target is not None and not self.canvas_target:
+            raise ValueError("a target image given to a model without a residual canvas")
+        self.target = None if target is None else target_at(target.to(device).float(), self.size)
+        canvas = self._input(compose(self.state, self.base), None)  # what the encoder reads (with target channels)
         self.tokens = model.canvas_enc(canvas)               # BOS is the first checkpoint: blank
         self.history = [[c] for c in canvas] if record else None
+
+    def _input(self, canvas: torch.Tensor, idx: torch.Tensor | None) -> torch.Tensor:
+        """What the canvas encoder reads for these rows (all rows when idx is None)."""
+        if not self.canvas_target:
+            return canvas
+        if self.target is None:
+            return with_target(canvas, None, None)
+        t = self.target if idx is None else self.target[idx]
+        return with_target(canvas, t, torch.ones(len(t), dtype=torch.bool, device=t.device))
 
     @torch.no_grad()
     def update(self, kind: torch.Tensor, attrs: torch.Tensor, layer: torch.Tensor, live: torch.Tensor,
@@ -206,7 +252,7 @@ class CanvasTracker:
             P, T = add_primitives(sub, prims, lay, self.size, self.proto)
             self.state[0][idx], self.state[1][idx] = P, T
         idx = torch.tensor(hit, device=self.tokens.device)
-        canvas = compose((self.state[0][idx], self.state[1][idx]), self.base)
+        canvas = self._input(compose((self.state[0][idx], self.state[1][idx]), self.base), idx)
         self.tokens[idx] = self.model.canvas_enc(canvas)
         for i, b in enumerate(hit):
             self.pending[b] = []

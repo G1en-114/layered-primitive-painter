@@ -76,8 +76,9 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
 
     image/image_valid: CLIP image tokens [B, Li, D] for image-conditioned models; guidance (cfg_scale)
     contrasts with and without the text only, both halves keep the image.
-    target: pixel target images [B, 3, S, S] in [0, 1] for target-conditioned models (cfg.target);
-    read by cross-attention at every step, kept by both guidance halves.
+    target: pixel target images [B, 3, S, S] in [0, 1] for target-conditioned models (cfg.target: read by
+    cross-attention at every step) or residual-canvas models (cfg.canvas_target: part of every canvas); kept by both
+    guidance halves.
     forced: per sample, a prefix DrawSeq starting with BOS (e.g. a decomposer's coarse layers, or a
     REFINE_k / REDRAW_k edit prefix): its records are taken instead of sampled, through the same
     grammar, cache and canvas path, and the model continues from where each prefix ends.
@@ -152,14 +153,16 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
     if model.cfg.canvas:
         if codec is None:
             raise ValueError("a canvas-feedback model needs `codec` to render its canvas")
-        tracker = CanvasTracker(model, codec, B, dev, record=canvas_history is not None)
+        canvas_target = getattr(model.cfg, "canvas_target", False)
+        tracker = CanvasTracker(model, codec, B, dev, record=canvas_history is not None,
+                                target=target if canvas_target else None)
         draw = torch.zeros(R, valid.shape[1], dtype=torch.bool, device=dev)
         draw[:, -1] = True                                  # the BOS sees the blank canvas; text does not
         ctx = ("current", rows(tracker.tokens), draw)
     else:
         ctx = None
     tctx = None
-    if target is not None:
+    if target is not None and not getattr(model.cfg, "canvas_target", False):   # residual canvas: in the tracker
         if not model.cfg.target:
             raise ValueError("a target image given to a model without target conditioning")
         tctx = (rows(model.target_enc(target)), torch.ones(R, dtype=torch.bool, device=dev))

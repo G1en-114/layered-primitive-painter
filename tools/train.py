@@ -57,7 +57,7 @@ def to_gpu(batch: dict, encoder, codec=None, model_cfg=None) -> dict:
         batch["text"], batch["text_valid"] = encoder(captions)
     if model_cfg is not None and model_cfg.canvas:
         batch["canvas"], batch["seg"] = build_training_canvases(batch, codec, model_cfg.canvas_k,
-                                                                model_cfg.canvas_size)
+                                                                model_cfg.canvas_size, model_cfg.canvas_target)
     return batch
 
 
@@ -218,6 +218,9 @@ def main() -> None:
     ap.add_argument("--target-images", type=Path, default=None,
                     help="pixel target store (tools/build_target_store.py): enables target-image cross-attention")
     ap.add_argument("--p-target", type=float, default=0.5, help="share of sequences given their pixel target")
+    ap.add_argument("--canvas-target", action="store_true",
+                    help="with --target-images and --canvas: the target goes into the canvas (residual canvas, "
+                         "docs/plan_v4.md) instead of target cross-attention; start from tools/add_canvas_target.py")
     ap.add_argument("--target-gate-init", type=float, default=0.5,
                     help="raw value of the target cross-attention gates at init (0 = exact no-op, but it stalls)")
     ap.add_argument("--new-lr-mult", type=float, default=1.0,
@@ -314,7 +317,13 @@ def main() -> None:
         # the image prefix comes on top of the protocol's worst case (rotary tables are not saved,
         # so a larger context still loads checkpoints trained without images)
         cfg.image, cfg.max_positions = True, max(cfg.max_positions, proto.worst_case_positions() + n_img)
-    if targets is not None:
+    if targets is not None and args.canvas_target:
+        if not args.canvas:
+            raise SystemExit("--canvas-target needs --canvas")
+        cfg.canvas_target = True
+    elif args.canvas_target:
+        raise SystemExit("--canvas-target needs --target-images")
+    elif targets is not None:
         cfg.target, cfg.target_gate_init = True, args.target_gate_init
         cfg.target_size = int(json.loads((args.target_images / "meta.json").read_text())["size"])
     if encoder is not None and cfg.text_dim != encoder.dim:

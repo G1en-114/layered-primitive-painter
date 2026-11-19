@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .canvas import TARGET_CHANNELS
 from .codec import Codec
 from .protocol import CodebookAttr, PeriodicAttr, Protocol
 from .sequence import KIND_PRIMITIVE
@@ -51,6 +52,10 @@ class ModelConfig:
     canvas_size: int = 64
     canvas_every: int = 4
     canvas_width: int = 64
+    # residual canvas (docs/plan_v4.md, image -> painting): the canvas encoder also sees a target image, target minus
+    # canvas and a has-target plane (canvas.with_target, 7 channels), zero where a sample has no target. The extra
+    # input weights start at 0 (tools/add_canvas_target.py), so a converted model is exactly the text model at init.
+    canvas_target: bool = False
     # image conditioning (image -> layered primitives, editing): frozen CLIP image tokens as a
     # prefix before the text, see tools/extract_image_features.py
     image: bool = False
@@ -331,7 +336,8 @@ class Painter(nn.Module):
                                     for _ in range(cfg.n_layers))
         self.norm = nn.RMSNorm(d)
         if cfg.canvas:
-            self.canvas_enc = CanvasEncoder(3 + proto.num_layers, d, cfg.canvas_size, cfg.canvas_width)
+            self.canvas_enc = CanvasEncoder(3 + proto.num_layers + (TARGET_CHANNELS if cfg.canvas_target else 0), d,
+                                            cfg.canvas_size, cfg.canvas_width)
             self.cross = nn.ModuleDict({str(li): CanvasCross(d, cfg.n_heads) for li in range(cfg.n_layers)
                                         if (li + 1) % cfg.canvas_every == 0})
         if cfg.target:

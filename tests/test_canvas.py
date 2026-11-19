@@ -153,3 +153,36 @@ def test_checkpoint_flags_vectorized_matches_sequential_rule():
         kind[:, 5] = 1
         kind[::3, 250:] = 0
         assert torch.equal(checkpoint_flags(kind, k), _checkpoint_flags_loop(kind, k))
+
+
+def test_residual_canvas_decoding_equals_training(codec):
+    """Residual canvas (cfg.canvas_target): the encoder input while generating towards a target, including the
+    target / target-minus-canvas / has-target channels, equals what teacher forcing builds for the same sequences;
+    a batch without targets gets zeros in those channels."""
+    from lpp.canvas import TARGET_CHANNELS
+    from lpp.sample import SampleConfig, generate
+    proto = codec.proto
+    cfg = ModelConfig.tiny()
+    cfg.canvas, cfg.canvas_every, cfg.canvas_size, cfg.canvas_k, cfg.canvas_target = True, 1, 32, 8, True
+    torch.manual_seed(2)
+    m = Painter(cfg, proto, codec).to(DEV).eval()
+    for c in m.cross.values():
+        c.gate.data.fill_(0.5)
+    target = torch.rand(3, 3, 64, 64, generator=torch.Generator().manual_seed(3)).to(DEV)
+    hist = []
+    g = torch.Generator(device=DEV).manual_seed(0)
+    seqs = generate(m, batch=3, cfg=SampleConfig(max_records=90, require_before_eos=(0, 2)), generator=g,
+                    codec=codec, canvas_history=hist, target=target)
+    b = batch_for(seqs)
+    b["target"], b["target_valid"] = target, torch.ones(3, dtype=torch.bool, device=DEV)
+    canvas, _ = build_training_canvases(b, codec, k=8, size=32, canvas_target=True)
+    C = 3 + proto.num_layers
+    assert canvas.shape[2] == C + TARGET_CHANNELS
+    for i in range(3):
+        n = int(checkpoint_flags(b["kind"][i:i + 1], 8)[0][b["valid"][i]].sum())
+        assert n >= 2
+        for j in range(n):
+            assert torch.allclose(hist[i][j], canvas[i, j], atol=2e-4), (i, j)
+    del b["target"], b["target_valid"]
+    plain, _ = build_training_canvases(b, codec, k=8, size=32, canvas_target=True)
+    assert plain[:, :, C:].abs().max() == 0 and torch.allclose(plain[:, :, :C], canvas[:, :, :C])
