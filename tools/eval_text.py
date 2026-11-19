@@ -102,6 +102,8 @@ def main() -> None:
     ap.add_argument("--renyi-alpha", type=float, default=None,
                     help="Renyi-entropy adaptive truncation with uniform choice inside it (replaces top-p)")
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--line-temperature", default=None,
+                    help="protocol v3: per-attribute temperature for LINE strokes only, e.g. x=0.5,y=0.5,theta=0.5")
     ap.add_argument("--attr-temperature", default=None,
                     help="per-attribute temperature overrides, e.g. x=0.7,y=0.7")
     ap.add_argument("--best-of", type=int, default=1,
@@ -159,7 +161,9 @@ def main() -> None:
 
     attr_t = {k: float(v) for k, v in (kv.split("=") for kv in args.attr_temperature.split(","))} if args.attr_temperature else None
     sc = SampleConfig(temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg_scale,
-                      renyi_alpha=args.renyi_alpha, attr_temperature=attr_t)
+                      renyi_alpha=args.renyi_alpha, attr_temperature=attr_t,
+                      line_temperature={k: float(v) for k, v in (kv.split("=") for kv in args.line_temperature.split(","))}
+                      if args.line_temperature else None)
     gen, orphan, lengths, early = [], [], [], 0
     cache = args.out / "generated.npz"
     if cache.exists():               # scoring can be rerun without regenerating
@@ -230,7 +234,7 @@ def main() -> None:
     half = len(r_np) // 2
     result = {
         "step": state["step"], "checkpoint": str(args.ckpt), "n": args.n, "cfg_scale": args.cfg_scale,
-        "renyi_alpha": args.renyi_alpha, "temperature": args.temperature, "best_of": args.best_of, "attr_temperature": args.attr_temperature,
+        "renyi_alpha": args.renyi_alpha, "temperature": args.temperature, "best_of": args.best_of, "attr_temperature": args.attr_temperature, "line_temperature": args.line_temperature,
         "top_p": args.top_p, "seed": args.seed,
         "generated": {"clip_score": round(100 * float((gi * t).sum(1).mean()), 3), **retrieval(gi, t),
                       "clip_fd": round(frechet(g_np, r_np), 4),

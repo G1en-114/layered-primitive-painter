@@ -21,12 +21,15 @@ class SampleConfig:
     top_p: float = 0.95
     cfg_scale: float = 1.0             # >1: classifier-free guidance (needs text)
     attr_temperature: dict | None = None   # per-attribute temperature overrides, e.g. {"x": 0.7}
+    line_temperature: dict | None = None   # protocol v3: per-attribute temperature for LINE strokes only
+                                           # (stray lines), e.g. {"x": 0.5, "theta": 0.5}; Gaussians keep the above
     renyi_alpha: float | None = None   # adaptive support (POP2-style) instead of top-p, see _sample
     require_before_eos: tuple = ()     # layer ids that must be drawn before EOS
     max_records: int | None = None     # drawing records incl. BOS; default: context minus text
 
 
-def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str = "") -> torch.Tensor:
+def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str = "",
+            row_temp: torch.Tensor | None = None) -> torch.Tensor:
     """Sample one token per row by inverse CDF with given uniforms u [B] (deterministic given u).
 
     Default: temperature + top-p. With renyi_alpha: the support size is the exponential of the
@@ -34,10 +37,13 @@ def _sample(logits: torch.Tensor, cfg: SampleConfig, u: torch.Tensor, name: str 
     "effective number of candidates"; the top k are kept and sampled uniformly (as in POP 2).
     A peaked distribution keeps 1-2 candidates, a flat one many.
     """
-    temp = (cfg.attr_temperature or {}).get(name, cfg.temperature)
-    if temp <= 0:
-        return logits.argmax(-1)
-    probs = torch.softmax(logits.float() / temp, -1)
+    if row_temp is not None:                           # one temperature per row (LINE vs Gaussian rows)
+        probs = torch.softmax(logits.float() / row_temp.clamp(min=1e-4)[:, None], -1)
+    else:
+        temp = (cfg.attr_temperature or {}).get(name, cfg.temperature)
+        if temp <= 0:
+            return logits.argmax(-1)
+        probs = torch.softmax(logits.float() / temp, -1)
     sp, si = probs.sort(-1, descending=True)
     if cfg.renyi_alpha is not None:
         a = cfg.renyi_alpha
@@ -190,7 +196,11 @@ def generate(model: Painter, batch: int = 1, cfg: SampleConfig | None = None, te
             for i, name in enumerate(model.attr_names):
                 dh = model.decoder(h, rows(event), rows(attrs.clamp(min=0)), steps=2 + i)
                 logits = model.attr_logits(name, dh[:, -1], rows(prev) if prev is not None else None, rows(event))
-                attrs[:, i] = _sample(guide(logits), cfg, rand(step, name), name)
+                rt = None
+                if cfg.line_temperature and name in cfg.line_temperature and proto.has_lines:
+                    base = (cfg.attr_temperature or {}).get(name, cfg.temperature)
+                    rt = torch.where(event == proto.event_id("LINE"), float(cfg.line_temperature[name]), float(base))
+                attrs[:, i] = _sample(guide(logits), cfg, rand(step, name), name, rt)
             for e, fx in fixed.items():                                     # beta = 0 on lines, bend = 0 on Gaussians
                 for nm, tk in fx.items():
                     attrs[:, model.attr_names.index(nm)] = torch.where(event == e, torch.full_like(attrs[:, 0], tk),
