@@ -33,6 +33,9 @@ def main() -> None:
                     help="canvas cross-attention layers whose gate is closed (|tanh| < 0.01) get the gate fixed open "
                          "(raw 3) and a zero output projection: still a no-op at init, but they can learn (train with "
                          "--freeze cross.N.gate so the optimiser cannot shut them again); see pilot 1 in plan_v4.md")
+    ap.add_argument("--canvas-stride", type=int, default=None,
+                    help="4: 16x16 canvas tokens instead of 8x8 (same conv weights, position embedding interpolated); "
+                         "no longer identical to the source at init")
     args = ap.parse_args()
     s = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg = ModelConfig(**s["config"])
@@ -53,6 +56,14 @@ def main() -> None:
                 sd[k] = torch.full_like(sd[k], 3.0)
                 sd[f"cross.{li}.o.weight"] = torch.zeros_like(sd[f"cross.{li}.o.weight"])
                 opened.append(f"cross.{li}.gate")
+    finer = args.canvas_stride is not None and args.canvas_stride != cfg.canvas_stride
+    if finer:
+        side = cfg.canvas_size // cfg.canvas_stride
+        pos = sd["canvas_enc.pos"].T.reshape(1, -1, side, side)
+        cfg.canvas_stride = args.canvas_stride
+        new_side = cfg.canvas_size // cfg.canvas_stride
+        sd["canvas_enc.pos"] = torch.nn.functional.interpolate(pos, size=(new_side, new_side), mode="bilinear",
+                                                               align_corners=False).reshape(-1, new_side ** 2).T.contiguous()
     codec = Codec.load(proto=proto, device="cpu")
     new = Painter(cfg, proto, codec)
     new.load_state_dict(sd)                                       # strict: every other tensor is unchanged
@@ -62,21 +73,24 @@ def main() -> None:
     canvas = torch.rand(2, w.shape[1], cfg.canvas_size, cfg.canvas_size, generator=g)
     target = torch.rand(2, 3, cfg.canvas_size, cfg.canvas_size, generator=g)
     with torch.no_grad():
-        ref = old.canvas_enc(canvas)
-        for t, has in ((None, None), (target, torch.tensor([True, False]))):
-            d = (new.canvas_enc(with_target(canvas, t, has)) - ref).abs().max().item()
-            assert d == 0.0, f"converted canvas encoder differs by {d}"
-        x = torch.randn(2, 5, cfg.d_model, generator=g)
-        toks = ref[:, None].expand(2, 1, *ref.shape[1:])
-        for k in opened:                                      # opened layers still add (almost exactly) nothing
-            li = k.split(".")[1]
-            a = old.cross[li](x, ("segments", toks, torch.zeros(2, 5, dtype=torch.long)))
-            b = new.cross[li](x, ("segments", toks, torch.zeros(2, 5, dtype=torch.long)))
-            assert (a - b).abs().max().item() < 1e-3 * x.abs().max().item(), k
+        if not finer:                                          # exact identity checks (not for finer tokens)
+            ref = old.canvas_enc(canvas)
+            for t, has in ((None, None), (target, torch.tensor([True, False]))):
+                d = (new.canvas_enc(with_target(canvas, t, has)) - ref).abs().max().item()
+                assert d == 0.0, f"converted canvas encoder differs by {d}"
+            x = torch.randn(2, 5, cfg.d_model, generator=g)
+            toks = ref[:, None].expand(2, 1, *ref.shape[1:])
+            for k in opened:                                      # opened layers still add (almost exactly) nothing
+                li = k.split(".")[1]
+                a = old.cross[li](x, ("segments", toks, torch.zeros(2, 5, dtype=torch.long)))
+                b = new.cross[li](x, ("segments", toks, torch.zeros(2, 5, dtype=torch.long)))
+                assert (a - b).abs().max().item() < 1e-3 * x.abs().max().item(), k
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": new.state_dict(), "step": 0, "config": cfg.to_dict(), "protocol": s["protocol"],
                 "source": str(args.ckpt)}, args.out)
-    print(f"{args.out}: {KEY} {tuple(w.shape)} -> {tuple(sd[KEY].shape)}; identical to the source at init"
+    print(f"{args.out}: {KEY} {tuple(w.shape)} -> {tuple(sd[KEY].shape)}; "
+          + (f"canvas tokens {side}x{side} -> {new_side}x{new_side} (NOT identical to the source at init)" if finer
+             else "identical to the source at init")
           + (f"; opened {opened} (train with --freeze {','.join(opened)})" if opened else ""))
 
 

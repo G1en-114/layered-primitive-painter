@@ -56,6 +56,9 @@ class ModelConfig:
     # canvas and a has-target plane (canvas.with_target, 7 channels), zero where a sample has no target. The extra
     # input weights start at 0 (tools/add_canvas_target.py), so a converted model is exactly the text model at init.
     canvas_target: bool = False
+    # canvas pixels per canvas token side: 8 (64 px canvas -> 8x8 tokens) or 4 (16x16: the third convolution keeps
+    # its weights but not its stride). Finer tokens for placing strokes from a residual canvas (plan_v4.md pilot 3).
+    canvas_stride: int = 8
     # image conditioning (image -> layered primitives, editing): frozen CLIP image tokens as a
     # prefix before the text, see tools/extract_image_features.py
     image: bool = False
@@ -179,18 +182,20 @@ class Block(nn.Module):
 
 
 class CanvasEncoder(nn.Module):
-    """[N, C, S, S] canvas -> [N, (S/8)^2, d] tokens with a learned 2D position embedding."""
+    """[N, C, S, S] canvas -> [N, (S/stride)^2, d] tokens with a learned 2D position embedding."""
 
-    def __init__(self, in_ch: int, d: int, size: int, width: int):
+    def __init__(self, in_ch: int, d: int, size: int, width: int, stride: int = 8):
         super().__init__()
+        if stride not in (4, 8):
+            raise ValueError(f"canvas stride {stride}: 4 or 8")
         w = width
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, w, 3, 2, 1), nn.GELU(),
             nn.Conv2d(w, 2 * w, 3, 2, 1), nn.GELU(),
-            nn.Conv2d(2 * w, 4 * w, 3, 2, 1), nn.GELU(),
+            nn.Conv2d(2 * w, 4 * w, 3, 2 if stride == 8 else 1, 1), nn.GELU(),
             nn.Conv2d(4 * w, d, 1),
         )
-        self.n_tokens = (size // 8) ** 2
+        self.n_tokens = (size // stride) ** 2
         self.pos = nn.Parameter(torch.zeros(self.n_tokens, d))
         nn.init.normal_(self.pos, std=0.02)
 
@@ -337,7 +342,7 @@ class Painter(nn.Module):
         self.norm = nn.RMSNorm(d)
         if cfg.canvas:
             self.canvas_enc = CanvasEncoder(3 + proto.num_layers + (TARGET_CHANNELS if cfg.canvas_target else 0), d,
-                                            cfg.canvas_size, cfg.canvas_width)
+                                            cfg.canvas_size, cfg.canvas_width, cfg.canvas_stride)
             self.cross = nn.ModuleDict({str(li): CanvasCross(d, cfg.n_heads) for li in range(cfg.n_layers)
                                         if (li + 1) % cfg.canvas_every == 0})
         if cfg.target:
