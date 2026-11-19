@@ -1,7 +1,7 @@
 #!/bin/bash
 # Laptop -> rented 2x5090 box: the formal v3 training (ops/v3_train/train.sh) and its evaluation watcher.
 #   ops/v3_train/launch.sh all         connect, set up python, upload (resumable), start training + watcher, fetch
-#   ops/v3_train/launch.sh STEP...     any of: connect setup upload start fetch status
+#   ops/v3_train/launch.sh STEP...     any of: connect setup upload models start fetch status
 # Box credentials: G5090_HOST/PORT/USER/PW in ~/.config/lpp/remotes.env (a NEW box: update them and pass
 # NEW_BOX=1 to forget the old host key). Code goes up as `git archive HEAD` (commit first).
 # On the box: /root/lpp/v3train/{code,data,runs,eval}; logs runs/train.log, runs/*.out, eval/summary.txt.
@@ -35,7 +35,9 @@ EOF'
 put() {     # put LOCAL REMOTE_REL: atomic, skipped when already there (FILE.ok)
   local l=$1 r=$R/$2
   $G "test -f $r.ok" 2>/dev/null && return 0
-  $G "mkdir -p \$(dirname $r) && cat > $r.tmp && mv $r.tmp $r && touch $r.ok" < "$l" || { echo "FAILED $l"; return 1; }
+  # zstd: the token shards halve; the laptop's uplink (~0.3 MB/s through the proxy) is the bottleneck
+  zstd -q -9 -T4 -c < "$l" | $G "mkdir -p \$(dirname $r) && zstd -q -d -c > $r.tmp && mv $r.tmp $r && touch $r.ok" \
+    || { echo "FAILED $l"; return 1; }
 }
 upload() {
   [ -z "$(git status --porcelain --untracked-files=no)" ] || echo "WARNING: uncommitted changes are NOT uploaded"
@@ -49,14 +51,32 @@ upload() {
     for d in v2 v2_t1 v2_t2 v2_t3 anime_v3_lines_full_t0; do ls data/seq/$d/decomp_*.npz data/seq/$d/config.json; done
     ls data/captions/captions_v3.jsonl data/celebamask256/attributes.json data/split_v3_faces_anime.jsonl \
        data/celebamask256_split_v1.jsonl data/celebamask256_val/* data/anime_val192/*
-    for m in chinese-clip-vit-base-patch16 chinese-clip-vit-large-patch14-fp16; do
-      ls data/models/$m/* | grep -vE 'aria2|SHA256SUMS'; done
+    ls data/models/chinese-clip-vit-base-patch16/SHA256SUMS data/models/chinese-clip-vit-large-patch14/SHA256SUMS
   } > out/v3_upload_list.txt
   export -f put; export G R
   sed 's|.*|& &|' out/v3_upload_list.txt | xargs -P 4 -L 1 bash -c 'put "$0" "$1"'
   local n; n=$($G "find $R -name '*.ok' | wc -l")
   echo "$(date +%T) data uploaded: $n of $(wc -l < out/v3_upload_list.txt) files on the box"
   [ "$n" -ge "$(wc -l < out/v3_upload_list.txt)" ]
+}
+models() {  # the public text encoders: the box downloads them itself (hf-mirror ~8 MB/s), checked against SHA256SUMS;
+            # the judge is the large model cast to fp16 (as data/models/chinese-clip-vit-large-patch14-fp16)
+  $G "test -f $R/data/models/chinese-clip-vit-large-patch14-fp16/model.safetensors.ok" && return 0
+  $G "test -f $R/data/models/chinese-clip-vit-large-patch14/SHA256SUMS.ok" || { echo "upload first"; return 1; }
+  $G 'set -e; M='$R'/data/models
+    for m in chinese-clip-vit-base-patch16 chinese-clip-vit-large-patch14; do
+      cd $M/$m
+      for f in $(awk "{print \$2}" SHA256SUMS); do
+        sha256sum -c --status <(grep " $f\$" SHA256SUMS) 2>/dev/null && continue
+        curl -sfL --retry 5 -o $f.part https://hf-mirror.com/OFA-Sys/$m/resolve/main/$f && mv $f.part $f
+      done
+      sha256sum -c SHA256SUMS
+    done
+    cd $M && python3 -c "
+import torch; from transformers import ChineseCLIPModel
+ChineseCLIPModel.from_pretrained(\"chinese-clip-vit-large-patch14\").half().save_pretrained(\"chinese-clip-vit-large-patch14-fp16\")"
+    cp chinese-clip-vit-large-patch14/{configuration.json,preprocessor_config.json,vocab.txt} chinese-clip-vit-large-patch14-fp16/
+    touch chinese-clip-vit-large-patch14-fp16/model.safetensors.ok; ls -la chinese-clip-vit-large-patch14-fp16'
 }
 start() {
   $G "pgrep -f 'v3_train/train.sh' > /dev/null" && { echo "training already running"; return 0; }
@@ -71,5 +91,5 @@ fetch() {   # a detached loop on the laptop: survives closing Claude and the ter
 status() {
   $G "tail -3 $R/runs/train.log; tail -2 $R/runs/B_ft/log.jsonl 2>/dev/null || tail -2 $R/runs/A_lp/log.jsonl; cat $R/eval/summary.txt 2>/dev/null; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader"
 }
-steps=("$@"); [ "${1:-all}" = all ] && steps=(connect setup upload start fetch)
+steps=("$@"); [ "${1:-all}" = all ] && steps=(connect setup upload models start fetch)
 for s in "${steps[@]}"; do $s || { echo "step $s failed"; exit 1; }; done
