@@ -187,6 +187,11 @@ def main() -> None:
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="also keep model-only snapshots <out>/model_step<N>.pt every N steps (for evaluation)")
+    ap.add_argument("--freeze", default=None,
+                    help="comma-separated parameter-name prefixes that do not train (e.g. gates fixed open)")
+    ap.add_argument("--boost", default=None,
+                    help="comma-separated parameter-name prefixes trained at lr x --new-lr-mult, like new tensors "
+                         "(e.g. canvas_enc.,cross. when a model has to learn to use its canvas)")
     ap.add_argument("--train-only", default=None,
                     help="comma-separated parameter-name prefixes: freeze every other parameter (LP-FT's first stage)")
     ap.add_argument("--workers", type=int, default=None, help="default: half the CPU quota, max 8")
@@ -340,6 +345,15 @@ def main() -> None:
         new_params = set(missing)
         print(f"initialised from {args.init_weights} (step {src.get('step')}); "
               f"{len(missing)} new tensors start fresh: {sorted({k.split('.')[0] for k in missing})}")
+    if args.boost:
+        pre = tuple(p.strip() for p in args.boost.split(",") if p.strip())
+        boosted = {n for n, _ in model.named_parameters() if n.startswith(pre)}
+        new_params |= boosted
+        print(f"--boost: {len(boosted)} tensors at lr x {args.new_lr_mult}")
+    if args.freeze:
+        pre = tuple(p.strip() for p in args.freeze.split(",") if p.strip())
+        frozen = [n for n, p in model.named_parameters() if n.startswith(pre) and not p.requires_grad_(False).requires_grad]
+        print(f"--freeze: {frozen}")
     if args.train_only:
         keep = tuple(p.strip() for p in args.train_only.split(",") if p.strip())
         for n, prm in model.named_parameters():
