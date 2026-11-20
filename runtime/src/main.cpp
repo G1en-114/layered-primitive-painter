@@ -37,10 +37,17 @@ int main(int argc, char** argv) {
     }
   try {
     NpyArray text = load_npy(a["--text"]), tv = load_npy(a["--text-valid"]), un = load_npy(a["--uniforms"]);
-    // cuda-auto: placement by batch size (measured on RTX 5070 Laptop: the CPU wins the small graphs
-    // at batch 1-2, the GPU wins them from batch 8 on)
+    // cuda-auto: placement by batch size AND model size (measured on RTX 5070 Laptop). The per-record heads
+    // (decode_heads, 9 calls per record) run faster on the CPU only while they are small: small model
+    // (16 MB heads) at batch 1-2 -> cuda-hybrid 266 vs cuda 174 records/s; base model (59 MB heads) at batch 1
+    // -> cuda 95 vs cuda-hybrid 67 (docs/deploy_report_v3.md). From batch 8 on the GPU wins either way.
     std::string provider = a["--provider"];
-    if (provider == "cuda-auto") provider = (!text.shape.empty() && text.shape[0] <= 2) ? "cuda-hybrid" : "cuda";
+    if (provider == "cuda-auto") {
+      std::error_code ec;
+      const auto heads = std::filesystem::file_size(std::filesystem::path(a["--onnx"]) / "decode_heads.onnx", ec);
+      const bool small_heads = !ec && heads < 32u * 1024 * 1024;
+      provider = (small_heads && !text.shape.empty() && text.shape[0] <= 2) ? "cuda-hybrid" : "cuda";
+    }
     Painter painter(a["--onnx"], provider);
     const Protocol& P = painter.protocol();
     if (text.dtype != "<f4" || text.shape.size() != 3) throw std::runtime_error("text must be float32 [B, Lt, D]");
