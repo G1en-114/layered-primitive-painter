@@ -224,7 +224,9 @@ def main() -> None:
     m = OrtPainter(args.onnx, [args.provider])
     codec = Codec.load(proto=m.proto, device="cpu")
     prompts = ["金发碧眼的女性，微笑，浅色背景", "黑色短发的男性，戴眼镜，深色背景", "棕色长卷发的女性，涂红色口红，戴耳环",
-               "灰白头发的男性，留着胡子，表情严肃", "黑色长直发的女性，有刘海，白色上衣，绿色背景", "光头男性，微笑，穿深色西装"][: args.n]
+               "灰白头发的男性，留着胡子，表情严肃", "黑色长直发的女性，有刘海，白色上衣，绿色背景", "光头男性，微笑，穿深色西装"]
+    # cycled to --n: [: n] alone capped every batch at 6, so "B = 8 / 32" benchmark inputs silently had 6 rows
+    prompts = [prompts[i % len(prompts)] for i in range(args.n)]
     enc = TextEncoder(args.text_encoder, max_positions=m.proto.max_text_positions)
     text, tv = enc(prompts)
     sc = SampleConfig(temperature=1.0, top_p=0.9, cfg_scale=args.cfg_scale, max_records=args.max_records,
