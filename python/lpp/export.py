@@ -317,6 +317,66 @@ class DecodeHeads(nn.Module):
         return tuple(outs)
 
 
+def sample_top_p(logits, u, top_p, temperature):
+    """lpp.sample._sample as exportable tensor ops: [N, V] logits, [N] uniforms -> [N] tokens.
+
+    Temperature + top-p support chosen in probability order, inverse CDF over the kept tokens in vocabulary order
+    (searchsorted(cdf, u) = the number of cdf entries below u). torch.sort is not stable and TopK ties may order
+    differently from the reference, so a token is only ever different at an exact probability tie on the top-p
+    boundary (parity is measured, see tests/test_decode_sample.py)."""
+    probs = torch.softmax(logits / temperature, -1)
+    sp, si = probs.sort(-1, descending=True)
+    keep = (sp.cumsum(-1) - sp) < top_p
+    w = torch.zeros_like(probs).scatter(-1, si, sp * keep)
+    cdf = w.cumsum(-1) / w.sum(-1, keepdim=True)
+    j = (cdf < u.clamp(max=1 - 1e-7)[:, None]).sum(-1).clamp(max=logits.shape[-1] - 1)
+    first = (w > 0).float().argmax(-1)                  # a zero-weight landing (rounding) -> first kept token
+    return torch.where(w.gather(-1, j[:, None])[:, 0] > 0, j, first)
+
+
+class DecodeSample(nn.Module):
+    """All attributes of one record in ONE graph call (the GPU bottleneck of docs/deploy_report_v3.md: ~10 tiny
+    decode_heads calls per record, each a launch + a device-to-host copy + host sampling).
+
+    h [2B, D] backbone states of the record's position (conditional rows, then unconditional: guidance is always on),
+    event [B] the sampled event, u [B, A] the record's uniforms for attributes 0..A-1, cfg_scale / top_p /
+    temperature [1] -> attrs [B, A]. The attribute decoder runs once per attribute (unrolled), each time with the
+    tokens sampled so far, exactly the runtime's loop; guidance, top-p sampling and the fixed slots (beta = 0 on
+    lines, bend = midpoint on Gaussians) happen inside. Rows whose event is not a stroke get arbitrary tokens: the
+    caller overwrites them with NO_ATTR as before."""
+
+    def __init__(self, painter: Painter):
+        super().__init__()
+        self.heads = DecodeHeads(painter)
+        p = painter
+        self.A = len(p.attr_names)
+        proto = p.proto
+        self.fixed = []                                   # (event id, attribute index, token)
+        for ev in proto.stroke_events:
+            for name, tok in proto.fixed_tokens(ev).items():
+                self.fixed.append((int(ev), p.attr_names.index(name), int(tok)))
+
+    def forward(self, h, event, u, cfg_scale, top_p, temperature):
+        B = event.shape[0]
+        ev2 = torch.cat([event, event])
+        attrs = torch.zeros(2 * B, self.A, dtype=torch.long, device=h.device)
+        cols = []
+        for i in range(self.A):
+            logits = self.heads(h, ev2, attrs)[1 + i]     # [2B, V_i]
+            g = logits[B:] + cfg_scale * (logits[:B] - logits[B:])
+            tok = sample_top_p(g, u[:, i], top_p, temperature)
+            cols.append(tok)
+            col = torch.cat([tok, tok])[:, None]
+            onehot = torch.arange(self.A, device=h.device)[None] == i
+            attrs = torch.where(onehot, col, attrs)
+        out = torch.stack(cols, 1)
+        # fixed slots after the loop, as lpp.sample.generate and the C++ runtime do: later attributes are decoded
+        # with the slot's sampled token, not the fixed one (a train / decode mismatch noted in deploy_report_v3.md)
+        for ev, ai, t in self.fixed:
+            out[:, ai] = torch.where(event == ev, torch.full_like(out[:, ai], t), out[:, ai])
+        return out
+
+
 class ManualRMSNorm(nn.Module):
     """nn.RMSNorm with plain operators (ONNX RMSNormalization needs opset 23; exporters target less).
     Same weight, same eps rule as nn.RMSNorm (finfo(dtype).eps when eps is None)."""
@@ -347,10 +407,10 @@ def graphs(painter: Painter) -> dict[str, nn.Module]:
     painter = exportable(painter)
     g = {"embed_record": EmbedRecord(painter), "embed_text": EmbedText(painter), "chunk": Chunk(painter),
          "chunk_cached": ChunkCached(painter),
-         "decode_heads": DecodeHeads(painter)}
+         "decode_heads": DecodeHeads(painter), "decode_sample": DecodeSample(painter)}
     if painter.cfg.canvas:
         g["canvas_enc"] = CanvasEnc(painter)
     return g
 
 
-__all__ = ["Chunk", "ChunkCached", "DecodeHeads", "EmbedRecord", "EmbedText", "CanvasEnc", "graphs"]
+__all__ = ["Chunk", "ChunkCached", "DecodeHeads", "DecodeSample", "EmbedRecord", "EmbedText", "CanvasEnc", "graphs"]

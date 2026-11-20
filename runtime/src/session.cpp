@@ -87,6 +87,13 @@ std::vector<Tensor> Graph::run(const std::vector<const Tensor*>& inputs) {
   std::vector<Tensor> res;
   for (auto& o : outs) {
     auto info = o.GetTensorTypeAndShapeInfo();
+    if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {   // decode_sample's tokens
+      Tensor t = Tensor::I(info.GetShape());
+      const int64_t* p = o.GetTensorData<int64_t>();
+      std::copy(p, p + t.i.size(), t.i.begin());
+      res.push_back(std::move(t));
+      continue;
+    }
     Tensor t = Tensor::F(info.GetShape());
     const float* p = o.GetTensorData<float>();
     std::copy(p, p + t.f.size(), t.f.begin());
@@ -136,9 +143,14 @@ Graphs::Graphs(const std::string& dir, const std::string& provider)
   // static one-step graphs: CUDA Graph capture unless LPP_CUDA_GRAPH=0 (A/B runs)
   const char* cg = std::getenv("LPP_CUDA_GRAPH");
   Ort::SessionOptions so_step = make_options(cuda, !(cg && std::string(cg) == "0"));
+  // fused attribute sampling (export.DecodeSample): used when present; LPP_FUSED=0 skips it (A/B runs)
+  const char* fu = std::getenv("LPP_FUSED");
+  const bool fused = !(fu && std::string(fu) == "0");
   for (auto& [name, g] : m["graphs"].items()) {
+    if (name == "decode_sample" && !fused) continue;
     const bool backbone = name == "chunk" || name == "chunk_cached";
-    const bool on_gpu = cuda && (provider == "cuda-all" || backbone || (provider != "cuda-hybrid" && name == "decode_heads"));
+    const bool heads = name == "decode_heads" || name == "decode_sample";
+    const bool on_gpu = cuda && (provider == "cuda-all" || backbone || (provider != "cuda-hybrid" && heads));
     const bool heads_r = name.rfind("decode_heads_r", 0) == 0;
     const bool step = name.rfind("chunk_step_r", 0) == 0 || name.rfind("chunk_inplace_r", 0) == 0 || heads_r;
     if (step && !cuda) continue;                   // the static step graphs are a CUDA-only path

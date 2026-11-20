@@ -407,6 +407,20 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
     }
     std::vector<std::vector<int64_t>> attrs(B, std::vector<int64_t>(A, P.no_attr));
     if (std::any_of(ev.begin(), ev.end(), [&](int64_t e) { return P.is_stroke(e); })) {
+      if (guided && g_.has("decode_sample")) {
+        // all attributes in one call (export.DecodeSample: guidance, top-p sampling and fixed slots in the
+        // graph, same uniforms): ~10 launches + device-to-host copies per record become 1 (deploy_report_v3.md)
+        Tensor evb = Tensor::I({B}), u = Tensor::F({B, A});
+        for (int b = 0; b < B; ++b) {
+          evb.i[b] = ev[b];
+          for (int i = 0; i < A; ++i) u.f[size_t(b) * A + i] = uni(step, 1 + i, b);
+        }
+        Tensor cs = Tensor::F({1}, cfg.sample.cfg_scale), tp = Tensor::F({1}, cfg.sample.top_p),
+               tt = Tensor::F({1}, cfg.sample.temperature);
+        const auto o = g_["decode_sample"].run({&h, &evb, &u, &cs, &tp, &tt});
+        for (int b = 0; b < B; ++b)
+          for (int i = 0; i < A; ++i) attrs[b][i] = o[0].i[size_t(b) * A + i];
+      } else {
       Tensor evt = Tensor::I({R}), at = Tensor::I({R, A});
       for (int r = 0; r < R; ++r) evt.i[r] = ev[r % B];
       for (int i = 0; i < A; ++i) {
@@ -415,6 +429,7 @@ std::vector<std::vector<Record>> Painter::generate(int B, const GenerateConfig& 
         auto heads = heads_run(h, evt, at, 1 + i);
         const int n = static_cast<int>(P.vocab[i]);
         for (int b = 0; b < B; ++b) attrs[b][i] = sample_top_p(guided_row(heads[1 + i], b, n), n, cfg.sample, uni(step, 1 + i, b));
+      }
       }
       for (int b = 0; b < B; ++b) {
         if (!P.is_stroke(ev[b])) std::fill(attrs[b].begin(), attrs[b].end(), P.no_attr);

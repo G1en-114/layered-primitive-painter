@@ -76,6 +76,13 @@ def specs(m: Painter, B: int, T: int, P: int, Lt: int) -> dict:
             names=["h", "event", "attrs"], outputs=["event_logits"] + [f"{n}_logits" for n in m.attr_names],
             axes={"h": {0: "B"}, "event": {0: "B"}, "attrs": {0: "B"}, "event_logits": {0: "B"},
                   **{f"{n}_logits": {0: "B"} for n in m.attr_names}}),
+        # all attributes of a record in one call (lpp.export.DecodeSample): h has 2B rows (guidance), B samples
+        "decode_sample": dict(
+            inputs=(torch.randn(2 * B, c.d_model, generator=g),
+                    torch.tensor(m.proto.stroke_events)[torch.randint(0, len(m.proto.stroke_events), (B,), generator=g)],
+                    torch.rand(B, A, generator=g), torch.tensor([5.0]), torch.tensor([0.6]), torch.tensor([1.0])),
+            names=["h", "event", "u", "cfg_scale", "top_p", "temperature"], outputs=["attrs"],
+            axes={"h": {0: "R"}, "event": {0: "B"}, "u": {0: "B"}, "attrs": {0: "B"}}),
     }
     if c.canvas:
         out["canvas_enc"] = dict(
